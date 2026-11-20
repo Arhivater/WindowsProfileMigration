@@ -128,6 +128,9 @@ Invoke-WpmTest 'Manifest rejects duplicate aliases and invalid paths before impo
     $manifest = [pscustomobject]@{ Path='Validation/files.jsonl'; Files=2; Bytes=6; SHA256=(Get-ExactFileSha256 $file) }
     $meta = [pscustomobject]@{ SchemaVersion=7; ValidationManifest=$manifest; ValidationConsistency=[pscustomobject]@{Stable=$true} }
     Assert-WpmThrows { Assert-ValidationManifestIntegrity $WpmTestRoot $meta } 'Повторяющийся путь'
+    # Windows PowerShell 5.1 must release the manifest even if validation stops early.
+    $exclusive = [IO.File]::Open($file,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+    $exclusive.Dispose()
     $invalid = @{ RelativePath='Desktop/..'; Length=3; SHA256=('a' * 64) } | ConvertTo-Json -Compress
     Assert-WpmThrows { Read-ValidationManifestRecord $invalid } 'Недопустимый компонент'
 }

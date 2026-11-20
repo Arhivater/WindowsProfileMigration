@@ -1593,15 +1593,18 @@ function Assert-ValidationManifestIntegrity([string]$Archive,[object]$Meta) {
     }
     $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     [decimal]$bytes = 0
-    foreach ($line in [IO.File]::ReadLines($path)) {
-        if (-not $line.Trim()) { continue }
-        $record = Read-ValidationManifestRecord $line
-        if (-not $paths.Add($record.RelativePath)) { throw ('Повторяющийся путь в реестре: ' + $record.RelativePath) }
-        $bytes += $record.Length
-        if ($paths.Count -gt [long]$info.Files -or $bytes -gt [long]$info.Bytes) {
-            throw 'Контрольный реестр превышает количество файлов или суммарный размер в метаданных.'
+    $reader = [IO.StreamReader]::new($path,[Text.Encoding]::UTF8,$true)
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if (-not $line.Trim()) { continue }
+            $record = Read-ValidationManifestRecord $line
+            if (-not $paths.Add($record.RelativePath)) { throw ('Повторяющийся путь в реестре: ' + $record.RelativePath) }
+            $bytes += $record.Length
+            if ($paths.Count -gt [long]$info.Files -or $bytes -gt [long]$info.Bytes) {
+                throw 'Контрольный реестр превышает количество файлов или суммарный размер в метаданных.'
+            }
         }
-    }
+    } finally { $reader.Dispose() }
     if ($paths.Count -ne [long]$info.Files -or $bytes -ne [long]$info.Bytes) {
         throw 'Количество файлов или суммарный размер контрольного реестра не совпадает с метаданными.'
     }
