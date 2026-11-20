@@ -2066,11 +2066,20 @@ function Restore-ExplorerAndOneCExtras([string]$Archive,[string]$TargetPath,[has
     Write-OperationReport 'НАСТРОЙКИ' ('Закрепления Проводника и 1С: восстановлено ' + $done + ' из ' + $jobs.Count + ' файлов.')
 }
 
+function Invoke-ProfileRegistryCommand([string[]]$Arguments) {
+    $reg = Join-Path $env:SystemRoot 'System32/reg.exe'
+    $commandLine = @($Arguments | ForEach-Object { Quote-WindowsArgument $_ }) -join ' '
+    $process = Start-Process -FilePath $reg -ArgumentList $commandLine -NoNewWindow -Wait -PassThru -ErrorAction Stop
+    try {
+        if ($null -eq $process.ExitCode) { throw 'reg.exe не вернул код завершения.' }
+        return [int]$process.ExitCode
+    } finally { $process.Dispose() }
+}
+
 # Выполняет действие с реестром именно выбранного пользователя. При отсутствии
 # сеанса временно подключает NTUSER.DAT и гарантированно пытается выгрузить его.
 function Invoke-ProfileHive([string]$Sid,[string]$ProfilePath,[scriptblock]$Action,[bool]$RequireOffline = $false) {
     if ($Sid -notmatch '^S-1-(?:[0-9]+-){1,14}[0-9]+$') { throw 'Некорректный SID пользовательского реестра.' }
-    $reg = Join-Path $env:SystemRoot 'System32/reg.exe'
     $hku = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::Users,[Microsoft.Win32.RegistryView]::Default)
     $mount = $Sid
     $mountedHere = $false
@@ -2084,8 +2093,7 @@ function Invoke-ProfileHive([string]$Sid,[string]$ProfilePath,[scriptblock]$Acti
             Assert-ProfileExtraPath $ntuser $ProfilePath
             if (-not [IO.File]::Exists($ntuser)) { throw ('Отсутствует пользовательский реестр: ' + $ntuser) }
             $mount = 'WPM_' + [guid]::NewGuid().ToString('N')
-            & $reg load ('HKU\' + $mount) $ntuser | Out-Null
-            $code = $LASTEXITCODE
+            $code = Invoke-ProfileRegistryCommand @('load',('HKU\' + $mount),$ntuser)
             if ($code -ne 0) { throw ('reg load: код ' + $code + '; реестр: ' + $ProfilePath) }
             $mountedHere = $true
         }
@@ -2093,10 +2101,11 @@ function Invoke-ProfileHive([string]$Sid,[string]$ProfilePath,[scriptblock]$Acti
     } finally {
         $hku.Dispose()
         if ($mountedHere) {
-            & $reg unload ('HKU\' + $mount) | Out-Null
-            $code = $LASTEXITCODE
-            if ($code -ne 0) {
-                Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('reg unload: код ' + $code + '; временный реестр HKU\' + $mount + ' остаётся подключён.')
+            try {
+                $code = Invoke-ProfileRegistryCommand @('unload',('HKU\' + $mount))
+                if ($code -ne 0) { throw ('Код ' + $code) }
+            } catch {
+                Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('reg unload: временный реестр HKU\' + $mount + ' мог остаться подключённым; ' + $_.Exception.Message)
             }
         }
     }

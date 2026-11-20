@@ -3,7 +3,7 @@
     'Read-ExtraJson','New-ExtrasManifest','Test-ExtrasManifest','Is-AllowedExtra',
     'Browser-Definitions','Get-BrowserExtraFileNames','Test-BrowserExtraRelativePath','Restore-BrowserExtras',
     'Test-NetworkDriveRemotePath','Get-DesktopRegistryValueNames','Convert-DesktopRegistryValues',
-    'Write-DesktopRegistryValues','Set-DesktopRegistryValues'
+    'Write-DesktopRegistryValues','Set-DesktopRegistryValues','Quote-WindowsArgument','Invoke-ProfileRegistryCommand'
 ))
 
 function Write-OperationReport([string]$Kind,[string]$Message) { }
@@ -155,4 +155,28 @@ Invoke-WpmTest 'Extras desktop rollback restores all values after simulated part
     Assert-WpmEqual $key.Values['Mode'] 2
     Assert-WpmEqual $key.Values['LogicalViewMode'] 1
     Assert-WpmEqual $key.Values.ContainsKey('IconSize') $false
+}
+
+Invoke-WpmTest 'Extras registry launch preserves account path argument and process exit code' {
+    $syntheticProcess = [pscustomobject]@{ExitCode=0; Disposed=$false}
+    $syntheticProcess | Add-Member ScriptMethod Dispose { $this.Disposed=$true }
+    function Start-Process {
+        [CmdletBinding()]
+        param([string]$FilePath,[string]$ArgumentList,[switch]$NoNewWindow,[switch]$Wait,[switch]$PassThru)
+        Assert-WpmEqual $FilePath (Join-Path $WpmTestRoot 'System32/reg.exe')
+        Assert-WpmEqual $ArgumentList 'load HKU\WPM_Synthetic "C:\Профили\Имя Пользователя\NTUSER.DAT"'
+        Assert-WpmEqual ($NoNewWindow -and $PassThru -and $Wait) $true
+        return $syntheticProcess
+    }
+    $systemRoot = $env:SystemRoot
+    try {
+        $env:SystemRoot = $WpmTestRoot
+        $arguments = @('load','HKU\WPM_Synthetic','C:\Профили\Имя Пользователя\NTUSER.DAT')
+        Assert-WpmEqual (Invoke-ProfileRegistryCommand $arguments) 0
+        Assert-WpmEqual $syntheticProcess.Disposed $true
+        $syntheticProcess.ExitCode=5
+        $syntheticProcess.Disposed=$false
+        Assert-WpmEqual (Invoke-ProfileRegistryCommand $arguments) 5
+        Assert-WpmEqual $syntheticProcess.Disposed $true
+    } finally { $env:SystemRoot = $systemRoot }
 }
