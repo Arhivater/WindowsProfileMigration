@@ -2908,38 +2908,41 @@ function Inspect-UsmtFileScope([string]$FileList,[string]$ProfilePath,[bool]$Ver
     [long]$files = 0
     [long]$invalid = 0
     $examples = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($line in [IO.File]::ReadLines($FileList)) {
-        $candidate = ([string]$line).Trim().Trim('"')
-        if (-not $candidate) { continue }
-        $files++
-        $reason = ''
-        try {
-            if ($candidate -notmatch '^[a-zA-Z]:\\') { throw 'не абсолютный локальный путь' }
-            $relative = $candidate.Substring(3)
-            if ($relative.EndsWith('\')) { $relative = $relative.Substring(0,$relative.Length - 1) }
-            if ($relative) { [void](Get-WindowsRelativePathParts $relative) }
-            $full = [IO.Path]::GetFullPath($candidate)
-            # Принимаем сам корень и строго вложенные объекты. Соседние
-            # профили, например a.agdamov2, остаются за пределами области.
-            if (-not ($full.Equals($root,$cmp) -or $full.StartsWith($prefix,$cmp))) {
-                throw 'вне выбранного профиля'
-            }
-            if ($VerifySourceLinks) {
-                $current = $full
-                while ($current.StartsWith($prefix,$cmp) -or $current.Equals($root,$cmp)) {
-                    if (-not $seen.Add($current)) { break }
-                    $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
-                    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'переход через ссылку' }
-                    if ($current.Equals($root,$cmp)) { break }
-                    $current = [IO.Path]::GetDirectoryName($current)
+    $reader = [IO.StreamReader]::new($FileList,[Text.Encoding]::UTF8,$true)
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            $candidate = ([string]$line).Trim().Trim('"')
+            if (-not $candidate) { continue }
+            $files++
+            $reason = ''
+            try {
+                if ($candidate -notmatch '^[a-zA-Z]:\\') { throw 'не абсолютный локальный путь' }
+                $relative = $candidate.Substring(3)
+                if ($relative.EndsWith('\')) { $relative = $relative.Substring(0,$relative.Length - 1) }
+                if ($relative) { [void](Get-WindowsRelativePathParts $relative) }
+                $full = [IO.Path]::GetFullPath($candidate)
+                # Принимаем сам корень и строго вложенные объекты. Соседние
+                # профили, например a.agdamov2, остаются за пределами области.
+                if (-not ($full.Equals($root,$cmp) -or $full.StartsWith($prefix,$cmp))) {
+                    throw 'вне выбранного профиля'
                 }
+                if ($VerifySourceLinks) {
+                    $current = $full
+                    while ($current.StartsWith($prefix,$cmp) -or $current.Equals($root,$cmp)) {
+                        if (-not $seen.Add($current)) { break }
+                        $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+                        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'переход через ссылку' }
+                        if ($current.Equals($root,$cmp)) { break }
+                        $current = [IO.Path]::GetDirectoryName($current)
+                    }
+                }
+            } catch { $reason = $_.Exception.Message }
+            if ($reason) {
+                $invalid++
+                if ($examples.Count -lt 12) { $examples.Add($candidate + ' (' + $reason + ')') }
             }
-        } catch { $reason = $_.Exception.Message }
-        if ($reason) {
-            $invalid++
-            if ($examples.Count -lt 12) { $examples.Add($candidate + ' (' + $reason + ')') }
         }
-    }
+    } finally { $reader.Dispose() }
     if ($files -eq 0) { throw 'USMT не перечислил ни одного объекта. Экспорт не может быть подтверждён.' }
     if ($invalid -gt 0) {
         foreach ($example in @($examples.ToArray())) { Write-OperationReport 'ОШИБКА ОБЛАСТИ' $example }

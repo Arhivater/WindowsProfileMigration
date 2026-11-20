@@ -7,7 +7,7 @@
     Get-ValidationSourceDirectories,Get-ValidationSourceFiles,Read-ValidationManifestRecord,
     New-ValidationManifest,Assert-ValidationSourceStable,Assert-ValidationManifestIntegrity,Test-ValidationManifest,
     Assert-ExportProfileReady,Write-EmbeddedProfileOnlyRule,Assert-ArchiveCacheOutsideSource,
-    Copy-DirectoryRobust,Quote-WindowsArgument)
+    Copy-DirectoryRobust,Quote-WindowsArgument,Inspect-UsmtFileScope)
 
 function Write-OperationReport {}
 function Test-RunningProcessStopRequest { $false }
@@ -151,6 +151,23 @@ Invoke-WpmTest 'Embedded profile-only rule matches the pinned SHA-256' {
     $components = @($xml.SelectNodes('/migration/component'))
     Assert-WpmEqual $components.Count 2
     Assert-WpmEqual @($components | ForEach-Object { $_.GetAttribute('context') }) @('User','User')
+}
+
+Invoke-WpmTest 'USMT scope list handles BOM and releases files after approval or rejection' {
+    $verifyLinks = [Environment]::OSVersion.Platform -eq 'Win32NT'
+    $profile = if ($verifyLinks) { Join-Path $WpmTestRoot 'Профиль' } else { 'C:\Users\Профиль' }
+    $profileFile = $profile + '\Документ.txt'
+    if ($verifyLinks) {
+        [void][IO.Directory]::CreateDirectory($profile)
+        [IO.File]::WriteAllText($profileFile,'fixture')
+    }
+    $fileList = Join-Path $WpmTestRoot 'usmt-files.txt'
+    [IO.File]::WriteAllLines($fileList,[string[]]@($profile, ('"' + $profileFile + '"')),[Text.Encoding]::Unicode)
+    Assert-WpmEqual (Inspect-UsmtFileScope $fileList $profile $verifyLinks) 2
+    [IO.File]::WriteAllLines($fileList,[string[]]@($profileFile, ($profile + '-other\external.txt')))
+    Assert-WpmThrows { Inspect-UsmtFileScope $fileList $profile $verifyLinks } 'вне подтверждённой области'
+    $exclusive = [IO.File]::Open($fileList,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+    $exclusive.Dispose()
 }
 
 Invoke-WpmTest 'Export guard rejects concurrent load or reassignment of selected SID' {
