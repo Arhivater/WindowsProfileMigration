@@ -4,13 +4,18 @@
 
 ## Синтетические проверки
 
-Прогон на Linux с PowerShell 7.7.0. Тесты загружают только нужные функции из AST, создают синтетические файлы и подменяют системные операции. Они не запускают миграцию системного профиля.
+Тесты загружают нужные функции из AST, создают синтетические файлы и подменяют системные операции. Миграция системного профиля в этих прогонах не запускается.
 
 ```powershell
 pwsh -NoLogo -NoProfile -NonInteractive -File tests/Run-Tests.ps1
 ```
 
-Результат объединённого прогона: `SUMMARY total=72 pass=72 fail=0`, код завершения 0.
+| Среда | Статус | Доказательство |
+| --- | --- | --- |
+| Linux, PowerShell 7.7.0 | PASS | `SUMMARY total=73 pass=73 fail=0`, код 0. Два теста CMD и путей выполняются только на Windows. |
+| Windows Server 2022, Windows PowerShell 5.1.20348.5773 | PASS | `SUMMARY total=75 pass=75 fail=0` на коммите `5543174`, код 0. [Журнал GitHub Actions](https://github.com/Arhivater/WindowsProfileMigration/actions/runs/44786728590) |
+
+Первый запуск на Windows обнаружил два дефекта закрытия потоков и ошибку передачи кавычек в тестовой команде CMD. После исправлений повторный запуск подтвердил работу обоих манифестов, чтение списка USMT с BOM, повторное эксклюзивное открытие файлов и прохождение кодов 0, 19 и 1223 через `Start.cmd`. [Первый запуск](https://github.com/Arhivater/WindowsProfileMigration/actions/runs/44785580231) · [Итоговый запуск](https://github.com/Arhivater/WindowsProfileMigration/actions/runs/44786728590)
 
 | Область | Статус | Доказательство из прогона |
 | --- | --- | --- |
@@ -19,7 +24,7 @@ pwsh -NoLogo -NoProfile -NonInteractive -File tests/Run-Tests.ps1
 | Аргументы, платформы, зависимости | PASS | Корректные аргументы UNC и параметры с пробелами, обязательные три файла USMT, отмена установки, отклонение несовместимой платформы и Windows Server. |
 | Коды процессов и прогресс | PASS | Модель ExitCode 0, 27 и отсутствующего значения, отмена конкретного дочернего процесса, парсер правильного процента и закрытие индикаторов. |
 | Архивы и пути | PASS | Синтетический ZIP распакован побайтово. Отклонены неоднозначные сегменты, коллизии файлов с каталогами, JSON неверной формы, перенаправления и вложенность кеша в источник. |
-| SHA-256 и область профиля | PASS | Порча того же размера обнаружена. Тесты проверили манифест, подмену выбранного профиля, SHA-256 встроенного XML и отказ от DTD. |
+| SHA-256 и область профиля | PASS | Порча того же размера обнаружена. Проверены манифест, подмена выбранного профиля, SHA-256 встроенного XML, отказ от DTD, кодировка списка USMT и освобождение файлов после отказа. |
 | Схема архива и свободное место | PASS | Поддерживаемые целочисленные версии, повторная проверка подготовленной копии, остановка до распаковки при недостатке места. |
 | Импорт, SID и профили | PASS | Моки WMI, локальных учётных записей и прав проверили шаблон назначения, отключённые и системные SID, отказ старой схеме до запуска LoadState. |
 | Состояние, остановка и повторный запуск | PASS | Атомарное обновление, распознавание повреждённой записи и отказ второй операции при эксклюзивной блокировке. Прерванный импорт требует проверки. |
@@ -40,7 +45,7 @@ pwsh -NoLogo -NoProfile -NonInteractive -File tests/Check-Compatibility.ps1
 | Синтаксис и командлеты профиля 5.1 | PASS | Анализ отчитал 0 замечаний `PSUseCompatibleSyntax` и 0 `PSUseCompatibleCmdlets`. |
 | Windows Forms во время работы | BLOCKED | Четыре указания на `System.Windows.Forms.Screen`. Сборка загружается явно перед обращениями. Поведение реальных экранов проверяется в W16. |
 | Закрытая DACL на Windows | BLOCKED | Анализ указал на `IO.FileSystemAclExtensions` в ветке PowerShell Core. Windows PowerShell 5.1 использует перегрузку `Directory.CreateDirectory`. Создание и наследование проверяются в W22. |
-| Реальные CMD и пути Windows | BLOCKED | Linux-прогон явно вывел `BLOCKED Windows-only CMD launcher and local/UNC root tests`. |
+| CMD и пути на Windows Server | PASS | `Windows drive root and UNC share remain absolute` и `CMD launcher forwards success and errors from a harmless fixture`. [Журнал GitHub Actions](https://github.com/Arhivater/WindowsProfileMigration/actions/runs/44786728590) |
 
 ## Стенд Windows
 
