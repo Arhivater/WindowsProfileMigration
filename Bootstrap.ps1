@@ -2,6 +2,7 @@
 # Автор: Arhivater
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$Script:WpmVersion = '1.10.1'
 
 # При отказе UAC/ошибке запуска оставляем один диагностический TXT.
 # В штатном запуске отдельный отчёт не создаётся: его пишет основной скрипт.
@@ -14,7 +15,7 @@ function Write-BootstrapFailure([object]$Record) {
             $file = Join-Path $folder ('Итог_работы_ЗАПУСК_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff') + '_' +
                 [guid]::NewGuid().ToString('N').Substring(0,12) + '.txt')
             $content = @(
-                'WINDOWS PROFILE MIGRATION 1.10.0 - ОШИБКА ЗАПУСКА',
+                ('WINDOWS PROFILE MIGRATION {0} - ОШИБКА ЗАПУСКА' -f $Script:WpmVersion),
                 ('Время: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')),
                 ('Компьютер: ' + $env:COMPUTERNAME),
                 ('Этап: Bootstrap / UAC'),
@@ -35,9 +36,12 @@ function Write-BootstrapFailure([object]$Record) {
 # Преобразуем букву подключённого сетевого диска в UNC до запроса прав UAC.
 function Resolve-OriginalFolder([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path)) { throw 'Не определена папка комплекта.' }
-    # UNC уже абсолютный путь, поэтому GetFullPath для него не требуется.
-    if ($Path.StartsWith('\\')) { return $Path.TrimEnd('\') }
-    $path = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $path = [IO.Path]::GetFullPath($Path)
+    # C:\ и корень SMB-ресурса остаются абсолютными путями.
+    if ($path.Length -gt [IO.Path]::GetPathRoot($path).Length) {
+        $path = $path.TrimEnd('\')
+    }
+    if ($path.StartsWith('\\')) { return $path }
     if ($path -notmatch '^[a-zA-Z]:\\') { return $path }
     $driveLetter = $path.Substring(0,2)
     try {
@@ -69,62 +73,52 @@ function Resolve-OriginalFolder([string]$Path) {
     return $path
 }
 
-# Повышенные права могут скрыть сетевой диск: копируем только код во временную локальную папку.
-# Архивы и отчёты при этом остаются рядом с исходным Start.cmd.
-$stage = $null
-$stageRoot = $null
+# После преобразования подключённого диска используем тот же абсолютный путь.
+# Это исключает запуск временной копии, созданной до повышения прав.
+function Quote-LaunchPath([string]$Path) {
+    return ('"' + ($Path -replace '(\\+)$','$1$1') + '"')
+}
+
 $exitCode = 1
+$process = $null
 try {
     $root = Resolve-OriginalFolder $PSScriptRoot
     $main = Join-Path $root 'ProfileMigration.ps1'
     if (-not (Test-Path -LiteralPath $main -PathType Leaf)) {
         throw ('Не найден основной скрипт: ' + $main)
     }
-    # Never invoke the privileged script through a mapped drive, which UAC may hide.
-    # The single PS1 is staged locally and receives the original UNC ToolRoot.
-    $stageRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
-    $stage = Join-Path $stageRoot ('WPM_Elevate_' + [guid]::NewGuid().ToString('N'))
-    [void](New-Item -ItemType Directory -Path $stage -ErrorAction Stop)
-    $copy = Join-Path $stage 'ProfileMigration.ps1'
-    Copy-Item -LiteralPath $main -Destination $copy -ErrorAction Stop
     Write-Host ('Папка комплекта: ' + $root)
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
     $admin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    $args = ('-NoProfile -ExecutionPolicy Bypass -File "{0}" -ToolRoot "{1}"' -f $copy,$root)
+    $engine = Join-Path $PSHOME 'powershell.exe'
     $launch = @{
-        FilePath = "$PSHOME\powershell.exe";
-        ArgumentList = $args;
-        PassThru = $true;
-        Wait = $true
+        FilePath = $engine
+        WorkingDirectory = $PSHOME
+        ArgumentList = '-NoProfile -ExecutionPolicy Bypass -File {0} -ToolRoot {1}' -f (Quote-LaunchPath $main),(Quote-LaunchPath $root)
+        PassThru = $true
     }
-    if (-not $admin) { $launch['Verb'] = 'RunAs' }
+    if ($admin) { $launch.NoNewWindow = $true }
+    else { $launch.Verb = 'RunAs' }
     $process = Start-Process @launch
-    if ($null -eq $process -or $null -eq $process.ExitCode) {
-        throw 'Не удалось получить код завершения основной программы.'
-    }
-    $exitCode = [int]$process.ExitCode
+    if ($null -eq $process) { throw 'Не удалось запустить основную программу.' }
+    [void]$process.Handle
+    $process.WaitForExit()
+    $code = $process.ExitCode
+    if ($null -eq $code) { throw 'Не удалось получить код завершения основной программы.' }
+    $exitCode = [int]$code
 } catch {
-    Write-Host ('ОШИБКА ЗАПУСКА: ' + $_.Exception.Message) -ForegroundColor Red
     Write-BootstrapFailure $_
-    $exitCode = 1
-} finally {
-    # Ошибка очистки TEMP никогда не должна перекрывать итог работы программы.
-    # Проверяем точный путь своего каталога, не удаляем родительские папки.
-    if ($stage -and $stageRoot) {
-        try {
-            $safe = [IO.Path]::GetFullPath($stage).TrimEnd('\')
-            $parent = [IO.Path]::GetDirectoryName($safe).TrimEnd('\')
-            if ($parent -ine $stageRoot -or
-                [IO.Path]::GetFileName($safe) -notmatch '^WPM_Elevate_[a-fA-F0-9]{32}$') {
-                throw 'Неожиданный путь временного каталога. Удаление запрещено.'
-            }
-            if ([IO.Directory]::Exists($safe)) {
-                [IO.Directory]::Delete($safe,$true)
-            }
-        } catch {
-            Write-Host ('ПРЕДУПРЕЖДЕНИЕ: временную копию кода удалить не удалось: ' + $_.Exception.Message) -ForegroundColor Yellow
-        }
+    $cause = $_.Exception
+    while ($cause -and $cause -isnot [ComponentModel.Win32Exception]) { $cause = $cause.InnerException }
+    if ($cause -and $cause.NativeErrorCode -eq 1223) {
+        Write-Host 'Запрос административных прав отменён.' -ForegroundColor Yellow
+        $exitCode = 1223
+    } else {
+        Write-Host ('ОШИБКА ЗАПУСКА: ' + $_.Exception.Message) -ForegroundColor Red
+        $exitCode = 1
     }
+} finally {
+    if ($process) { $process.Dispose() }
 }
 exit $exitCode

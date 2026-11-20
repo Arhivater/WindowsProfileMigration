@@ -1,6 +1,6 @@
 ﻿#Requires -Version 5.1
 # Автор: Arhivater
-# WindowsProfileMigration 1.10.0 | Windows PowerShell 5.1 | Windows 10/11
+# WindowsProfileMigration 1.10.1 | Windows PowerShell 5.1 | Windows 10/11
 # Экспорт выбранного профиля и подтверждённый автоматический импорт по WinRM.
 # Учётная запись администратора запуска не подставляется вместо выбранного профиля.
 
@@ -12,22 +12,24 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-# Bootstrap runs from a local temporary directory. All archives, reports and
-# optional USMT binaries still live beside Start.cmd, including on a UNC share.
-$Script:ToolRoot = [IO.Path]::GetFullPath($ToolRoot).TrimEnd('\')
+$Script:WpmVersion = '1.10.1'
+$Script:ToolRoot = [IO.Path]::GetFullPath($ToolRoot)
+if ($Script:ToolRoot.Length -gt [IO.Path]::GetPathRoot($Script:ToolRoot).Length) {
+    $Script:ToolRoot = $Script:ToolRoot.TrimEnd('\')
+}
 # Один перечень версий для создания, поиска, проверки и восстановления архивов.
 $Script:SupportedArchiveSchemas = @(1,2,3,4,5,6,7)
 $Script:CurrentArchiveSchema = 7
 $Script:BackupRoot = Join-Path $Script:ToolRoot 'Backups'
 $Script:RestartRequired = $false
 $Script:ReportPath = $null
+$Script:ReportWriter = $null
 $Script:ReportWarnings = 0
 $Script:ReportErrors = 0
 $Script:ReportStart = $null
 $Script:ReportPhase = 'Ожидание действия'
 $Script:ReportPhaseStart = $null
 $Script:ProgressStep = 0
-$Script:ProgressStepTotal = 0
 $Script:ActiveOpState = $null
 $Script:HadFailures = $false
 $Script:OpStateRoot = Join-Path $env:ProgramData 'WindowsProfileMigration\Operations'
@@ -48,6 +50,7 @@ function Start-OperationReport([string]$Operation) {
                 $filename = '{0}_{1}.txt' -f $stem,([guid]::NewGuid().ToString('N').Substring(0,12))
                 $candidate = Join-Path $root $filename
                 $stream = $null
+                $writer = $null
                 try {
                     $stream = [System.IO.File]::Open($candidate,
                         [System.IO.FileMode]::CreateNew,
@@ -55,39 +58,34 @@ function Start-OperationReport([string]$Operation) {
                         [System.IO.FileShare]::Read)
                     $writer = [System.IO.StreamWriter]::new($stream,[System.Text.UTF8Encoding]::new($true))
                     $stream = $null
-                    try {
-                        $writer.WriteLine('WINDOWS PROFILE MIGRATION 1.10.0 - ПОЛНЫЙ ИТОГ РАБОТЫ')
-                        $writer.WriteLine(('Операция: ' + $Operation))
-                        $writer.WriteLine(('Начало: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')))
-                        $writer.WriteLine(('Компьютер: ' + $env:COMPUTERNAME))
-                        $writer.WriteLine(('Технический администратор: ' + [Security.Principal.WindowsIdentity]::GetCurrent().Name))
-                        $writer.WriteLine(('Отчёт: ' + $candidate))
-                        $writer.WriteLine(('----------------------------------------------'))
-                    } finally { $writer.Dispose() }
+                    $writer.AutoFlush = $true
+                    $writer.WriteLine(('WINDOWS PROFILE MIGRATION {0} - ПОЛНЫЙ ИТОГ РАБОТЫ' -f $Script:WpmVersion))
+                    $writer.WriteLine(('Операция: ' + $Operation))
+                    $writer.WriteLine(('Начало: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')))
+                    $writer.WriteLine(('Компьютер: ' + $env:COMPUTERNAME))
+                    $writer.WriteLine(('Технический администратор: ' + [Security.Principal.WindowsIdentity]::GetCurrent().Name))
+                    $writer.WriteLine(('Отчёт: ' + $candidate))
+                    $writer.WriteLine(('----------------------------------------------'))
+                    $Script:ReportWriter = $writer
+                    $writer = $null
                     $Script:ReportPath = $candidate
                     $Script:ReportStart = Get-Date
                     $Script:ReportPhase = 'Начало операции'
                     $Script:ReportPhaseStart = Get-Date
                     $Script:ProgressStep = 0
-                    $Script:ProgressStepTotal = switch ($Operation) {
-                        'ЭКСПОРТ' { 15 }
-                        'ИМПОРТ' { 14 }
-                        'ПРЯМОЙ ПЕРЕНОС' { 29 }
-                        default { 8 }
-                    }
                     $Script:ReportWarnings = 0
                     $Script:ReportErrors = 0
                     Write-Host ('Итоговый отчёт: ' + $candidate) -ForegroundColor Cyan
                     Write-OperationReport 'ДИАГНОСТИКА' ('PowerShell ' + $PSVersionTable.PSVersion +
                         '; PID=' + $PID + '; 64-битный процесс=' + [Environment]::Is64BitProcess +
-                        '; операция=' + $Operation + '; версия инструмента=1.10.0')
+                        '; операция=' + $Operation + '; версия инструмента=' + $Script:WpmVersion)
                     return
                 } catch [System.IO.IOException] {
                     # On collision try another name. For a read-only drive, fall back
                     # to ProgramData instead of destroying any existing report.
                     $lastError = $_.Exception
-                    if ($stream) { $stream.Dispose() }
                 } finally {
+                    if ($writer) { $writer.Dispose() }
                     if ($stream) { $stream.Dispose() }
                 }
             }
@@ -100,9 +98,9 @@ function Write-OperationReport([string]$Category,[string]$Message) {
     if (-not $Script:ReportPath) { return }
     if ($Category -eq 'ПРЕДУПРЕЖДЕНИЕ') { $Script:ReportWarnings++ }
     if ($Category -eq 'ОШИБКА') { $Script:ReportErrors++ }
-    $line = '[{0}] [{1}] [Этап: {2}] {3}{4}' -f (Get-Date -Format 'HH:mm:ss.fff'),$Category,$Script:ReportPhase,$Message,[Environment]::NewLine
+    $line = '[{0}] [{1}] [Этап: {2}] {3}' -f (Get-Date -Format 'HH:mm:ss.fff'),$Category,$Script:ReportPhase,$Message
     try {
-        [System.IO.File]::AppendAllText($Script:ReportPath,$line,[System.Text.UTF8Encoding]::new($false))
+        $Script:ReportWriter.WriteLine($line)
     } catch {
         Write-Host ('Не удалось дописать итоговый отчёт: ' + $_.Exception.Message) -ForegroundColor Red
     }
@@ -113,6 +111,10 @@ function Finish-OperationReport([string]$Status) {
     if ($Status -eq 'УСПЕШНО' -and $Script:ReportWarnings -gt 0) {
         $Status = 'УСПЕШНО, ЕСТЬ ПРЕДУПРЕЖДЕНИЯ'
     }
+    if ($Script:ReportPhaseStart) {
+        $seconds = [Math]::Round(((Get-Date) - $Script:ReportPhaseStart).TotalSeconds,1)
+        Write-OperationReport 'ВРЕМЯ ЭТАПА' ($Script:ReportPhase + ': ' + $seconds + ' с')
+    }
     Write-OperationReport 'ИТОГ' ('Результат операции: ' + $Status)
     if ($Script:ReportStart) {
         $elapsed = (Get-Date) - $Script:ReportStart
@@ -122,12 +124,17 @@ function Finish-OperationReport([string]$Status) {
     Write-OperationReport 'ИТОГ' ('Завершено: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'))
     $completed = $Script:ReportPath
     $Script:ReportPath = $null
-    Write-Progress -Id 0 -Activity 'Выполнение операции' -Completed
+    try { $Script:ReportWriter.Dispose() }
+    catch { Write-Host ('Не удалось закрыть отчёт: ' + $_.Exception.Message) -ForegroundColor Yellow }
+    finally { $Script:ReportWriter = $null }
+    foreach ($progressId in 0..6) {
+        Write-Progress -Id $progressId -Activity 'Выполнение операции' -Completed
+    }
     Write-Host ('Один итоговый отчёт по операции: ' + $completed) -ForegroundColor Cyan
 }
 
-# Показывает реальные завершённые этапы (в процентах от числа этапов).
-# Проценты отдельного длительного действия выводит его собственный индикатор.
+# Состав этапов зависит от сценария. Считаем выполненные этапы, а проценты
+# показываем только для действий с известным объёмом работы.
 function Advance-OperationStage([string]$Stage) {
     if (-not $Script:ReportPath) { return }
     if ($Script:ReportPhaseStart) {
@@ -136,11 +143,10 @@ function Advance-OperationStage([string]$Stage) {
     }
     $Script:ReportPhase = $Stage
     $Script:ReportPhaseStart = Get-Date
-    $Script:ProgressStep = [Math]::Min(($Script:ProgressStep+1),$Script:ProgressStepTotal)
-    $percentage = if ($Script:ProgressStepTotal -gt 0) { [int][Math]::Floor(100.0 * $Script:ProgressStep / $Script:ProgressStepTotal) } else { 0 }
+    $Script:ProgressStep++
     Write-Progress -Id 0 -Activity 'Миграция профиля - выполненные этапы' -Status ($Stage +
-        ' | завершено этапов: ' + $Script:ProgressStep + ' из ' + $Script:ProgressStepTotal) -PercentComplete $percentage
-    Write-OperationReport 'ЭТАП' ('Начат: ' + $Stage + '; выполнено этапов ' + $Script:ProgressStep + '/' + $Script:ProgressStepTotal + ' (' + $percentage + '% по этапам)')
+        ' | завершено этапов: ' + $Script:ProgressStep) -PercentComplete -1
+    Write-OperationReport 'ЭТАП' ($Stage + '; выполнено этапов: ' + $Script:ProgressStep)
 }
 
 # Добавляет в тот же отчёт причину сбоя, тип исключения и точку в скрипте.
@@ -378,8 +384,14 @@ function Title([string]$Value) {
 }
 # Разрешает ввод только целого числа в заданном диапазоне.
 function Choice([string]$Prompt, [int]$Maximum, [int]$Minimum = 0) {
+    if ($Maximum -lt $Minimum) { throw 'Нет доступных вариантов для выбора.' }
     while ($true) {
-        $s = (Read-Host $Prompt).Trim()
+        $answer = Read-Host $Prompt
+        if ($null -eq $answer) {
+            if ($Minimum -le 0 -and $Maximum -ge 0) { return 0 }
+            throw [System.OperationCanceledException]::new('Ввод завершён.')
+        }
+        $s = $answer.Trim()
         $n = 0
         if ([int]::TryParse($s, [ref]$n) -and $n -ge $Minimum -and $n -le $Maximum) { return $n }
         Write-Host ('Введите число от {0} до {1}.' -f $Minimum, $Maximum) -ForegroundColor Yellow
@@ -406,7 +418,8 @@ function Ensure-Admin {
     if (-not [Environment]::Is64BitProcess) {
         throw 'Нужен 64-битный Windows PowerShell. Запустите Start.cmd из обычного проводника Windows.'
     }
-    if ((Get-CimInstance Win32_OperatingSystem).Version -notmatch '^10\.') {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+    if ($os.ProductType -ne 1 -or $os.Version -notmatch '^10\.') {
         throw 'Поддерживаются Windows 10 и 11.'
     }
     $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -437,7 +450,7 @@ function Get-UsmtPath {
 }
 # Выбирает официальный загрузчик ADK в зависимости от сборки Windows.
 function Get-ADKDownload {
-    $v = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue).DisplayVersion
+    $v = Get-ItemPropertyValue -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name 'DisplayVersion' -ErrorAction SilentlyContinue
     if ($v -eq '26H1') {
         return [pscustomobject]@{ Label='Windows ADK 10.1.28000.3481'; Url='https://go.microsoft.com/fwlink/?linkid=2337875' }
     }
@@ -458,43 +471,54 @@ function Install-USMT {
     Write-Host ('Источник: ' + $item.Label)
     Write-Host 'Скачается установщик с сайта Microsoft, затем установится только USMT.'
     if (-not (Confirm 'Скачать официальный установщик Windows ADK?')) { return }
-    Write-Progress -Id 0 -Activity 'Подготовка USMT - выполненные этапы' -Status 'Проверка установщика (1 из 4)' -PercentComplete 25
-    $cache = Join-Path $env:ProgramData 'WindowsProfileMigration\Installers'
-    [void](New-Item -ItemType Directory -Path $cache -Force)
-    $installer = Join-Path $cache (('adksetup_' + $item.Label) -replace '[^a-zA-Z0-9_.-]', '_')
-    $installer += '.exe'
-    if (-not (Test-OfficialInstaller $installer)) {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        $partial = $installer + '.download.exe'
+    $folder = Join-Path ([IO.Path]::GetTempPath()) ('WPM_ADK_' + [guid]::NewGuid().ToString('N'))
+    $installer = Join-Path $folder 'adksetup.exe'
+    $downloadProtocol = [Net.ServicePointManager]::SecurityProtocol
+    [void](New-Item -ItemType Directory -Path $folder -ErrorAction Stop)
+    $verificationLock = $null
+    $proc = $null
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = $downloadProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Write-Progress -Id 1 -Activity 'Подготовка USMT' -Status 'Скачивание Windows ADK' -PercentComplete -1
+        Invoke-WebRequest -Uri $item.Url -OutFile $installer -UseBasicParsing -MaximumRedirection 10 -TimeoutSec 120
+        # Пока проверяется подпись и работает процесс, файл открыт только для чтения.
+        $verificationLock = [IO.File]::Open($installer,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        if (-not (Test-OfficialInstaller $installer)) {
+            throw 'Подпись установщика не прошла проверку. Установка остановлена.'
+        }
+        Advance-OperationStage 'Подпись установщика Microsoft проверена'
+        if (-not (Confirm 'Установить компонент USMT?')) { return }
+        Write-Progress -Id 1 -Activity 'Подготовка USMT' -Status 'Установка компонента USMT' -PercentComplete -1
+        $installerArguments = '/quiet /norestart /ceip off /features OptionId.UserStateMigrationTool'
+        $proc = Start-Process -FilePath $installer -ArgumentList $installerArguments -PassThru -Wait -WorkingDirectory $folder -ErrorAction Stop
+        $code = $proc.ExitCode
+        Write-OperationReport 'ДИАГНОСТИКА' ('Код завершения установщика ADK: ' + $code)
+        if ($null -eq $code -or $code -notin @(0,3010)) { throw ('Ошибка установщика ADK, код ' + $code) }
+        if ($code -eq 3010) {
+            $Script:RestartRequired = $true
+            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Для работы USMT потребуется перезагрузка Windows.'
+            Write-Host 'Для работы потребуется перезагрузка Windows.' -ForegroundColor Yellow
+            return
+        }
+        if (-not (Get-UsmtPath)) { throw 'Установка завершилась, но USMT не обнаружен.' }
+        Advance-OperationStage 'Компонент USMT установлен'
+    } finally {
+        [Net.ServicePointManager]::SecurityProtocol = $downloadProtocol
+        if ($proc) { $proc.Dispose() }
+        if ($verificationLock) { $verificationLock.Dispose() }
+        Write-Progress -Id 1 -Activity 'Подготовка USMT' -Completed
         try {
-            if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force }
-            Write-Host 'Загрузка...' -ForegroundColor Cyan
-            Write-Progress -Id 0 -Activity 'Подготовка USMT - выполненные этапы' -Status 'Скачивание ADK (2 из 4)' -PercentComplete 50
-            Invoke-WebRequest -Uri $item.Url -OutFile $partial -UseBasicParsing -MaximumRedirection 10
-            if (-not (Test-OfficialInstaller $partial)) {
-                throw 'Подпись установщика не прошла проверку. Установка остановлена.'
+            $itemFolder = Get-Item -LiteralPath $folder -Force -ErrorAction Stop
+            if ($itemFolder.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw 'Временная папка установщика была заменена ссылкой.'
             }
-            Move-Item -LiteralPath $partial -Destination $installer -Force
-        } finally {
-            try {
-                if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force -ErrorAction Stop }
-            } catch { Write-Host ('Не удалось удалить неполную загрузку: ' + $_.Exception.Message) -ForegroundColor Yellow }
+            [IO.File]::Delete($installer)
+            [IO.Directory]::Delete($folder)
+        } catch {
+            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Папка установщика оставлена: ' + $folder + '; ' + $_.Exception.Message)
+            Write-Host ('Не удалось очистить папку установщика: ' + $folder) -ForegroundColor Yellow
         }
     }
-    Write-Host 'Подпись Microsoft проверена.' -ForegroundColor Green
-    Write-Progress -Id 0 -Activity 'Подготовка USMT - выполненные этапы' -Status 'Проверка подписи выполнена (3 из 4)' -PercentComplete 75
-    if (-not (Confirm 'Установить компонент USMT?')) { return }
-    $args = '/quiet /norestart /ceip off /features OptionId.UserStateMigrationTool'
-    $proc = Start-Process -FilePath $installer -ArgumentList $args -PassThru -Wait -WorkingDirectory $cache
-    if ($proc.ExitCode -notin @(0,3010)) { throw ('Ошибка установщика ADK, код ' + $proc.ExitCode) }
-    if ($proc.ExitCode -eq 3010) {
-        $Script:RestartRequired = $true
-        Write-Host 'Для работы потребуется перезагрузка Windows.' -ForegroundColor Yellow
-        return
-    }
-    if (-not (Get-UsmtPath)) { throw 'Установка завершилась, но USMT не обнаружен.' }
-    Write-Progress -Id 0 -Activity 'Подготовка USMT - выполненные этапы' -Status 'USMT установлен (4 из 4)' -PercentComplete 100
-    Write-Progress -Id 0 -Activity 'Подготовка USMT' -Completed
 }
 # Если USMT не найден, предлагает числовые варианты установки, повторного поиска или выхода.
 function Require-USMT {
@@ -505,9 +529,9 @@ function Require-USMT {
         Title 'USMT НЕ НАЙДЕН'
         Write-Host '1. Скачать и установить с сайта Microsoft'
         Write-Host '2. Повторить поиск (если USMT скопировали рядом со скриптом)'
-        Write-Host '0. Выход'
+        Write-Host '0. Назад'
         switch (Choice 'Выберите пункт' 2) {
-            1 { try { Install-USMT } catch { $Script:HadFailures = $true; Write-Host $_.Exception.Message -ForegroundColor Red; Pause-Menu } }
+            1 { Install-USMT }
             2 { }
             0 { return $null }
         }
@@ -515,6 +539,7 @@ function Require-USMT {
 }
 # Готовит кавычки для аргументов Windows. Нужен и для UNC, и для каталогов с пробелами.
 function Quote-WindowsArgument([string]$Value) {
+    if ([string]::IsNullOrEmpty($Value)) { return '""' }
     if ($Value -notmatch '[\s"]') { return $Value }
     # Правила CreateProcess: экранируем кавычки и завершающие обратные слеши.
     $result = '"'
@@ -540,9 +565,11 @@ function Show-UsmtProgress([string]$ProgressPath,[string]$Caption) {
         try {
             $tail = @(Get-Content -LiteralPath $ProgressPath -Tail 100 -ErrorAction Stop)
             foreach ($line in $tail) {
-                if ($line -match '(?i)\btotalPercentageCompleted\s*[,=: ]\s*"?(\d{1,3})(?:[.,]\d+)?') {
-                    [int]$value=[int]$Matches[1]
-                    if ($value -ge 0 -and $value -le 100) { $last=$value }
+                if ($line -match '(?i)\btotalPercentageCompleted"?\s*[,=: ]\s*"?(\d{1,3}(?:[.,]\d+)?)(?=$|["\s;]|,(?!\d))') {
+                    [double]$value = 0
+                    if ([double]::TryParse($Matches[1].Replace(',','.'),[Globalization.NumberStyles]::AllowDecimalPoint,[Globalization.CultureInfo]::InvariantCulture,[ref]$value) -and $value -le 100) {
+                        $last = [int][Math]::Floor($value)
+                    }
                 }
             }
         } catch { }
@@ -572,8 +599,8 @@ function Test-RunningProcessStopRequest([string]$Activity,[int]$ProgressId) {
 # Запускает USMT и обновляет индикатор в течение выполнения процесса.
 function Invoke-USMT([string]$File,[string[]]$Options,[string]$WorkingPath,[string]$ProgressPath = '') {
     $argLine = (@($Options | ForEach-Object { Quote-WindowsArgument ([string]$_) }) -join ' ')
-    Push-Location -LiteralPath $WorkingPath
     $proc = $null
+    $code = $null
     try {
         $proc = Start-Process -FilePath $File -WorkingDirectory $WorkingPath -ArgumentList $argLine -PassThru -NoNewWindow -ErrorAction Stop
         # В Windows PowerShell Start-Process -NoNewWindow может вернуть null
@@ -586,8 +613,14 @@ function Invoke-USMT([string]$File,[string[]]$Options,[string]$WorkingPath,[stri
                 if ($proc.HasExited) { break }
                 # Останавливаем только дочерний процесс, запущенный этой операцией.
                 # Удаление целевого профиля и исходных данных не выполняется.
-                $proc.Kill()
-                $proc.WaitForExit()
+                try { $proc.Kill() }
+                catch [InvalidOperationException] {
+                    if ($proc.HasExited) { break }
+                    throw
+                }
+                if (-not $proc.WaitForExit(30000)) {
+                    throw 'USMT не подтвердил завершение после запроса остановки.'
+                }
                 throw [System.OperationCanceledException]::new(('USMT остановлен пользователем: ' + [IO.Path]::GetFileName($File)))
             }
         }
@@ -596,11 +629,11 @@ function Invoke-USMT([string]$File,[string[]]$Options,[string]$WorkingPath,[stri
     } finally {
         Write-Progress -Id 1 -Activity 'USMT' -Completed
         if ($proc) { $proc.Dispose() }
-        Pop-Location
     }
     if ($null -eq $code) {
         throw 'Не удалось прочитать код завершения USMT. Проверьте журнал запуска; успех не подтверждён.'
     }
+    Write-OperationReport 'ДИАГНОСТИКА' ('Код завершения ' + [IO.Path]::GetFileName($File) + ': ' + $code)
     if ($code -ne 0) {
         Append-UsmtLogTail $Options
         $action = if (@($Options | Where-Object { $_ -like '/genconfig:*' }).Count -gt 0) {
@@ -3415,7 +3448,7 @@ try {
     # Подготовка приёмника и просмотр состояний доступны без установленного ADK.
     $usmt = Get-UsmtPath
     while ($true) {
-        Title 'МИГРАЦИЯ ПРОФИЛЕЙ WINDOWS | v1.10.0'
+        Title ('МИГРАЦИЯ ПРОФИЛЕЙ WINDOWS | v' + $Script:WpmVersion)
         Write-Host ('Компьютер: ' + $env:COMPUTERNAME)
         Write-Host ('Папка архивов: ' + $Script:BackupRoot)
         $readyArchives = @(Get-AvailableArchives)
@@ -3436,17 +3469,17 @@ try {
         $n = Choice 'Выберите действие' 7
         if ($n -eq 0) { break }
         if ($n -eq 4) { Show-RecoveryMenu; Pause-Menu; continue }
-        if ($n -in @(1,2,3,5,7) -and -not $usmt) {
-            $usmt = Require-USMT
-            if (-not $usmt) {
-                if ($Script:HadFailures) { Write-Host 'USMT ещё не установлен. Попробуйте пункт меню снова.' -ForegroundColor Yellow }
-                continue
-            }
-        }
         try {
             $action = switch ($n) { 1 { 'ЭКСПОРТ' }; 2 { 'ИМПОРТ' }; 3 { 'ПРОВЕРКА АРХИВА' }; 5 { 'ПРЯМОЙ ПЕРЕНОС' }; 6 { 'ПОДГОТОВКА СЕТИ' }; 7 { 'ВОЗОБНОВЛЕНИЕ ПЕРЕНОСА' } }
             Start-OperationReport $action
             Write-OperationReport 'НАЧАТО' ('Действие: ' + $action)
+            if ($n -in @(1,2,3,5,7) -and -not $usmt) {
+                $usmt = Require-USMT
+                if (-not $usmt) {
+                    Write-OperationReport 'ПРОВЕРКА' 'USMT не готов. Миграция не запускалась.'
+                    continue
+                }
+            }
             switch ($n) {
                 1 { [void](Do-Export $usmt) }
                 2 { [void](Do-Import $usmt $false) }
