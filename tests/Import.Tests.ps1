@@ -1,11 +1,20 @@
 ﻿# Проверки импорта на синтетических данных без изменения профилей Windows.
 . (Get-WpmFunctionDefinitions -ScriptName 'ProfileMigration.ps1' -Name @(
-    'Assert-ArchiveMetadata','Assert-WpmDirectoryChain','New-OperationStateDirectory',
+    'Assert-ArchiveMetadata','Assert-WpmDirectoryChain','New-WpmWorkDirectoryAcl','Assert-WpmWorkAcl',
+    'Initialize-WpmWorkDirectory','Assert-WpmWorkRoot',
     'Save-TrackedState','Get-TrackedStates','Enter-ProfileMutationLock','Assert-TrackedOperationStopped',
     'Assert-OperationTreeHasNoReparsePoint','Assert-SafeStaging','Resolve-ImportTarget',
-    'Select-ImportDestination','Assert-NoUnreviewedImport'
+    'Select-ImportDestination','Assert-NoUnreviewedImport','Show-RecoveryMenu','Assert-RegularNetworkPartial',
+    'Clear-NetworkPartial','Restore-PreviousDesktopLayout','Read-ExtraJson','Assert-ProfileExtraPath',
+    'Get-ExtraStreamSha256','Test-ExtraPathComponent'
 ))
 
+function Set-ImportTestDirectories([string]$Root) {
+    $script:WpmWorkRoot = Join-Path $Root 'Private'
+    $script:OpStateRoot = Join-Path $script:WpmWorkRoot 'Operations'
+    $script:WpmStagingRoot = Join-Path $script:WpmWorkRoot 'Staging'
+    $script:LegacyOpStateRoot = Join-Path $Root 'Legacy'
+}
 function New-ImportTestMetadata {
     [pscustomobject]@{
         SchemaVersion=7;SourceAccount='SOURCE\пользователь';SourceSid='S-1-5-21-1-2-3-1001';
@@ -49,7 +58,7 @@ Invoke-WpmTest 'Import metadata rejects malformed identity and local namespace m
 }
 
 Invoke-WpmTest 'State replace preserves exactly one complete durable record' {
-    $script:OpStateRoot = Join-Path $WpmTestRoot 'Operations'
+    Set-ImportTestDirectories $WpmTestRoot
     $state = New-ImportTestState
     Save-TrackedState $state
     $state.USMTStarted = $true
@@ -64,7 +73,7 @@ Invoke-WpmTest 'State replace preserves exactly one complete durable record' {
 }
 
 Invoke-WpmTest 'Corrupt retained operation cannot be mistaken for no prior import' {
-    $script:OpStateRoot = Join-Path $WpmTestRoot 'Operations'
+    Set-ImportTestDirectories $WpmTestRoot
     $state = New-ImportTestState
     Save-TrackedState $state
     $file = Join-Path $script:OpStateRoot ($state.Id + '.json')
@@ -73,7 +82,7 @@ Invoke-WpmTest 'Corrupt retained operation cannot be mistaken for no prior impor
 }
 
 Invoke-WpmTest 'Mutation lock rejects another writer and supports reacquisition' {
-    $script:OpStateRoot = Join-Path $WpmTestRoot 'Operations'
+    Set-ImportTestDirectories $WpmTestRoot
     $lock = Enter-ProfileMutationLock
     try {
         Assert-WpmThrows { $conflicting = Enter-ProfileMutationLock; $conflicting.Dispose() } 'блокировку'
@@ -96,7 +105,7 @@ Invoke-WpmTest 'Recovery blocks active-process records but allows released recor
 }
 
 Invoke-WpmTest 'Interrupted import requires review for matching SID or saved name' {
-    $script:OpStateRoot = Join-Path $WpmTestRoot 'Operations'
+    Set-ImportTestDirectories $WpmTestRoot
     $script:ActiveOpState = @{Id='current'}
     try {
         $prior = New-ImportTestState
@@ -114,7 +123,7 @@ Invoke-WpmTest 'Interrupted import requires review for matching SID or saved nam
 }
 
 Invoke-WpmTest 'Account creation without a saved SID requires review after interruption' {
-    $script:OpStateRoot = Join-Path $WpmTestRoot 'Operations'
+    Set-ImportTestDirectories $WpmTestRoot
     $script:ActiveOpState = @{Id='current'}
     try {
         $prior = New-ImportTestState
@@ -166,18 +175,16 @@ Invoke-WpmTest 'Destination menu zero stops before reading a name' {
 }
 
 Invoke-WpmTest 'Cleanup accepts only the direct owned staging directory' {
-    $savedProgramData = $env:ProgramData
-    $env:ProgramData = $WpmTestRoot
-    try {
-        $root = Join-Path $env:ProgramData 'WindowsProfileMigration\Staging'
-        $valid = Join-Path $root 'ImportCache_20260402_123456_789_abcdef01'
-        $nested = Join-Path (Join-Path $root 'other') 'ImportCache_20260402_123456_789_abcdef01'
-        $prefixOnly = Join-Path $root 'ImportCache_unowned'
-        [void][IO.Directory]::CreateDirectory($valid)
-        Assert-WpmEqual (Assert-SafeStaging $valid) $valid
-        Assert-WpmThrows { Assert-SafeStaging $nested } 'Очистка запрещена'
-        Assert-WpmThrows { Assert-SafeStaging $prefixOnly } 'Очистка запрещена'
-    } finally { $env:ProgramData = $savedProgramData }
+    Set-ImportTestDirectories $WpmTestRoot
+    $root = $script:WpmStagingRoot
+    Initialize-WpmWorkDirectory $root
+    $valid = Join-Path $root 'ImportCache_20260402_123456_789_abcdef01'
+    $nested = Join-Path (Join-Path $root 'other') 'ImportCache_20260402_123456_789_abcdef01'
+    $prefixOnly = Join-Path $root 'ImportCache_unowned'
+    [void][IO.Directory]::CreateDirectory($valid)
+    Assert-WpmEqual (Assert-SafeStaging $valid) $valid
+    Assert-WpmThrows { Assert-SafeStaging $nested } 'Очистка запрещена'
+    Assert-WpmThrows { Assert-SafeStaging $prefixOnly } 'Очистка запрещена'
 }
 
 function Invoke-ImportFixture([object]$Metadata,[int]$StagedSchema,[uint64]$Available,[scriptblock]$Verify) {
@@ -185,8 +192,7 @@ function Invoke-ImportFixture([object]$Metadata,[int]$StagedSchema,[uint64]$Avai
         'Do-Import','Read-ArchiveMetadataFile','Read-BoundedArchiveMetadata','Assert-NoReparseAncestor'))
     $archive = Join-Path $WpmTestRoot 'backup.zip'
     [IO.File]::WriteAllBytes($archive,[byte[]]@(1,2,3))
-    $savedProgramData = $env:ProgramData
-    $env:ProgramData = $WpmTestRoot
+    Set-ImportTestDirectories $WpmTestRoot
     $script:SupportedArchiveSchemas = @(1,2,3,4,5,6,7)
     $fixture = @{ ExpandCalls=0;VerifyCalls=0;CleanupCalls=0;LockCalls=0 }
     function Start-TrackedState([string]$Kind,[string]$Archive) {
@@ -204,7 +210,8 @@ function Invoke-ImportFixture([object]$Metadata,[int]$StagedSchema,[uint64]$Avai
     function Get-PathFreeBytes([string]$Path) { return $Available }
     function Format-ByteSize([uint64]$Bytes) { return [string]$Bytes }
     function New-StagingDirectory([string]$Prefix) {
-        $root = Join-Path $env:ProgramData 'WindowsProfileMigration\Staging'
+        $root = $script:WpmStagingRoot
+        Initialize-WpmWorkDirectory $root
         $path = Join-Path $root 'ImportCache_20260402_123456_789_abcde123'
         [void][IO.Directory]::CreateDirectory($path)
         return $path
@@ -226,7 +233,6 @@ function Invoke-ImportFixture([object]$Metadata,[int]$StagedSchema,[uint64]$Avai
     try {
         & $Verify $archive $fixture
     } finally {
-        $env:ProgramData = $savedProgramData
         $script:ActiveOpState = $null
     }
 }
@@ -260,4 +266,92 @@ Invoke-WpmTest 'Changed staged archive schema fails before integrity or profile 
         Assert-WpmEqual $fixture.CleanupCalls 1
         Assert-WpmEqual $fixture.LockCalls 0
     }
+}
+
+function Write-LegacyTestState([hashtable]$Record) {
+    [void][IO.Directory]::CreateDirectory($script:LegacyOpStateRoot)
+    $path = Join-Path $script:LegacyOpStateRoot ($Record.Id + '.json')
+    [IO.File]::WriteAllText($path,($Record | ConvertTo-Json -Depth 4))
+    return $path
+}
+
+Invoke-WpmTest 'Legacy JSON is never a recovery mutation authority' {
+    Set-ImportTestDirectories $WpmTestRoot
+    $legacy = New-ImportTestState
+    $legacy.CreatedByTool = $true
+    $legacy.DesktopBackup = 'forged'
+    $legacy.NetworkPartialPath = 'forged'
+    $legacy.LastUpdated = '2026-04-02'
+    $file = Write-LegacyTestState $legacy
+    $original = [IO.File]::ReadAllText($file)
+    $trace = @{ Choices=0 }
+    function Title([string]$Label) {}
+    function Choice([string]$Label,[int]$Options) {
+        $trace.Choices++
+        return 1
+    }
+    function Enter-ProfileMutationLock { throw 'Legacy state reached a mutation' }
+    Show-RecoveryMenu
+    Assert-WpmEqual $trace.Choices 1
+    Assert-WpmEqual ([IO.File]::ReadAllText($file)) $original
+    Assert-WpmEqual (Test-Path -LiteralPath $script:WpmWorkRoot) $false
+}
+
+Invoke-WpmTest 'Legacy interrupted matching import requires manual review despite untrusted reviewed flag' {
+    Set-ImportTestDirectories $WpmTestRoot
+    $script:ActiveOpState = @{Id='current'}
+    try {
+        $legacy = New-ImportTestState
+        $legacy.USMTStarted = $true
+        $legacy.RecoveryReviewed = $true
+        [void](Write-LegacyTestState $legacy)
+        Assert-WpmThrows {
+            Assert-NoUnreviewedImport ([pscustomobject]@{Account=$legacy.TargetAccount;Sid=''})
+        } 'старая незавершённая операция'
+        Assert-NoUnreviewedImport ([pscustomobject]@{Account='OTHER\user';Sid='S-1-5-21-1-2-3-1001'})
+    } finally { $script:ActiveOpState = $null }
+}
+
+Invoke-WpmTest 'Partial ZIP cleanup accepts one exact generated file only and preserves completed ZIP' {
+    Set-ImportTestDirectories $WpmTestRoot
+    function Write-OperationReport([string]$Category,[string]$Message) {}
+    $archive = Join-Path $WpmTestRoot 'profile.zip'
+    $temp = $archive + '.partial_a123bcde'
+    $state = New-ImportTestState
+    $state.Kind = 'Экспорт'
+    $state.SourceArchive = $archive
+    $state.NetworkPartialPath = $archive + '.partial_unowned'
+    Assert-WpmThrows { Clear-NetworkPartial $state $false } 'Подозрительное имя'
+    $state.NetworkPartialPath = $temp
+    [void][IO.Directory]::CreateDirectory($temp)
+    Assert-WpmThrows { Clear-NetworkPartial $state $false } 'обычным файлом'
+    Assert-WpmEqual (Test-Path -LiteralPath $temp -PathType Container) $true
+    [IO.Directory]::Delete($temp)
+    [IO.File]::WriteAllText($archive,'completed archive')
+    [IO.File]::WriteAllText($temp,'partial archive')
+    Clear-NetworkPartial $state $false
+    Assert-WpmEqual (Test-Path -LiteralPath $temp) $false
+    Assert-WpmEqual ([IO.File]::ReadAllText($archive)) 'completed archive'
+}
+
+Invoke-WpmTest 'Desktop rollback rejects missing or tampered trusted digest before registry' {
+    Set-ImportTestDirectories $WpmTestRoot
+    $root = Join-Path $script:WpmWorkRoot 'DesktopBackups'
+    Initialize-WpmWorkDirectory $root
+    $file = Join-Path $root 'Desktop_00112233445566778899aabbccddeeff.json'
+    [IO.File]::WriteAllText($file,'original')
+    $digest = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+    [IO.File]::WriteAllText($file,'tampered')
+    function Get-CimInstance { throw 'Unexpected profile lookup' }
+    Assert-WpmThrows { Restore-PreviousDesktopLayout $file '' } 'контрольная сумма'
+    Assert-WpmThrows { Restore-PreviousDesktopLayout $file $digest } 'изменился после проверки'
+}
+
+Invoke-WpmTest 'Private work initializer rejects paths outside its direct child boundary' {
+    Set-ImportTestDirectories $WpmTestRoot
+    $outside = Join-Path $WpmTestRoot 'Outside'
+    $nested = Join-Path $script:WpmStagingRoot 'Nested'
+    Assert-WpmThrows { Initialize-WpmWorkDirectory $outside } 'Недопустимый рабочий каталог'
+    Assert-WpmThrows { Initialize-WpmWorkDirectory $nested } 'Недопустимый рабочий каталог'
+    Assert-WpmEqual (Test-Path -LiteralPath $outside) $false
 }

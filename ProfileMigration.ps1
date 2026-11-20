@@ -32,7 +32,10 @@ $Script:ReportPhaseStart = $null
 $Script:ProgressStep = 0
 $Script:ActiveOpState = $null
 $Script:HadFailures = $false
-$Script:OpStateRoot = Join-Path $env:ProgramData 'WindowsProfileMigration\Operations'
+$Script:WpmWorkRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)) 'WindowsProfileMigration-Work'
+$Script:OpStateRoot = Join-Path $Script:WpmWorkRoot 'Operations'
+$Script:WpmStagingRoot = Join-Path $Script:WpmWorkRoot 'Staging'
+$Script:LegacyOpStateRoot = Join-Path $env:ProgramData 'WindowsProfileMigration\Operations'
 
 # One human-readable report per operation. The file name is never reused:
 # CreateNew protects against collisions even when operations start simultaneously.
@@ -205,17 +208,67 @@ function Assert-WpmDirectoryChain([string]$Path) {
     }
 }
 
-function New-OperationStateDirectory {
-    Assert-WpmDirectoryChain $Script:OpStateRoot
-    [void][IO.Directory]::CreateDirectory($Script:OpStateRoot)
-    Assert-WpmDirectoryChain $Script:OpStateRoot
+function New-WpmWorkDirectoryAcl {
+    $admin = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+    $acl = [Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetOwner($admin)
+    $acl.SetAccessRuleProtection($true,$false)
+    foreach ($identity in @($admin,$system)) {
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $identity,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
+    }
+    return $acl
 }
 
+function Assert-WpmWorkAcl([string]$Path) {
+    Assert-WpmDirectoryChain $Path
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return }
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    $trusted = @('S-1-5-32-544','S-1-5-18')
+    $aclRules = $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])
+    if (-not $acl.AreAccessRulesProtected -or
+        $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $trusted) {
+        throw ('Рабочий каталог не защищён. Проверьте владельца и права каталога: ' + $Path)
+    }
+    foreach ($rule in $aclRules) {
+        if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -notin $trusted) {
+            throw ('Рабочий каталог доступен посторонним: ' + $Path)
+        }
+    }
+}
+
+function Assert-WpmWorkRoot {
+    Assert-WpmWorkAcl $Script:WpmWorkRoot
+}
+
+function Initialize-WpmWorkDirectory([string]$Path) {
+    $root = [IO.Path]::GetFullPath($Script:WpmWorkRoot)
+    $directory = [IO.Path]::GetFullPath($Path)
+    if ([IO.Path]::GetDirectoryName($directory) -ine $root) { throw 'Недопустимый рабочий каталог.' }
+    foreach ($candidate in @($root,$directory)) {
+        Assert-WpmDirectoryChain $candidate
+        if (-not (Test-Path -LiteralPath $candidate -PathType Container -ErrorAction Stop)) {
+            # В Windows владелец и DACL устанавливаются при создании, до появления данных.
+            if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+                $acl = New-WpmWorkDirectoryAcl
+                if ($PSVersionTable.PSEdition -eq 'Desktop') {
+                    [void][IO.Directory]::CreateDirectory($candidate,$acl)
+                } else {
+                    [void][IO.FileSystemAclExtensions]::CreateDirectory($acl,$candidate)
+                }
+            } else {
+                [void][IO.Directory]::CreateDirectory($candidate)
+            }
+        }
+        Assert-WpmWorkAcl $candidate
+    }
+}
 function Save-TrackedState([hashtable]$State) {
     if ([string]$State.Id -notmatch '^WPM_\d{8}_\d{6}_\d{3}_[a-f0-9]{12}$') {
         throw 'Некорректный идентификатор операции.'
     }
-    New-OperationStateDirectory
+    Initialize-WpmWorkDirectory $Script:OpStateRoot
     $path = Join-Path $Script:OpStateRoot ($State.Id + '.json')
     $tmp = $path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
     $stream = $null
@@ -252,7 +305,7 @@ function Start-TrackedState([string]$Kind,[string]$Archive) {
         Kind=$Kind; Status='Начато'; SourceArchive=$Archive; TargetAccount='';
         CreatedAccount=''; CreatedSid=''; CreatedByTool=$false; AccountCreationPending=$false;
         TargetSid=''; TargetProfile=''; RecoveryReviewed=$false; ImportCompleted=$false;
-        StagingPath=''; StagingDisposition=''; StagingPurpose=''; DesktopBackup='';
+        StagingPath=''; StagingDisposition=''; StagingPurpose=''; DesktopBackup=''; DesktopBackupSha256='';
         NetworkPartialPath=''; BrowserBackupPath=''; ConfigBackupPath='';
         USMTStarted=$false; USMTFinished=$false; CleanupDone=$false;
         LastError=''; LastUpdated=''; Report=[string]$Script:ReportPath;
@@ -267,11 +320,17 @@ function Update-TrackedState([string]$Status,[hashtable]$Fields = @{}) {
     foreach ($key in $Fields.Keys) { $Script:ActiveOpState[$key] = $Fields[$key] }
     Save-TrackedState $Script:ActiveOpState
 }
-function Get-TrackedStates([switch]$RequireReadable,[string]$Id = '') {
-    Assert-WpmDirectoryChain $Script:OpStateRoot
-    if (-not (Test-Path -LiteralPath $Script:OpStateRoot -PathType Container -ErrorAction Stop)) { return }
+function Get-TrackedStates([switch]$RequireReadable,[string]$Id = '',[switch]$Legacy) {
+    $root = if ($Legacy) { $Script:LegacyOpStateRoot } else { $Script:OpStateRoot }
+    if (-not $root) { return }
+    Assert-WpmDirectoryChain $root
+    if (-not (Test-Path -LiteralPath $root -PathType Container -ErrorAction Stop)) { return }
+    if (-not $Legacy) {
+        Assert-WpmWorkRoot
+        Assert-WpmWorkAcl $root
+    }
     $results=@()
-    foreach ($file in @(Get-ChildItem -LiteralPath $Script:OpStateRoot -Filter 'WPM_*.json' -File -Force -ErrorAction Stop)) {
+    foreach ($file in @(Get-ChildItem -LiteralPath $root -Filter 'WPM_*.json' -File -Force -ErrorAction Stop)) {
         if ($Id -and $file.BaseName -cne $Id) { continue }
         if ($file.BaseName -notmatch '^WPM_\d{8}_\d{6}_\d{3}_[a-f0-9]{12}$') { continue }
         try {
@@ -302,7 +361,7 @@ function Get-TrackedStates([switch]$RequireReadable,[string]$Id = '') {
 # Общая блокировка получателя защищает импорт и управляемый откат разных сеансов.
 # Сам файл остаётся на месте, а дескриптор освобождается при завершении процесса.
 function Enter-ProfileMutationLock {
-    New-OperationStateDirectory
+    Initialize-WpmWorkDirectory $Script:OpStateRoot
     $path = Join-Path $Script:OpStateRoot 'profile-mutation.lock'
     if (Test-Path -LiteralPath $path -ErrorAction Stop) {
         $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
@@ -348,12 +407,14 @@ function Assert-OperationTreeHasNoReparsePoint([string]$Path) {
 # Разрешена очистка только собственных временных каталогов под ProgramData.
 function Assert-SafeStaging([string]$Candidate) {
     if (-not $Candidate) { throw 'Временная папка не указана.' }
-    $base = [IO.Path]::GetFullPath((Join-Path $env:ProgramData 'WindowsProfileMigration\Staging'))
+    $base = [IO.Path]::GetFullPath($Script:WpmStagingRoot)
     $full = [IO.Path]::GetFullPath($Candidate)
     if ([IO.Path]::GetDirectoryName($full) -ine $base -or
         [IO.Path]::GetFileName($full) -notmatch '^(ImportCache|Export)_\d{8}_\d{6}_\d{3}_[a-f0-9]{8}$') {
         throw 'Неверный путь временного каталога. Очистка запрещена.'
     }
+    Assert-WpmWorkRoot
+    Assert-WpmWorkAcl $base
     Assert-WpmDirectoryChain $full
     if (Test-Path -LiteralPath $full -ErrorAction Stop) { Assert-OperationTreeHasNoReparsePoint $full }
     return $full
@@ -380,6 +441,13 @@ function Clear-TrackedStaging([hashtable]$State,[bool]$Ask = $false) {
 # Меню для незавершённых импортов: исходные профили и пользовательские данные не удаляются.
 # Удалять сетевую недокопированную папку можно только внутри места публикации,
 # которое записано в исходном состоянии операции.
+function Assert-RegularNetworkPartial([string]$Path) {
+    $file = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($file -isnot [IO.FileInfo] -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'Незавершённый ZIP должен быть обычным файлом. Очистка запрещена.'
+    }
+}
+
 function Clear-NetworkPartial([hashtable]$State,[bool]$Ask = $true) {
     $target=[string]$State.NetworkPartialPath
     $published=[string]$State.SourceArchive
@@ -387,18 +455,22 @@ function Clear-NetworkPartial([hashtable]$State,[bool]$Ask = $true) {
     $final=[IO.Path]::GetFullPath($published).TrimEnd('\')
     $temp=[IO.Path]::GetFullPath($target).TrimEnd('\')
     $parent=[IO.Path]::GetDirectoryName($final)
-    $prefix=[IO.Path]::GetFileName($final) + '.partial_'
-    if ([IO.Path]::GetDirectoryName($temp) -ine $parent -or
-        -not ([IO.Path]::GetFileName($temp)).StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Подозрительный путь сетевого временного каталога. Очистка запрещена.'
+    $finalName = [IO.Path]::GetFileName($final)
+    $partialPattern = '^' + [regex]::Escape($finalName) + '\.partial_[a-f0-9]{8}$'
+    if ([IO.Path]::GetExtension($finalName) -ine '.zip' -or
+        [IO.Path]::GetDirectoryName($temp) -ine $parent -or
+        [IO.Path]::GetFileName($temp) -notmatch $partialPattern) {
+        throw 'Подозрительное имя незавершённого ZIP. Очистка запрещена.'
     }
     Assert-WpmDirectoryChain $parent
-    if (Test-Path -LiteralPath $temp -ErrorAction Stop) { Assert-OperationTreeHasNoReparsePoint $temp }
+    if (Test-Path -LiteralPath $temp -ErrorAction Stop) {
+        Assert-RegularNetworkPartial $temp
+    }
     if ($Ask -and -not (Confirm ('Удалить незавершённую копию ' + $temp + ' ?'))) { return }
     Assert-WpmDirectoryChain $parent
     if (Test-Path -LiteralPath $temp -ErrorAction Stop) {
-        Assert-OperationTreeHasNoReparsePoint $temp
-        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction Stop
+        Assert-RegularNetworkPartial $temp
+        [IO.File]::Delete($temp)
     }
     $State.NetworkPartialPath=''
     Save-TrackedState $State
@@ -407,17 +479,35 @@ function Clear-NetworkPartial([hashtable]$State,[bool]$Ask = $true) {
 }
 function Show-RecoveryMenu {
     Title 'СОСТОЯНИЕ ОПЕРАЦИЙ И УПРАВЛЯЕМАЯ ОЧИСТКА'
-    $items=@(Get-TrackedStates)
+    $items = @(
+        foreach ($record in @(Get-TrackedStates)) { [pscustomobject]@{State=$record;Legacy=$false} }
+        foreach ($record in @(Get-TrackedStates -Legacy)) { [pscustomobject]@{State=$record;Legacy=$true} }
+    )
     if ($items.Count -eq 0) { Write-Host 'Операций пока нет.'; return }
     for ($i=0; $i -lt $items.Count; $i++) {
-        $item=$items[$i]
-        Write-Host ('{0}. {1} | {2} | {3}' -f ($i+1),$item.Kind,$item.Status,$item.LastUpdated)
+        $item = $items[$i]
+        $label = if ($item.Legacy) { 'Старая запись, только просмотр' } else { $item.State.Kind }
+        $status = [string]$item.State.Status -replace '[\x00-\x1F\x7F-\x9F]', '?'
+        $when = if ($item.State.PSObject.Properties['LastUpdated']) {
+            [string]$item.State.LastUpdated -replace '[\x00-\x1F\x7F-\x9F]', '?'
+        } else { '' }
+        Write-Host ('{0}. {1} | {2} | {3}' -f ($i+1),$label,$status,$when)
     }
     Write-Host '0. Назад'
     $index=Choice 'Номер операции' $items.Count
     if ($index -eq 0) { return }
-    $state=$items[$index-1]
+    $selection = $items[$index-1]
+    $state = $selection.State
     Title ('ОПЕРАЦИЯ ' + $state.Id)
+    if ($selection.Legacy) {
+        foreach ($field in @('Kind','Status','LastUpdated','SourceArchive','TargetAccount','StagingPath','NetworkPartialPath','DesktopBackup','LastError')) {
+            if ($state.PSObject.Properties[$field] -and $state.$field) {
+                Write-Host ($field + ': ' + ([string]$state.$field -replace '[\x00-\x1F\x7F-\x9F]', '?'))
+            }
+        }
+        Write-Host 'Старая запись доступна для просмотра. Проверьте перечисленные данные средствами Windows.'
+        return
+    }
     Write-Host ('Результат: ' + $state.Status)
     Write-Host ('Исходный архив: ' + $state.SourceArchive)
     Write-Host ('Целевая учётная запись: ' + $state.TargetAccount)
@@ -482,7 +572,10 @@ function Show-RecoveryMenu {
             }
             3 {
                 if (-not $state.DesktopBackup) { Write-Host 'Резервной копии значков нет.'; return }
-                Restore-PreviousDesktopLayout ([string]$state.DesktopBackup)
+                if (-not $state.PSObject.Properties['DesktopBackupSha256'] -or -not $state.DesktopBackupSha256) {
+                    throw 'Для резервной копии отсутствует зарегистрированная контрольная сумма.'
+                }
+                Restore-PreviousDesktopLayout ([string]$state.DesktopBackup) ([string]$state.DesktopBackupSha256)
             }
             4 {
                 if (-not $state.NetworkPartialPath) { Write-Host 'Незавершённой копии нет.'; return }
@@ -1572,9 +1665,8 @@ function Ensure-PathAvailable([string]$Path,[string]$Caption,[int]$Attempts = 3,
 }
 # Создаёт уникальную локальную папку для подготовки/кеширования сетевого архива.
 function New-StagingDirectory([string]$Prefix) {
-    $base = Join-Path $env:ProgramData 'WindowsProfileMigration\Staging'
-    Assert-NoReparseAncestor $base
-    [void](New-Item -ItemType Directory -Path $base -Force -ErrorAction Stop)
+    $base = $Script:WpmStagingRoot
+    Initialize-WpmWorkDirectory $base
     $dir = Join-Path $base ('{0}_{1}_{2}' -f $Prefix,(Get-Date -Format 'yyyyMMdd_HHmmss_fff'),([guid]::NewGuid().ToString('N').Substring(0,8)))
     [void](New-Item -ItemType Directory -Path $dir -ErrorAction Stop)
     return $dir
@@ -2614,18 +2706,19 @@ function Restore-DesktopLayout(
                 @{Present=$true; Type='Binary'; Data=[Convert]::ToBase64String([byte[]]$previous[$name])}
             } else { @{Present=$true; Type='DWord'; Data=[int]$previous[$name]} }
         }
-        $backupFolder = Join-Path $env:ProgramData 'WindowsProfileMigration\DesktopBackups'
+        $backupFolder = Join-Path $Script:WpmWorkRoot 'DesktopBackups'
+        Initialize-WpmWorkDirectory $backupFolder
         $backupPath = Join-Path $backupFolder ('Desktop_' + [guid]::NewGuid().ToString('N') + '.json')
-        Assert-ProfileExtraPath $backupPath $env:ProgramData $true
-        [void][IO.Directory]::CreateDirectory($backupFolder)
-        Assert-ProfileExtraPath $backupPath $env:ProgramData $true
         $bytes = [Text.Encoding]::UTF8.GetBytes(($snapshot | ConvertTo-Json -Depth 5))
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        try { $snapshotHash = [BitConverter]::ToString($hasher.ComputeHash($bytes)).Replace('-','') }
+        finally { $hasher.Dispose() }
         $out = [IO.File]::Open($backupPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
         try {
             $out.Write($bytes,0,$bytes.Length)
             $out.Flush($true)
         } finally { $out.Dispose() }
-        Update-TrackedState '' @{DesktopBackup=$backupPath}
+        Update-TrackedState '' @{DesktopBackup=$backupPath;DesktopBackupSha256=$snapshotHash}
         Write-OperationReport 'РЕЗЕРВ' ('Прежние значения рабочего стола сохранены: ' + $backupPath)
         Set-DesktopRegistryValues $hku $keyPath $values $previous
     } $true
@@ -2634,14 +2727,17 @@ function Restore-DesktopLayout(
 }
 
 # Восстанавливает только локальную резервную копию для зарегистрированного SID и пути.
-function Restore-PreviousDesktopLayout([string]$BackupFile) {
-    $backupRoot = [IO.Path]::GetFullPath((Join-Path $env:ProgramData 'WindowsProfileMigration\DesktopBackups'))
+function Restore-PreviousDesktopLayout([string]$BackupFile,[string]$ExpectedHash) {
+    if ($ExpectedHash -notmatch '^[a-f0-9]{64}$') { throw 'Некорректная контрольная сумма резервной копии.' }
+    $backupRoot = [IO.Path]::GetFullPath((Join-Path $Script:WpmWorkRoot 'DesktopBackups'))
+    Assert-WpmWorkRoot
+    Assert-WpmWorkAcl $backupRoot
     $backupPath = [IO.Path]::GetFullPath($BackupFile)
     if ([IO.Path]::GetDirectoryName($backupPath) -ine $backupRoot -or
         [IO.Path]::GetFileName($backupPath) -notmatch '^Desktop_[a-f0-9]{32}\.json$') {
         throw 'Путь вне каталога резервных копий расположения значков.'
     }
-    $data = Read-ExtraJson $backupPath $env:ProgramData
+    $data = Read-ExtraJson $backupPath $Script:WpmWorkRoot $ExpectedHash
     $values = Convert-DesktopRegistryValues $data $true
     $sid = [string]$data.TargetSid
     if ($sid -notmatch '^S-1-(?:[0-9]+-){1,14}[0-9]+$' -or -not $data.TargetProfile) {
@@ -2925,7 +3021,7 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
     if ($networkPublish) { Ensure-PathAvailable $root 'Сетевая папка архива' }
     # USMT создаёт рабочий каталог; готовым результатом всегда является один ZIP.
     # Хранение каталога и ZIP одновременно требует локального свободного места.
-    $stagingRoot = Join-Path $env:ProgramData 'WindowsProfileMigration\Staging'
+    $stagingRoot = $Script:WpmStagingRoot
     $stagingDrive = [IO.Path]::GetPathRoot($stagingRoot)
     $stagingFree = Get-PathFreeBytes $stagingDrive
     $stagingNeeded = [UInt64]([double]$estimatedBytes * 2.2 + [double]1GB)
@@ -3346,6 +3442,19 @@ function Assert-ImportProfileUnused([string]$Sid,[string]$PossibleLocalName = ''
 }
 
 function Assert-NoUnreviewedImport([object]$Target) {
+    foreach ($prior in @(Get-TrackedStates -Legacy)) {
+        if ($prior.Kind -ne 'Импорт') { continue }
+        $sameSid = $Target.Sid -and (
+            ($prior.PSObject.Properties['TargetSid'] -and $prior.TargetSid -eq $Target.Sid) -or
+            ($prior.PSObject.Properties['CreatedSid'] -and $prior.CreatedSid -eq $Target.Sid)
+        )
+        if (-not $sameSid -and $prior.TargetAccount -ine $Target.Account) { continue }
+        $pending = $prior.PSObject.Properties['AccountCreationPending'] -and $prior.AccountCreationPending -eq $true
+        if (($prior.USMTStarted -and -not $prior.USMTFinished) -or $pending) {
+            throw ('Найдена старая незавершённая операция ' + $prior.Id +
+                '. Проверьте профиль и сохраните запись операции отдельно перед повторным импортом.')
+        }
+    }
     foreach ($prior in @(Get-TrackedStates -RequireReadable)) {
         if ($prior.Kind -ne 'Импорт' -or $prior.Id -eq $Script:ActiveOpState.Id) { continue }
         if ($prior.PSObject.Properties['RecoveryReviewed'] -and $prior.RecoveryReviewed -eq $true) { continue }
@@ -3375,7 +3484,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         if ($isNetworkZip) { Ensure-PathAvailable $archive 'Сетевой ZIP' }
         $zipInfo = Get-ProfileZipInfo $archive
         Assert-ArchiveMetadata $zipInfo.Metadata (-not $JustVerify)
-        $stagingRoot = Join-Path $env:ProgramData 'WindowsProfileMigration\Staging'
+        $stagingRoot = $Script:WpmStagingRoot
         $stagingDrive = [IO.Path]::GetPathRoot($stagingRoot)
         $stagingFree = Get-PathFreeBytes $stagingDrive
         $zipBytes = [UInt64](Get-Item -LiteralPath $archive -ErrorAction Stop).Length
@@ -3405,7 +3514,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         $archive = $extracted
     } else {
         if (Test-IsUncPath $archive) { Ensure-PathAvailable $archive 'Выбранный сетевой архив' }
-        $stagingRoot = Join-Path $env:ProgramData 'WindowsProfileMigration\Staging'
+        $stagingRoot = $Script:WpmStagingRoot
         Assert-ArchiveCacheOutsideSource $archive $stagingRoot
         $metadataPath = Join-Path $archive 'metadata.json'
         $earlyMeta = Read-ArchiveMetadataFile $metadataPath
