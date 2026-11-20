@@ -42,13 +42,14 @@ $Script:LegacyOpStateRoot = Join-Path $env:ProgramData 'WindowsProfileMigration\
 # Создаёт уникальный итоговый TXT-отчёт без перезаписи предыдущих результатов.
 function Start-OperationReport([string]$Operation) {
     if ($Script:ReportPath) { throw 'Предыдущий отчёт не завершён.' }
-    $rootOptions = @((Join-Path $Script:ToolRoot 'Reports'),
-        (Join-Path $env:ProgramData 'WindowsProfileMigration\Reports'))
+    $protectedReports = Join-Path $Script:WpmWorkRoot 'Reports'
+    $rootOptions = @((Join-Path $Script:ToolRoot 'Reports'),$protectedReports)
     $stem = 'Итог_работы_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff')
     $lastError = $null
     foreach ($root in $rootOptions) {
         try {
-            [void](New-Item -ItemType Directory -Path $root -Force -ErrorAction Stop)
+            if ($root -eq $protectedReports) { Initialize-WpmWorkDirectory $root }
+            else { [void](New-Item -ItemType Directory -Path $root -Force -ErrorAction Stop) }
             for ($i=0; $i -lt 10; $i++) {
                 $filename = '{0}_{1}.txt' -f $stem,([guid]::NewGuid().ToString('N').Substring(0,12))
                 $candidate = Join-Path $root $filename
@@ -336,11 +337,9 @@ function Get-TrackedStates([switch]$RequireReadable,[string]$Id = '',[switch]$Le
         try {
             if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Файл состояния является ссылкой.' }
             $stream = [IO.File]::Open($file.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,
-                ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+                ([IO.FileShare]::Read -bor [IO.FileShare]::Delete))
             try {
-                $reader = [IO.StreamReader]::new($stream,[Text.Encoding]::UTF8)
-                try { $item = ConvertFrom-Json -InputObject $reader.ReadToEnd() -ErrorAction Stop }
-                finally { $reader.Dispose() }
+                $item = Read-BoundedArchiveMetadata $stream $stream.Length
             } finally { $stream.Dispose() }
             if ($item -isnot [pscustomobject] -or $item.Id -cne $file.BaseName -or
                 $item.Kind -isnot [string] -or $item.Status -isnot [string] -or
@@ -466,7 +465,7 @@ function Clear-NetworkPartial([hashtable]$State,[bool]$Ask = $true) {
     if (Test-Path -LiteralPath $temp -ErrorAction Stop) {
         Assert-RegularNetworkPartial $temp
     }
-    if ($Ask -and -not (Confirm ('Удалить незавершённую копию ' + $temp + ' ?'))) { return }
+    if ($Ask -and -not (Confirm ('Удалить незавершённую копию ' + $temp + ' ?'))) { return $false }
     Assert-WpmDirectoryChain $parent
     if (Test-Path -LiteralPath $temp -ErrorAction Stop) {
         Assert-RegularNetworkPartial $temp
@@ -476,6 +475,7 @@ function Clear-NetworkPartial([hashtable]$State,[bool]$Ask = $true) {
     Save-TrackedState $State
     Write-OperationReport 'ОЧИСТКА' ('Удалена незавершённая копия: ' + $temp)
     Write-Host 'Незавершённая копия удалена.' -ForegroundColor Green
+    return $true
 }
 function Show-RecoveryMenu {
     Title 'СОСТОЯНИЕ ОПЕРАЦИЙ И УПРАВЛЯЕМАЯ ОЧИСТКА'
@@ -534,6 +534,8 @@ function Show-RecoveryMenu {
     $id = $state.Id
     $lock = $null
     try {
+        Start-OperationReport 'ВОССТАНОВЛЕНИЕ'
+        Write-OperationReport 'ДЕЙСТВИЕ' ('Операция ' + $id + ', пункт ' + $action)
         $lock = Enter-ProfileMutationLock
         $state = Get-TrackedStates -RequireReadable -Id $id
         if (-not $state) { throw 'Запись выбранной операции больше недоступна.' }
@@ -543,7 +545,7 @@ function Show-RecoveryMenu {
         switch ($action) {
             1 {
                 if (-not $state.StagingPath -or $state.CleanupDone) { Write-Host 'Временной копии нет.'; return }
-                [void](Clear-TrackedStaging $hash $true)
+                if (-not (Clear-TrackedStaging $hash $true)) { return }
             }
             2 {
                 if ($state.Kind -ne 'Импорт' -or -not $state.CreatedByTool -or -not $state.CreatedAccount -or
@@ -575,11 +577,11 @@ function Show-RecoveryMenu {
                 if (-not $state.PSObject.Properties['DesktopBackupSha256'] -or -not $state.DesktopBackupSha256) {
                     throw 'Для резервной копии отсутствует зарегистрированная контрольная сумма.'
                 }
-                Restore-PreviousDesktopLayout ([string]$state.DesktopBackup) ([string]$state.DesktopBackupSha256)
+                if (-not (Restore-PreviousDesktopLayout ([string]$state.DesktopBackup) ([string]$state.DesktopBackupSha256))) { return }
             }
             4 {
                 if (-not $state.NetworkPartialPath) { Write-Host 'Незавершённой копии нет.'; return }
-                Clear-NetworkPartial $hash
+                if (-not (Clear-NetworkPartial $hash)) { return }
             }
             5 {
                 $pending = $state.PSObject.Properties['AccountCreationPending'] -and $state.AccountCreationPending -eq $true
@@ -604,10 +606,16 @@ function Show-RecoveryMenu {
                 Write-Host 'Проверка записана. Импорт можно заново запустить через главное меню.' -ForegroundColor Green
             }
         }
+        Finish-OperationReport 'УСПЕШНО'
     } catch {
+        $Script:HadFailures = $true
+        Write-OperationReport 'ОШИБКА' $_.Exception.Message
+        Write-DiagnosticFailure $_ 'Восстановление состояния'
+        Finish-OperationReport 'СБОЙ ВОССТАНОВЛЕНИЯ'
         Write-Host ('Действие восстановления не выполнено: ' + $_.Exception.Message) -ForegroundColor Red
     } finally {
         if ($null -ne $lock) { $lock.Dispose() }
+        if ($Script:ReportPath) { Finish-OperationReport 'ОТМЕНЕНО / НЕ ЗАВЕРШЕНО' }
     }
 }
 
@@ -2153,8 +2161,9 @@ function Restore-ExplorerAndOneCExtras([string]$Archive,[string]$TargetPath,[has
         Write-OperationReport 'НАСТРОЙКИ' 'Дополнительных файлов закреплений Проводника и 1С в архиве нет.'
         return
     }
-    $backupRoot = Join-Path $env:ProgramData ('WindowsProfileMigration\ConfigBackups\' +
-        (Get-Date -Format 'yyyyMMdd_HHmmss_fff') + '_' + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $backupBase = Join-Path $Script:WpmWorkRoot 'ConfigBackups'
+    Initialize-WpmWorkDirectory $backupBase
+    $backupRoot = Join-Path $backupBase ((Get-Date -Format 'yyyyMMdd_HHmmss_fff') + '_' + [guid]::NewGuid().ToString('N').Substring(0,8))
     Update-TrackedState '' @{ConfigBackupPath=$backupRoot}
     [int]$done = 0
     foreach ($job in $jobs) {
@@ -2464,7 +2473,9 @@ function Restore-BrowserExtras([string]$Archive,[string]$TargetPath,[string]$Tar
     Write-Host 'Открытые браузеры автоматически пропускаются. Пароли и cookie отдельно не копируются.'
     if (-not $AutoApprove -and -not (Confirm 'Восстановить доступные файлы браузеров?')) { Write-OperationReport 'ОТМЕНА' 'Восстановление браузеров отклонено пользователем.'; return }
     $busy = @(Get-OpenTargetBrowsers $TargetSid)
-    $recovery = Join-Path $env:ProgramData ('WindowsProfileMigration\BrowserRestoreBackup_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '_' + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $backupBase = Join-Path $Script:WpmWorkRoot 'BrowserBackups'
+    Initialize-WpmWorkDirectory $backupBase
+    $recovery = Join-Path $backupBase ((Get-Date -Format 'yyyyMMdd_HHmmss_fff') + '_' + [guid]::NewGuid().ToString('N').Substring(0,8))
     Update-TrackedState '' @{BrowserBackupPath=$recovery}
     foreach ($browser in @(Browser-Definitions)) {
         $restored = 0
@@ -2749,7 +2760,7 @@ function Restore-PreviousDesktopLayout([string]$BackupFile,[string]$ExpectedHash
         [IO.Path]::GetFullPath([string]$registered[0].LocalPath) -ine $targetPath) {
         throw 'SID или путь зарегистрированного профиля больше не совпадает с резервной копией.'
     }
-    if (-not (Confirm ('Восстановить прежние позиции значков пользователя ' + $sid + ' ?'))) { return }
+    if (-not (Confirm ('Восстановить прежние позиции значков пользователя ' + $sid + ' ?'))) { return $false }
     Invoke-ProfileHive $sid $targetPath {
         param($hku,$mount)
         $keyPath = $mount + '\Software\Microsoft\Windows\Shell\Bags\1\Desktop'
@@ -2757,6 +2768,7 @@ function Restore-PreviousDesktopLayout([string]$BackupFile,[string]$ExpectedHash
         Set-DesktopRegistryValues $hku $keyPath $values $current
     } $true
     Write-Host 'Настройки возвращены. Проверьте их после нового входа пользователя.' -ForegroundColor Green
+    return $true
 }
 
 # Находит зарегистрированный в Windows целевой профиль по учётной записи.
@@ -3054,7 +3066,9 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
     Advance-OperationStage 'Экспорт подтверждён'
     Write-OperationReport 'АРХИВ' ('Создаётся: ' + $archive)
     $store = Join-Path $archive 'Store'
-    $logs = Join-Path $env:ProgramData ('WindowsProfileMigration\Logs\Export_' + $folderName)
+    $logBase = Join-Path $Script:WpmWorkRoot 'Logs'
+    Initialize-WpmWorkDirectory $logBase
+    $logs = Join-Path $logBase ('Export_' + $folderName)
     [void](New-Item -Path $store -ItemType Directory -Force)
     [void](New-Item -Path $logs -ItemType Directory -Force)
     $rules = New-ProfileOnlyRules $archive $Usmt $logs
@@ -3157,7 +3171,7 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
     } catch [System.OperationCanceledException] {
         Update-TrackedState 'Публикация отменена - локальная копия сохранена' @{StagingDisposition='Рабочие данные сохранены для диагностики'}
         if ($Script:ActiveOpState.NetworkPartialPath) {
-            try { Clear-NetworkPartial $Script:ActiveOpState $false }
+            try { [void](Clear-NetworkPartial $Script:ActiveOpState $false) }
             catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалось очистить незавершённый ZIP: ' + $_.Exception.Message) }
         }
         Write-OperationReport 'ОТМЕНА' ('Создание ZIP остановлено. Временные данные сохранены: ' + $staging)
@@ -3550,7 +3564,9 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         $requiredImportBytes = if ($meta.PSObject.Properties.Name -contains 'EstimatedProfileBytes' -and $meta.EstimatedProfileBytes) { [UInt64]$meta.EstimatedProfileBytes } else { [UInt64](Get-FolderMetrics $store).Bytes }
         Test-TargetFreeSpace $requiredImportBytes
     }
-    $logRoot = Join-Path $env:ProgramData ('WindowsProfileMigration\Logs\' + $(if ($JustVerify) { 'Check_' } else { 'Import_' }) + (Get-Date -Format 'yyyyMMdd_HHmmss_fff') + '_' + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $logBase = Join-Path $Script:WpmWorkRoot 'Logs'
+    Initialize-WpmWorkDirectory $logBase
+    $logRoot = Join-Path $logBase ($(if ($JustVerify) { 'Check_' } else { 'Import_' }) + (Get-Date -Format 'yyyyMMdd_HHmmss_fff') + '_' + [guid]::NewGuid().ToString('N').Substring(0,8))
     [void](New-Item -ItemType Directory -Path $logRoot -Force)
     Write-Host ('Исходная учётная запись: ' + $meta.SourceAccount)
     Write-Host ('Источник: ' + $meta.SourceMachine)

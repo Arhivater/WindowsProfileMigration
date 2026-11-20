@@ -111,11 +111,11 @@ Invoke-WpmTest 'Extras browser restore skips unexpected files and keeps other br
     $meta = [pscustomobject]@{SchemaVersion=7; ExtrasManifest=(New-ExtrasManifest $archive)}
     $approved = Test-ExtrasManifest $archive $meta
     [IO.File]::WriteAllText((Join-Path $chrome 'Bookmarks'),'changed after manifest')
-    $programData = $env:ProgramData
-    try {
-        $env:ProgramData = $WpmTestRoot
-        Restore-BrowserExtras $archive $profile 'S-1-5-21-5' $approved $true
-    } finally { $env:ProgramData = $programData }
+    $script:WpmWorkRoot = Join-Path $WpmTestRoot 'Private'
+    function Initialize-WpmWorkDirectory([string]$Path) {
+        [void][IO.Directory]::CreateDirectory($Path)
+    }
+    Restore-BrowserExtras $archive $profile 'S-1-5-21-5' $approved $true
     Assert-WpmEqual ([IO.File]::Exists((Join-Path $profile 'AppData/Local/Google/Chrome/User Data/Default/Bookmarks'))) $false
     Assert-WpmEqual ([IO.File]::Exists((Join-Path $profile 'AppData/Local/Google/Chrome/User Data/Default/Login Data'))) $false
     Assert-WpmEqual ([IO.File]::ReadAllText((Join-Path $profile 'AppData/Local/Microsoft/Edge/User Data/Profile 2/History'))) 'edge'

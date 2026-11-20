@@ -2,7 +2,7 @@
 . (Get-WpmFunctionDefinitions -ScriptName 'ProfileMigration.ps1' -Name @(
     'Assert-ArchiveMetadata','Assert-WpmDirectoryChain','New-WpmWorkDirectoryAcl','Assert-WpmWorkAcl',
     'Initialize-WpmWorkDirectory','Assert-WpmWorkRoot',
-    'Save-TrackedState','Get-TrackedStates','Enter-ProfileMutationLock','Assert-TrackedOperationStopped',
+    'Save-TrackedState','Get-TrackedStates','Read-BoundedArchiveMetadata','Enter-ProfileMutationLock','Assert-TrackedOperationStopped',
     'Assert-OperationTreeHasNoReparsePoint','Assert-SafeStaging','Resolve-ImportTarget',
     'Select-ImportDestination','Assert-NoUnreviewedImport','Show-RecoveryMenu','Assert-RegularNetworkPartial',
     'Clear-NetworkPartial','Restore-PreviousDesktopLayout','Read-ExtraJson','Assert-ProfileExtraPath',
@@ -78,6 +78,18 @@ Invoke-WpmTest 'Corrupt retained operation cannot be mistaken for no prior impor
     Save-TrackedState $state
     $file = Join-Path $script:OpStateRoot ($state.Id + '.json')
     [IO.File]::WriteAllText($file, '{')
+    Assert-WpmThrows { Get-TrackedStates -RequireReadable } 'Не удалось проверить состояние'
+}
+
+Invoke-WpmTest 'State reader rejects arrays and oversized journals' {
+    Set-ImportTestDirectories $WpmTestRoot
+    $state = New-ImportTestState
+    Save-TrackedState $state
+    $file = Join-Path $script:OpStateRoot ($state.Id + '.json')
+    [IO.File]::WriteAllText($file,('[' + ($state | ConvertTo-Json -Depth 4) + ']'))
+    Assert-WpmThrows { Get-TrackedStates -RequireReadable } 'Не удалось проверить состояние'
+    $stream = [IO.File]::Open($file,'Open','Write','None')
+    try { $stream.SetLength(2MB + 1) } finally { $stream.Dispose() }
     Assert-WpmThrows { Get-TrackedStates -RequireReadable } 'Не удалось проверить состояние'
 }
 
