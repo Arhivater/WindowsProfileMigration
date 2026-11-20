@@ -330,16 +330,29 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
     }
 
     Invoke-WpmTest 'CMD launcher forwards success and errors from a harmless fixture' {
-        $kit = Join-Path $WpmTestRoot 'комплект с пробелами'
+        $kit = Join-Path $WpmTestRoot 'комплект с пробелами!'
         [void][IO.Directory]::CreateDirectory($kit)
         $launcher = Join-Path $kit 'Start.cmd'
         $fixture = Join-Path $kit 'Bootstrap.ps1'
         [IO.File]::Copy((Join-Path $script:WpmProjectRoot 'Start.cmd'), $launcher)
         foreach ($code in @(0,19,1223)) {
             [IO.File]::WriteAllText($fixture, "exit $code")
-            # Input is redirected so the console's error prompt cannot wait on a keypress.
-            & $env:ComSpec /d /s /c ('""{0}" <nul"' -f $launcher) | Out-Null
-            Assert-WpmEqual $LASTEXITCODE $code 'Code through Start.cmd'
+            # Pass the precise CMD command line and close stdin to release its pause.
+            $start = [Diagnostics.ProcessStartInfo]::new()
+            $start.FileName = $env:ComSpec
+            $start.Arguments = '/d /v:off /s /c ""{0}""' -f $launcher
+            $start.UseShellExecute = $false
+            $start.RedirectStandardInput = $true
+            $start.CreateNoWindow = $true
+            $process = [Diagnostics.Process]::Start($start)
+            try {
+                $process.StandardInput.Close()
+                if (-not $process.WaitForExit(20000)) {
+                    $process.Kill()
+                    throw 'The fixture launcher did not exit.'
+                }
+                Assert-WpmEqual $process.ExitCode $code 'Code through Start.cmd'
+            } finally { $process.Dispose() }
         }
     }
 } else {
