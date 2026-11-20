@@ -763,13 +763,15 @@ function Get-PathFreeBytes([string]$Path) {
 # Считает размер и число файлов без подавления ошибок доступа.
 # Переходы через junction/symlink намеренно не выполняются, иначе возможны циклы.
 # Если не получается прочитать хотя бы один каталог, результат НЕ используется как оценка.
-function Get-FolderMetrics([string]$Path) {
+function Get-FolderMetrics([string]$Path,[int]$SampleCount = 0) {
     [UInt64]$bytes = 0
     [Int64]$files = 0
     [Int64]$links = 0
+    $samples = [Collections.Generic.List[string]]::new()
     try {
         $root = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
         if (-not $root.PSIsContainer) { throw 'Указанный путь не является каталогом.' }
+        if ($root.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Указанный каталог является ссылкой.' }
         $pending = New-Object 'System.Collections.Generic.Stack[string]'
         $pending.Push([string]$root.FullName)
         while ($pending.Count -gt 0) {
@@ -785,6 +787,7 @@ function Get-FolderMetrics([string]$Path) {
                     } else {
                         $bytes = [UInt64]($bytes + [UInt64]$item.Length)
                         $files++
+                        if ($samples.Count -lt $SampleCount) { $samples.Add([string]$item.FullName) }
                     }
                 }
             } catch {
@@ -794,7 +797,7 @@ function Get-FolderMetrics([string]$Path) {
     } catch {
         throw ('Подсчёт размера не завершён для ' + $Path + '. Миграция остановлена, чтобы не занизить объём. ' + $_.Exception.Message)
     }
-    return [pscustomobject]@{ Bytes = $bytes; Files = $files; SkippedLinks = $links }
+    return [pscustomobject]@{ Bytes = $bytes; Files = $files; SkippedLinks = $links; Samples = $samples.ToArray() }
 }
 # Запоминает стандартные папки и небольшую выборку файлов для проверки после импорта.
 function Get-ProfileValidationBaseline([string]$ProfilePath) {
@@ -802,18 +805,17 @@ function Get-ProfileValidationBaseline([string]$ProfilePath) {
     $resultDirs = @()
     $samples = @()
     foreach ($rel in $dirs) {
-        $full = Join-Path $ProfilePath $rel
-        $exists = Test-Path -LiteralPath $full -PathType Container
+        $directory = Get-ProfileDataItem $ProfilePath $rel
+        $exists = $directory -and $directory.PSIsContainer
         [UInt64]$bytes = 0
         [Int64]$files = 0
         if ($exists) {
-            $m = Get-FolderMetrics $full
+            $m = Get-FolderMetrics $directory.FullName 3
             $bytes = [UInt64]$m.Bytes
             $files = [Int64]$m.Files
-            $s = @(Get-ChildItem -LiteralPath $full -Recurse -Force -File -ErrorAction Stop | Select-Object -First 3 -ExpandProperty FullName)
-            foreach ($item in $s) {
+            foreach ($item in $m.Samples) {
                 if ($item.Length -gt $ProfilePath.Length) {
-                    $samples += $item.Substring($ProfilePath.Length).TrimStart('\\')
+                    $samples += $item.Substring($ProfilePath.Length).TrimStart([IO.Path]::DirectorySeparatorChar)
                 }
             }
         }
@@ -858,6 +860,8 @@ function Assert-CopiedZipHash([string]$Source,[string]$Destination) {
     try {
         $streamSrc = [IO.File]::Open($Source,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
         $streamDst = [IO.File]::Open($Destination,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        $sourceLength = $streamSrc.Length
+        if ($sourceLength -ne $streamDst.Length) { throw 'ZIP изменился перед сверкой.' }
         while (($n = $streamSrc.Read($bufferSrc,0,$bufferSrc.Length)) -gt 0) {
             $readDst = 0
             while ($readDst -lt $n) {
@@ -868,7 +872,7 @@ function Assert-CopiedZipHash([string]$Source,[string]$Destination) {
             [void]$hashSrc.TransformBlock($bufferSrc,0,$n,$bufferSrc,0)
             [void]$hashDst.TransformBlock($bufferDst,0,$n,$bufferDst,0)
             $done = [UInt64]($done + [UInt64]$n)
-            $percent = if ($srcFile.Length -gt 0) { [int][Math]::Floor(100.0 * $done / [double]$srcFile.Length) } else { 100 }
+            $percent = if ($sourceLength -gt 0) { [int][Math]::Floor(100.0 * $done / [double]$sourceLength) } else { 100 }
             Write-Progress -Id 5 -Activity 'Проверка ZIP после копирования' -Status ('Сверено: ' + (Format-ByteSize $done)) -PercentComplete $percent
             if (Test-RunningProcessStopRequest 'проверку ZIP' 5) {
                 throw [System.OperationCanceledException]::new('Проверка ZIP остановлена пользователем.')
@@ -890,22 +894,64 @@ function Assert-CopiedZipHash([string]$Source,[string]$Destination) {
         $hashDst.Dispose()
     }
 }
+# Проверка едина для ZIP, путей в манифестах и архивов-каталогов.
+function Assert-WindowsPathComponent([string]$Part) {
+    if (-not $Part -or $Part.EndsWith('.') -or $Part.EndsWith(' ') -or
+        $Part -match '[\x00-\x1f\\/:*?"<>|]' -or
+        $Part -match '^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³]) *(\..*)?$') {
+        throw ('Недопустимый компонент пути Windows: ' + $Part)
+    }
+}
+function Get-WindowsRelativePathParts([string]$RelativePath) {
+    $parts = $RelativePath -split '[\\/]'
+    foreach ($part in $parts) { Assert-WindowsPathComponent $part }
+    return $parts
+}
+
+# Проверяем каждый компонент до входа в каталог. Отсутствующий объект
+# или точку повторной обработки считаем недоступными внутри профиля.
+function Get-ProfileDataItem([string]$ProfilePath,[string]$RelativePath) {
+    $parts = @(Get-WindowsRelativePathParts $RelativePath)
+    try {
+        $item = Get-Item -LiteralPath $ProfilePath -Force -ErrorAction Stop
+        foreach ($part in $parts) {
+            if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $null }
+            $item = Get-Item -LiteralPath ([IO.Path]::Combine($item.FullName,$part)) -Force -ErrorAction Stop
+        }
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $null }
+        return $item
+    } catch [System.Management.Automation.ItemNotFoundException] { return $null }
+}
+# Проверяем существующие предки до создания каталога или копирования данных.
+function Assert-NoReparseAncestor([string]$Path) {
+    $pending = [Collections.Generic.Stack[string]]::new()
+    for ($current = [IO.Path]::GetFullPath($Path); $current; $current = [IO.Path]::GetDirectoryName($current)) {
+        $pending.Push($current)
+    }
+    while ($pending.Count -gt 0) {
+        try { $item = Get-Item -LiteralPath $pending.Pop() -Force -ErrorAction Stop }
+        catch [System.Management.Automation.ItemNotFoundException] { return }
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw ('Путь проходит через ссылку: ' + $item.FullName)
+        }
+    }
+}
 # Формирует карту файлов готового архива, не следуя ссылкам/junction.
 # При проверке сетевой публикации нужно сравнивать именно ВСЕ файлы,
 # включая .mig, метаданные, контрольные реестры и дополнительные данные.
 function Get-ArchiveFileMap([string]$ArchiveRoot) {
+    Assert-NoReparseAncestor $ArchiveRoot
     $root = Get-Item -LiteralPath $ArchiveRoot -Force -ErrorAction Stop
     if (-not $root.PSIsContainer) { throw ('Архив не является каталогом: ' + $ArchiveRoot) }
-    if ($root.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-        throw ('Каталог архива является ссылкой: ' + $ArchiveRoot)
-    }
-    $base = [IO.Path]::GetFullPath([string]$root.FullName).TrimEnd([char]'\')
+    $base = [IO.Path]::GetFullPath([string]$root.FullName)
+    $separator = [IO.Path]::DirectorySeparatorChar
     $files = @{}
     $pending = New-Object 'System.Collections.Generic.Stack[string]'
     $pending.Push($base)
     while ($pending.Count -gt 0) {
         $current = $pending.Pop()
         foreach ($item in @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop)) {
+            Assert-WindowsPathComponent $item.Name
             if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
                 throw ('В архиве обнаружена ссылка, проверка остановлена: ' + $item.FullName)
             }
@@ -913,7 +959,7 @@ function Get-ArchiveFileMap([string]$ArchiveRoot) {
                 $pending.Push([string]$item.FullName)
                 continue
             }
-            $relative = ([string]$item.FullName).Substring($base.Length).TrimStart([char]'\')
+            $relative = ([string]$item.FullName).Substring($base.Length).TrimStart($separator)
             if (-not $relative -or $files.ContainsKey($relative)) {
                 throw ('Неоднозначное имя файла в архиве: ' + $item.FullName)
             }
@@ -933,53 +979,72 @@ function Initialize-ZipSupport {
 function Get-ProfileZipInfo([string]$ZipPath) {
     Initialize-ZipSupport
     $zip = [IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try { return Read-ProfileZipInfo $zip }
+    finally { $zip.Dispose() }
+}
+
+function Read-ProfileZipInfo([IO.Compression.ZipArchive]$Zip) {
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $directories = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $filePaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    [UInt64]$expanded = 0
+    [int]$storeFiles = 0
+    $metaEntry = $null
+    if ($Zip.Entries.Count -gt 1000000) { throw 'Слишком много записей в ZIP.' }
+    foreach ($entry in $Zip.Entries) {
+        $rel = [string]$entry.FullName
+        $isDir = $rel.EndsWith('/')
+        $name = if ($isDir) { $rel.Substring(0,$rel.Length - 1) } else { $rel }
+        if (-not $seen.Add($name)) { throw ('Повторяющееся имя в ZIP: ' + $rel) }
+        foreach ($part in $name.Split('/')) { Assert-WindowsPathComponent $part }
+        # Windows reparse-point и Unix symlink внутри ZIP запрещены.
+        if (($entry.ExternalAttributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            ((($entry.ExternalAttributes -shr 16) -band 0xF000) -eq 0xA000)) {
+            throw ('Ссылка в ZIP запрещена: ' + $rel)
+        }
+        for ($slash = $name.LastIndexOf('/'); $slash -ge 0; $slash = $parent.LastIndexOf('/')) {
+            $parent = $name.Substring(0,$slash)
+            if ($filePaths.Contains($parent)) { throw ('Файл ZIP используется как каталог: ' + $parent) }
+            if (-not $directories.Add($parent)) { break }
+        }
+        if ($isDir) {
+            if ($entry.Length -ne 0) { throw ('Каталог ZIP содержит данные: ' + $rel) }
+            [void]$directories.Add($name)
+            continue
+        }
+        if ($directories.Contains($name)) { throw ('Файл ZIP используется как каталог: ' + $name) }
+        [void]$filePaths.Add($name)
+        if ($entry.Length -lt 0 -or $expanded -gt ([UInt64]::MaxValue - [UInt64]$entry.Length)) {
+            throw 'Недопустимый размер ZIP.'
+        }
+        $expanded = [UInt64]($expanded + [UInt64]$entry.Length)
+        if ($name -ceq 'metadata.json') { $metaEntry = $entry }
+        if ($name -match '^Store/.+\.mig$') { $storeFiles++ }
+    }
+    if (-not $metaEntry -or $metaEntry.Length -le 0 -or $metaEntry.Length -gt 2MB -or $storeFiles -ne 1) {
+        throw 'ZIP должен содержать metadata.json размером до 2 МБ и ровно одно USMT-хранилище.'
+    }
+    # Лимит применяется к данным в потоке, даже если ZIP заявил меньший размер.
+    $bytes = [byte[]]::new([int]$metaEntry.Length)
+    $stream = $metaEntry.Open()
     try {
-        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        [UInt64]$expanded = 0
-        [int]$files = 0
-        $metaEntry = $null
-        $hasStore = $false
-        foreach ($entry in $zip.Entries) {
-            $rel = [string]$entry.FullName
-            $isDir = $rel.EndsWith('/')
-            $name = $rel.TrimEnd('/')
-            if (-not $name -or $name.StartsWith('/') -or $name -match '[\x00-\x1f\\:*?"<>|]' -or
-                -not $seen.Add($name)) {
-                throw ('Недопустимое или повторяющееся имя в ZIP: ' + $rel)
-            }
-            foreach ($part in $name.Split('/')) {
-                if (-not $part -or $part -in @('.','..') -or $part.EndsWith('.') -or $part.EndsWith(' ') -or
-                    $part -match '^(?i:(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]))(\..*)?$') {
-                    throw ('Недопустимый компонент пути в ZIP: ' + $rel)
-                }
-            }
-            # Windows reparse-point и Unix symlink внутри ZIP запрещены.
-            if (($entry.ExternalAttributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or
-                ((($entry.ExternalAttributes -shr 16) -band 0xF000) -eq 0xA000)) {
-                throw ('Ссылка в ZIP запрещена: ' + $rel)
-            }
-            if ($isDir) {
-                if ($entry.Length -ne 0) { throw ('Каталог ZIP содержит данные: ' + $rel) }
-                continue
-            }
-            if ($entry.Length -lt 0 -or $expanded -gt ([UInt64]::MaxValue - [UInt64]$entry.Length)) {
-                throw 'Недопустимый размер ZIP.'
-            }
-            $expanded = [UInt64]($expanded + [UInt64]$entry.Length)
-            $files++
-            if ($files -gt 1000000) { throw 'Слишком много файлов в ZIP.' }
-            if ($name -ceq 'metadata.json') { $metaEntry = $entry }
-            if ($name -like 'Store/*.mig') { $hasStore = $true }
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes,$offset,$bytes.Length - $offset)
+            if ($read -le 0) { throw 'metadata.json в ZIP обрезан.' }
+            $offset += $read
         }
-        if (-not $metaEntry -or $metaEntry.Length -gt 2MB -or -not $hasStore) {
-            throw 'ZIP не содержит корректные metadata.json и USMT-хранилище.'
-        }
-        $stream = $metaEntry.Open()
-        $reader = [IO.StreamReader]::new($stream,[Text.Encoding]::UTF8,$true)
-        try { $meta = $reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop }
-        finally { $reader.Dispose() }
-        return [pscustomobject]@{ Metadata=$meta; ExpandedBytes=$expanded; Files=$files }
-    } finally { $zip.Dispose() }
+        if ($stream.ReadByte() -ne -1) { throw 'Размер metadata.json не совпадает с ZIP.' }
+    } finally { $stream.Dispose() }
+    $reader = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes,$false),[Text.Encoding]::UTF8,$true)
+    try {
+        $json = $reader.ReadToEnd().Trim()
+        if (-not $json.StartsWith('{')) { throw 'metadata.json должен содержать один JSON-объект.' }
+        $meta = $json | ConvertFrom-Json -ErrorAction Stop
+    }
+    finally { $reader.Dispose() }
+    if ($meta -isnot [pscustomobject]) { throw 'metadata.json должен содержать один JSON-объект.' }
+    return [pscustomobject]@{ Metadata=$meta; ExpandedBytes=$expanded; Files=$filePaths.Count }
 }
 # Сжимает каталог в один ZIP с поддержкой больших файлов (ZIP64) и клавиши 0.
 function Compress-ProfileArchive([string]$Source,[string]$ZipPath) {
@@ -1034,18 +1099,27 @@ function Compress-ProfileArchive([string]$Source,[string]$ZipPath) {
 }
 # Распаковывает ZIP в пустой локальный каталог; каждый путь проверен заранее.
 function Expand-ProfileArchive([string]$ZipPath,[string]$Destination) {
-    $info = Get-ProfileZipInfo $ZipPath
+    Initialize-ZipSupport
     Write-Host 'Во время распаковки ZIP нажмите 0 без Enter, чтобы запросить отмену.' -ForegroundColor Yellow
-    $root = [IO.Path]::GetFullPath($Destination).TrimEnd('\')
-    if (Test-Path -LiteralPath $root) { throw 'Каталог распаковки уже существует.' }
-    [void][IO.Directory]::CreateDirectory($root)
-    $prefix = $root + '\'
-    $zip = [IO.Compression.ZipFile]::OpenRead($ZipPath)
+    $separator = [IO.Path]::DirectorySeparatorChar
+    $root = [IO.Path]::GetFullPath($Destination).TrimEnd($separator)
+    $prefix = $root + $separator
     [UInt64]$done = 0
     $buffer = New-Object byte[] (1024 * 1024)
+    $zip = [IO.Compression.ZipFile]::OpenRead($ZipPath)
     try {
+        # Проверяем тот же открытый ZIP, который будем читать. На Windows
+        # файловый дескриптор не разрешает в это время запись или подмену.
+        $info = Read-ProfileZipInfo $zip
+        if (Test-Path -LiteralPath $root) { throw 'Каталог распаковки уже существует.' }
+        Assert-NoReparseAncestor $root
+        $free = Get-PathFreeBytes ([IO.Path]::GetDirectoryName($root))
+        if ([double]$free -lt ([double]$info.ExpandedBytes + 1GB)) {
+            throw 'Недостаточно места для распаковки открытого ZIP с резервом 1 ГБ.'
+        }
+        [void][IO.Directory]::CreateDirectory($root)
         foreach ($entry in $zip.Entries) {
-            $full = [IO.Path]::GetFullPath((Join-Path $root ($entry.FullName.Replace('/','\'))))
+            $full = [IO.Path]::GetFullPath((Join-Path $root ($entry.FullName.Replace([char]'/', $separator))))
             if (-not $full.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) {
                 throw ('ZIP содержит путь за пределами папки распаковки: ' + $entry.FullName)
             }
@@ -1128,10 +1202,10 @@ function Assert-NetworkArchiveCopy([string]$Source,[string]$Destination) {
 # Обход без следования junction/symlink и без подавления ошибок доступа.
 function Get-ValidationSourceFiles([string]$ProfilePath) {
     foreach ($rel in @(Get-ValidationSourceDirectories)) {
-        $dir = Join-Path $ProfilePath $rel
-        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
+        $dir = Get-ProfileDataItem $ProfilePath $rel
+        if (-not $dir -or -not $dir.PSIsContainer) { continue }
         $pending = New-Object 'System.Collections.Generic.Stack[string]'
-        $pending.Push([string]$dir)
+        $pending.Push([string]$dir.FullName)
         while ($pending.Count -gt 0) {
             $current = $pending.Pop()
             foreach ($child in @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop)) {
@@ -1142,6 +1216,16 @@ function Get-ValidationSourceFiles([string]$ProfilePath) {
         }
     }
 }
+function Read-ValidationManifestRecord([string]$Line) {
+    if (-not $Line.TrimStart().StartsWith('{')) { throw 'Недопустимая запись контрольного реестра.' }
+    $record = $Line | ConvertFrom-Json -ErrorAction Stop
+    $relative = @(Get-WindowsRelativePathParts ([string]$record.RelativePath)) -join '\'
+    if (($record.Length -isnot [int] -and $record.Length -isnot [long]) -or $record.Length -lt 0 -or
+        [string]$record.SHA256 -notmatch '\A[0-9a-fA-F]{64}\z') {
+        throw ('Недопустимый размер или SHA-256 в контрольном реестре: ' + $relative)
+    }
+    return [pscustomobject]@{ RelativePath=$relative; Length=[long]$record.Length; SHA256=[string]$record.SHA256 }
+}
 function New-ValidationManifest([string]$ProfilePath,[string]$Archive) {
     $valDir = Join-Path $Archive 'Validation'
     [void](New-Item -Path $valDir -ItemType Directory -Force)
@@ -1150,10 +1234,14 @@ function New-ValidationManifest([string]$ProfilePath,[string]$Archive) {
     [long]$count = 0
     [long]$bytes = 0
     try {
-        foreach ($file in @(Get-ValidationSourceFiles $ProfilePath)) {
-            $relative = $file.FullName.Substring($ProfilePath.TrimEnd('\').Length).TrimStart('\')
+        $root = [IO.Path]::GetFullPath($ProfilePath).TrimEnd([IO.Path]::DirectorySeparatorChar)
+        Get-ValidationSourceFiles $ProfilePath | ForEach-Object {
+            $file = $_
+            $relative = $file.FullName.Substring($root.Length).TrimStart([IO.Path]::DirectorySeparatorChar)
             try {
-                $length = [long](Get-Item -LiteralPath $file.FullName -Force -ErrorAction Stop).Length
+                $current = Get-ProfileDataItem $ProfilePath $relative
+                if (-not $current -or $current.PSIsContainer) { throw 'Файл больше недоступен внутри профиля.' }
+                $length = [long]$current.Length
                 $hash = Get-ExactFileSha256 $file.FullName
             } catch {
                 throw ('Не удалось вычислить SHA-256 ДО ScanState для ' + $relative + ': ' + $_.Exception.Message)
@@ -1191,20 +1279,16 @@ function Assert-ValidationSourceStable([string]$ProfilePath,[string]$Archive,[ob
     try {
         while ($null -ne ($line = $reader.ReadLine())) {
             if (-not $line.Trim()) { continue }
-            $item = $line | ConvertFrom-Json
-            $rel = [string]$item.RelativePath
-            if (-not $rel -or [IO.Path]::IsPathRooted($rel) -or $rel.Contains('..\') -or $rel.Contains('../')) {
-                throw 'Реестр содержит недопустимый относительный путь.'
-            }
+            $item = Read-ValidationManifestRecord $line
+            $rel = $item.RelativePath
             if (-not $expected.Add($rel)) { throw ('Повторяющийся путь в реестре: ' + $rel) }
             $checked++
-            $path = Join-Path $ProfilePath $rel
             try {
-                $file = Get-Item -LiteralPath $path -Force -ErrorAction Stop
-                if ($file.PSIsContainer -or [long]$file.Length -ne [long]$item.Length) {
+                $file = Get-ProfileDataItem $ProfilePath $rel
+                if (-not $file -or $file.PSIsContainer -or [long]$file.Length -ne $item.Length) {
                     $changed++
                     if ($details.Count -lt 15) { $details.Add('Изменён размер: ' + $rel) }
-                } elseif ((Get-ExactFileSha256 $path) -ne [string]$item.SHA256) {
+                } elseif ((Get-ExactFileSha256 $file.FullName) -ne $item.SHA256) {
                     $changed++
                     if ($details.Count -lt 15) { $details.Add('Изменён SHA-256: ' + $rel) }
                 }
@@ -1222,8 +1306,10 @@ function Assert-ValidationSourceStable([string]$ProfilePath,[string]$Archive,[ob
     }
     if ($checked -ne [long]$Manifest.Files) { throw 'Изменилось число записей контрольного реестра.' }
     [long]$newFiles = 0
-    foreach ($file in @(Get-ValidationSourceFiles $ProfilePath)) {
-        $rel = $file.FullName.Substring($ProfilePath.TrimEnd('\').Length).TrimStart('\')
+    $separator = [IO.Path]::DirectorySeparatorChar
+    $root = [IO.Path]::GetFullPath($ProfilePath).TrimEnd($separator)
+    Get-ValidationSourceFiles $ProfilePath | ForEach-Object {
+        $rel = $_.FullName.Substring($root.Length).TrimStart($separator).Replace($separator,[char]'\')
         if (-not $expected.Contains($rel)) {
             $newFiles++
             if ($details.Count -lt 15) { $details.Add('Новый файл: ' + $rel) }
@@ -1249,6 +1335,24 @@ function Assert-ValidationManifestIntegrity([string]$Archive,[object]$Meta) {
     if ($actual -ne [string]$Meta.ValidationManifest.SHA256) {
         throw 'SHA-256 контрольного реестра отличается от сохранённого в метаданных.'
     }
+    $info = $Meta.ValidationManifest
+    if ($info.Path -ne 'Validation/files.jsonl' -or [long]$info.Files -lt 0 -or [long]$info.Bytes -lt 0) {
+        throw 'Некорректные метаданные контрольного реестра.'
+    }
+    $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    [decimal]$bytes = 0
+    foreach ($line in [IO.File]::ReadLines($path)) {
+        if (-not $line.Trim()) { continue }
+        $record = Read-ValidationManifestRecord $line
+        if (-not $paths.Add($record.RelativePath)) { throw ('Повторяющийся путь в реестре: ' + $record.RelativePath) }
+        $bytes += $record.Length
+        if ($paths.Count -gt [long]$info.Files -or $bytes -gt [long]$info.Bytes) {
+            throw 'Контрольный реестр превышает количество файлов или суммарный размер в метаданных.'
+        }
+    }
+    if ($paths.Count -ne [long]$info.Files -or $bytes -ne [long]$info.Bytes) {
+        throw 'Количество файлов или суммарный размер контрольного реестра не совпадает с метаданными.'
+    }
     Write-OperationReport 'ПРОВЕРКА' 'Контрольный реестр файлов прошёл проверку SHA-256.'
 }
 # Сверяет каждый файл реестра по пути, размеру и SHA-256 после LoadState.
@@ -1269,33 +1373,24 @@ function Test-ValidationManifest([string]$Archive,[string]$TargetPath,[object]$M
     try {
         while ($null -ne ($line=$sr.ReadLine())) {
             if (-not $line.Trim()) { continue }
-            $item=$line | ConvertFrom-Json
-            $rel=[string]$item.RelativePath
-            if (-not $rel -or [IO.Path]::IsPathRooted($rel) -or $rel.Contains('..\') -or $rel.Contains('../')) {
-                throw 'В контрольном реестре обнаружен недопустимый путь.'
-            }
-            $full=Join-Path $TargetPath $rel
-            if (-not [IO.Path]::GetFullPath($full).StartsWith(([IO.Path]::GetFullPath($TargetPath).TrimEnd('\')+'\'),[StringComparison]::OrdinalIgnoreCase)) {
-                throw 'Контрольный реестр содержит путь вне профиля.'
-            }
+            $item = Read-ValidationManifestRecord $line
+            $rel = $item.RelativePath
             $seen++
-            if (-not [IO.File]::Exists($full)) {
-                $missing++
-                if ($examples.Count -lt 20) { $examples.Add('Отсутствует: '+$rel) }
-            } else {
-                try {
-                    $actual=(Get-Item -LiteralPath $full -Force -ErrorAction Stop)
-                    if ([long]$actual.Length -ne [long]$item.Length) {
-                        $modified++
-                        if ($examples.Count -lt 20) { $examples.Add('Размер отличается: '+$rel) }
-                    } elseif ((Get-ExactFileSha256 $full) -ne [string]$item.SHA256) {
-                        $modified++
-                        if ($examples.Count -lt 20) { $examples.Add('Контрольная сумма отличается: '+$rel) }
-                    } else { $ok++ }
-                } catch {
+            try {
+                $actual = Get-ProfileDataItem $TargetPath $rel
+                if (-not $actual -or $actual.PSIsContainer) {
+                    $missing++
+                    if ($examples.Count -lt 20) { $examples.Add('Отсутствует или находится по ссылке: '+$rel) }
+                } elseif ([long]$actual.Length -ne $item.Length) {
                     $modified++
-                    if ($examples.Count -lt 20) { $examples.Add('Нет доступа для проверки: '+$rel) }
-                }
+                    if ($examples.Count -lt 20) { $examples.Add('Размер отличается: '+$rel) }
+                } elseif ((Get-ExactFileSha256 $actual.FullName) -ne $item.SHA256) {
+                    $modified++
+                    if ($examples.Count -lt 20) { $examples.Add('Контрольная сумма отличается: '+$rel) }
+                } else { $ok++ }
+            } catch {
+                $modified++
+                if ($examples.Count -lt 20) { $examples.Add('Нет доступа для проверки: '+$rel) }
             }
             if ($seen % 50 -eq 0 -or $seen -eq $expected) {
                 $percent=if ($expected -gt 0) { [int][Math]::Min(100,[Math]::Floor($seen*100.0/$expected)) } else { 100 }
@@ -1327,9 +1422,10 @@ function Ensure-PathAvailable([string]$Path,[string]$Caption,[int]$Attempts = 3,
 # Создаёт уникальную локальную папку для подготовки/кеширования сетевого архива.
 function New-StagingDirectory([string]$Prefix) {
     $base = Join-Path $env:ProgramData 'WindowsProfileMigration\Staging'
-    [void](New-Item -ItemType Directory -Path $base -Force)
+    Assert-NoReparseAncestor $base
+    [void](New-Item -ItemType Directory -Path $base -Force -ErrorAction Stop)
     $dir = Join-Path $base ('{0}_{1}_{2}' -f $Prefix,(Get-Date -Format 'yyyyMMdd_HHmmss_fff'),([guid]::NewGuid().ToString('N').Substring(0,8)))
-    [void](New-Item -ItemType Directory -Path $dir -Force)
+    [void](New-Item -ItemType Directory -Path $dir -ErrorAction Stop)
     return $dir
 }
 # Копирует каталог через Robocopy с повторами и контролем ошибок.
@@ -1347,16 +1443,15 @@ function Copy-DirectoryRobust([string]$Source,[string]$Destination,[string]$Purp
         if ([IO.Path]::GetFileName($FileName) -ne $FileName) { throw 'Недопустимое имя файла для копирования.' }
         $args += $FileName
     } else { $args += '/E' }
-    $args += @('/Z','/FFT','/R:3','/W:5','/NFL','/NDL','/NJH','/NJS','/NP','/COPY:DAT','/DCOPY:DAT')
-    # PowerShell passes an array of arguments to native robocopy with path boundaries
-    # preserved; Start-Process -ArgumentList joins arguments into one string and can
-    # break paths containing spaces, including paths to shared network folders.
+    $args += @('/Z','/XJ','/FFT','/R:3','/W:5','/NFL','/NDL','/NJH','/NJS','/NP','/COPY:DAT','/DCOPY:DAT')
+    # Start-Process принимает строку с явно экранированными путями.
     $proc=$null
     try {
         # Robocopy работает с UNC и умеет докачивать после временного сетевого сбоя.
         # Пока он копирует файлы, показываем индикатор без неподтверждённых процентов.
         $argLine=(@($args | ForEach-Object { Quote-WindowsArgument ([string]$_) }) -join ' ')
-        $proc=Start-Process -FilePath 'robocopy.exe' -ArgumentList $argLine -NoNewWindow -PassThru -ErrorAction Stop
+        $robocopy = Join-Path $env:SystemRoot 'System32\robocopy.exe'
+        $proc=Start-Process -FilePath $robocopy -ArgumentList $argLine -NoNewWindow -PassThru -ErrorAction Stop
         # Не теряем код завершения при -NoNewWindow в Windows PowerShell 5.1.
         [void]$proc.Handle
         Write-Host 'Во время копирования нажмите клавишу 0 (без Enter), чтобы запросить отмену.' -ForegroundColor Yellow
@@ -1412,7 +1507,7 @@ function Validate-RestoredProfile([object]$Meta,[object]$TargetProfile) {
             Directories = @(
                 [pscustomobject]@{ RelativePath='Desktop'; Exists=$true; FileCount=0; TotalBytes=0 },
                 [pscustomobject]@{ RelativePath='Documents'; Exists=$true; FileCount=0; TotalBytes=0 },
-                [pscustomobject]@{ RelativePath='AppData\\Roaming'; Exists=$true; FileCount=0; TotalBytes=0 }
+                [pscustomobject]@{ RelativePath='AppData\Roaming'; Exists=$true; FileCount=0; TotalBytes=0 }
             )
             SampleFiles = @()
         }
@@ -1424,11 +1519,11 @@ function Validate-RestoredProfile([object]$Meta,[object]$TargetProfile) {
     foreach ($dir in @($baseline.Directories)) {
         if (-not $dir.Exists) { continue }
         $expectedDirs++
-        $dest = Join-Path $TargetProfile.Path ([string]$dir.RelativePath)
-        if (Test-Path -LiteralPath $dest -PathType Container) {
+        $dest = Get-ProfileDataItem $TargetProfile.Path ([string]$dir.RelativePath)
+        if ($dest -and $dest.PSIsContainer) {
             $presentDirs++
             if ([Int64]$dir.FileCount -gt 0) {
-                $m = Get-FolderMetrics $dest
+                $m = Get-FolderMetrics $dest.FullName
                 if ($m.Files -eq 0) {
                     $warns += ('Каталог пуст после восстановления: ' + $dir.RelativePath)
                 }
@@ -1442,8 +1537,8 @@ function Validate-RestoredProfile([object]$Meta,[object]$TargetProfile) {
     $sampleMissing = @()
     foreach ($sample in @($baseline.SampleFiles)) {
         $sampleTotal++
-        $targetFile = Join-Path $TargetProfile.Path ([string]$sample)
-        if (Test-Path -LiteralPath $targetFile -PathType Leaf) { $sampleMatched++ }
+        $targetFile = Get-ProfileDataItem $TargetProfile.Path ([string]$sample)
+        if ($targetFile -and -not $targetFile.PSIsContainer) { $sampleMatched++ }
         else { $sampleMissing += [string]$sample }
     }
     if ($expectedDirs -gt 0 -and $presentDirs -eq 0) {
@@ -1486,6 +1581,7 @@ function Test-StoreLocation([string]$Root, [string]$SourcePath, [UInt64]$Require
     if ($full -ieq $profile -or $full.StartsWith(($profile+'\'), [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Архив нельзя создавать внутри переносимого профиля: выберите внешний диск или разместите комплект в сетевой папке.'
     }
+    Assert-NoReparseAncestor $Root
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
         [void](New-Item -ItemType Directory -Path $Root -Force -ErrorAction Stop)
     }
@@ -1506,9 +1602,9 @@ function Test-StoreLocation([string]$Root, [string]$SourcePath, [UInt64]$Require
 }
 # Находит файл .mig в USMT-хранилище и исключает неоднозначный архив.
 function MigFile([string]$Store) {
-    $files = @(Get-ChildItem -LiteralPath $Store -Recurse -Force -File -Filter '*.mig' -ErrorAction Stop)
+    $files = @((Get-ArchiveFileMap $Store).Values | Where-Object { [IO.Path]::GetExtension($_.Path) -ieq '.mig' })
     if ($files.Count -ne 1) { throw ('В архиве должно быть ровно 1 файл .mig; найдено: ' + $files.Count) }
-    return $files[0].FullName
+    return $files[0].Path
 }
 # Проверяет целостность файла .mig стандартным UsmtUtils.
 function Verify-Store([string]$Usmt,[string]$Store,[string]$Logs) {
@@ -2285,6 +2381,21 @@ function Write-EmbeddedProfileOnlyRule([string]$Destination) {
     }
 }
 
+# XML читается с отключённым DTD и внешними ресурсами.
+function Read-MigrationXml([string]$Path) {
+    $settings = [Xml.XmlReaderSettings]::new()
+    $settings.DtdProcessing = [Xml.DtdProcessing]::Prohibit
+    $settings.XmlResolver = $null
+    $settings.MaxCharactersInDocument = 32MB
+    $reader = [Xml.XmlReader]::Create($Path,$settings)
+    try {
+        $document = [Xml.XmlDocument]::new()
+        $document.XmlResolver = $null
+        $document.Load($reader)
+        return ,$document
+    } finally { $reader.Dispose() }
+}
+
 # Готовит только пользовательские правила USMT. Стандартные MigDocs/MigUser
 # ищут файлы по всему компьютеру, поэтому для профильного архива не используются.
 # Генерируемый Config.xml отключает стандартные настройки уровня компьютера.
@@ -2295,8 +2406,7 @@ function New-ProfileOnlyRules([string]$Archive,[string]$Usmt,[string]$Logs) {
     $configPath = Join-Path $folder 'Config.xml'
     Write-EmbeddedProfileOnlyRule $rule
     # Проверка XML до передачи его ScanState.
-    $xml = New-Object System.Xml.XmlDocument
-    $xml.Load($rule)
+    $xml = Read-MigrationXml $rule
     $parts = @($xml.SelectNodes('/migration/component'))
     if ($parts.Count -ne 2 -or @($parts | Where-Object { $_.GetAttribute('context') -ne 'User' }).Count -gt 0) {
         throw 'Правило ProfileOnly.xml имеет неожиданную область миграции.'
@@ -2310,12 +2420,11 @@ function New-ProfileOnlyRules([string]$Archive,[string]$Usmt,[string]$Logs) {
     if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
         throw 'USMT не создал Config.xml для ограничения настроек компьютера.'
     }
-    $config = New-Object System.Xml.XmlDocument
-    $config.Load($configPath)
+    $config = Read-MigrationXml $configPath
     if (-not $config.SelectSingleNode('/Configuration')) {
         throw 'Config.xml USMT имеет неожиданный формат.'
     }
-    $machineComponents = @($config.SelectNodes('/Configuration/WindowsComponents/component'))
+    $machineComponents = @($config.SelectNodes('/Configuration/WindowsComponents//component'))
     foreach ($node in $machineComponents) { [void]$node.SetAttribute('migrate','no') }
     $config.Save($configPath)
     Write-OperationReport 'ПРОВЕРКА' ('Настройки Windows уровня компьютера отключены: ' + $machineComponents.Count + ' разделов.')
@@ -2343,6 +2452,9 @@ function Inspect-UsmtFileScope([string]$FileList,[string]$ProfilePath,[bool]$Ver
         $reason = ''
         try {
             if ($candidate -notmatch '^[a-zA-Z]:\\') { throw 'не абсолютный локальный путь' }
+            $relative = $candidate.Substring(3)
+            if ($relative.EndsWith('\')) { $relative = $relative.Substring(0,$relative.Length - 1) }
+            if ($relative) { [void](Get-WindowsRelativePathParts $relative) }
             $full = [IO.Path]::GetFullPath($candidate)
             # Принимаем сам корень и строго вложенные объекты. Соседние
             # профили, например a.agdamov2, остаются за пределами области.
@@ -2402,16 +2514,25 @@ function Assert-ProfileOnlyArchive([string]$Archive,[object]$Meta) {
     if ([string]$proof.RuleSHA256 -ne '5bf12aa9ff9d874faec31829cc7f0b8277af82311810321ec97c89aa6803705c') {
         throw 'Правила в архиве отличаются от подтверждённого шаблона комплекта.'
     }
-    $configDoc = New-Object System.Xml.XmlDocument
-    $configDoc.Load($config)
+    $configDoc = Read-MigrationXml $config
     if (-not $configDoc.SelectSingleNode('/Configuration')) { throw 'Config.xml не прошёл структурную проверку.' }
-    foreach ($node in @($configDoc.SelectNodes('/Configuration/WindowsComponents/component'))) {
+    foreach ($node in @($configDoc.SelectNodes('/Configuration/WindowsComponents//component'))) {
         if ($node.GetAttribute('migrate') -ne 'no') {
             throw 'В архиве обнаружены включённые системные компоненты Windows.'
         }
     }
     $actual = Inspect-UsmtFileScope $files ([string]$proof.ProfilePath) $false
     if ($actual -ne [long]$proof.Files) { throw 'Количество файлов в проверенном списке не совпадает.' }
+}
+
+# Повторно проверяет нет ли нового входа в систему, подмены каталога
+# или удаления профиля за время подготовки и сверки файлов.
+function Assert-ExportProfileReady([object]$Profile,[string]$Phase) {
+    $actual = @(Get-CimInstance Win32_UserProfile -ErrorAction Stop | Where-Object { $_.SID -eq $Profile.SID })
+    if ($actual.Count -ne 1 -or [string]$actual[0].LocalPath -ine [string]$Profile.Path -or
+        $null -eq $actual[0].Loaded -or $actual[0].Loaded) {
+        throw ('Состояние выбранного профиля изменилось: ' + $Phase + '. ZIP не опубликован.')
+    }
 }
 
 # Главный сценарий: профиль → оценка объёма → ScanState → проверка .mig → дополнения → публикация.
@@ -2430,6 +2551,8 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
         Write-Host 'Это необходимо, чтобы контрольные суммы относились к тем же данным, что захватывает USMT.'
         return
     }
+    Assert-ExportProfileReady $p 'перед оценкой файлов'
+    Assert-NoReparseAncestor $p.Path
     Write-Host 'Оценка размера профиля...' -ForegroundColor Cyan
     $profileMetrics = Get-FolderMetrics $p.Path
     $estimatedBytes = [UInt64]$profileMetrics.Bytes
@@ -2465,8 +2588,8 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
     }
     $staging = New-StagingDirectory ('Export_' + $folderName)
     $archive = Join-Path $staging 'Payload'
-    [void](New-Item -ItemType Directory -Path $archive -Force -ErrorAction Stop)
     Update-TrackedState 'Подготовка экспорта' @{StagingPath=$staging; StagingPurpose='Создание ZIP'}
+    [void](New-Item -ItemType Directory -Path $archive -ErrorAction Stop)
     Write-Host ('Готовый ZIP будет сохранён: ' + $finalArchive) -ForegroundColor Cyan
     Write-OperationReport 'АРХИВ' ('Временный рабочий каталог: ' + $archive)
     Write-OperationReport 'ПУТЬ' ('Готовый ZIP: ' + $finalArchive)
@@ -2493,12 +2616,11 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
     $rules = New-ProfileOnlyRules $archive $Usmt $logs
     Advance-OperationStage 'Подготовлены правила USMT'
     # Перед ScanState сохраняем SHA-256, не после. Затем сверим источник повторно.
-    if (@(Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $p.SID -and $_.Loaded }).Count -gt 0) {
-        throw 'Профиль снова был загружен перед началом сканирования. Экспорт отменён.'
-    }
+    Assert-ExportProfileReady $p 'перед созданием контрольного реестра'
     Write-Host 'Формирование контрольного списка ДО ScanState...' -ForegroundColor Cyan
     $manifest = New-ValidationManifest $p.Path $archive
     Advance-OperationStage 'Создан контрольный реестр до ScanState'
+    Assert-ExportProfileReady $p 'перед ScanState'
     $listPath = Join-Path $logs 'usmt-files.txt'
     $args = @($store, ('/i:'+$rules.Rule),('/config:'+$rules.Config),('/listfiles:'+$listPath),'/localonly','/efs:abort',
         '/ue:*\*',('/ui:' + $p.Account), '/v:5',('/l:'+(Join-Path $logs 'scanstate.log')),
@@ -2543,11 +2665,10 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
     catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Сетевые диски: ' + $_.Exception.Message) }
     Advance-OperationStage 'Сохранены дополнительные настройки Проводника, 1С и дисков'
     Write-OperationReport 'НАСТРОЙКИ' ('Расположение значков: ' + $(if ($layoutSaved) { 'сохранено (без гарантии восстановления на другом мониторе)' } else { 'не сохранено' }))
-    if (@(Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $p.SID -and $_.Loaded }).Count -gt 0) {
-        throw 'Во время экспорта профиль снова был загружен. Согласованность файлов не гарантирована.'
-    }
+    Assert-ExportProfileReady $p 'перед повторной сверкой'
     Write-Host 'Повторная сверка SHA-256 источника ПОСЛЕ ScanState...' -ForegroundColor Cyan
     $consistency = Assert-ValidationSourceStable $p.Path $archive $manifest
+    Assert-ExportProfileReady $p 'после повторной сверки'
     Advance-OperationStage 'Подтверждена неизменность исходных файлов'
     $extrasManifest=New-ExtrasManifest $archive
     $exportLogs = Join-Path $archive 'Logs'
@@ -2583,7 +2704,7 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
         $localHash = Assert-CopiedZipHash $localZip $publishedPartial
         Write-OperationReport 'ПРОВЕРКА' ('ZIP проверен после копирования, SHA-256: ' + $localHash)
         if (Test-Path -LiteralPath $finalArchive) { throw 'Готовый ZIP с этим именем уже существует.' }
-        Move-Item -LiteralPath $publishedPartial -Destination $finalArchive -ErrorAction Stop
+        [IO.File]::Move($publishedPartial,$finalArchive)
         Advance-OperationStage 'ZIP опубликован в папке назначения'
         Update-TrackedState 'ZIP опубликован' @{NetworkPartialPath=''}
         Write-OperationReport 'УСПЕХ' ('ZIP проверен и опубликован: ' + $finalArchive)
