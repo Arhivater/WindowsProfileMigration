@@ -1,0 +1,37 @@
+name: Upload v1.10.1 release downloads
+
+on:
+  push:
+    branches: ['artifacts/v1.10.1']
+    paths: ['.github/workflows/upload-v1.10.1-assets.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Verify and attach release files
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          package=dist/WindowsProfileMigration_v1.10.1_Arhivater.zip
+          printf '683bc4f8fd2620b2b3dc68444f57e343911d8d569f1dcee7181e8698b201ee8c  %s\n' "$package" | sha256sum --check --strict
+          compare_dir=$(mktemp -d)
+          for file in "$package" AUDIT_REPORT.md TEST_CHECKLIST.md CHANGELOG.md TESTING_GUIDE.md; do
+            name=${file##*/}
+            assets=$(gh release view v1.10.1 --json assets --jq '.assets[].name')
+            if ! grep -Fqx -- "$name" <<< "$assets"; then
+              gh release upload v1.10.1 "$file"
+            fi
+            gh release download v1.10.1 --pattern "$name" --dir "$compare_dir"
+            cmp "$file" "$compare_dir/$name"
+          done
