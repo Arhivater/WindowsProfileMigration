@@ -3983,6 +3983,37 @@ function Enter-RemoteMigration([object]$Session,[string]$Root,[string]$Hash,[str
 function Invoke-RemoteProfileImport([object]$Session,[string]$Root,[string]$Archive,[string]$Account,[string]$Hash) {
     Invoke-Command -Session $Session -ArgumentList $Root,$Archive,$Account,$Hash -ErrorAction Stop -ScriptBlock {
         param($root,$zip,$account,$hash)
+        function Get-MigrationLaunchOptions([string]$Script) {
+            $policy = Get-ExecutionPolicy -ErrorAction Stop
+            $options = @('-NoProfile','-NonInteractive')
+            if ($policy -eq 'Restricted') {
+                $configured = @(Get-ExecutionPolicy -List -ErrorAction Stop | Where-Object ExecutionPolicy -ne 'Undefined')
+                if ($configured.Count -gt 0) {
+                    throw 'Настроенная политика Windows PowerShell запрещает сценарии на получателе. Импорт ещё не запущен.'
+                }
+                # Штатный Restricted при отсутствии настроенных политик
+                # заменяется RemoteSigned только в этом дочернем процессе.
+                $options += @('-ExecutionPolicy','RemoteSigned')
+                $policy = 'RemoteSigned'
+            }
+            $remoteOrigin = $false
+            if ($policy -in @('RemoteSigned','Unrestricted')) {
+                $zone = @(Get-Content -LiteralPath $Script -Stream 'Zone.Identifier' -ErrorAction SilentlyContinue)
+                $remoteOrigin = @($zone | Where-Object { $_ -match '^\s*ZoneId\s*=\s*[34]\s*$' }).Count -gt 0
+            }
+            if ($policy -eq 'AllSigned' -or ($remoteOrigin -and $policy -in @('RemoteSigned','Unrestricted'))) {
+                $signature = Get-AuthenticodeSignature -LiteralPath $Script -ErrorAction Stop
+                if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate) {
+                    throw 'Получатель требует подписанный сценарий. Импорт ещё не запущен.'
+                }
+                $thumbprint = $signature.SignerCertificate.Thumbprint
+                if (-not (Test-Path -LiteralPath ('Cert:\LocalMachine\TrustedPublisher\' + $thumbprint)) -and
+                    -not (Test-Path -LiteralPath ('Cert:\CurrentUser\TrustedPublisher\' + $thumbprint))) {
+                    throw 'Издатель сценария не добавлен в доверенные на получателе. Импорт ещё не запущен.'
+                }
+            }
+            return $options
+        }
         function Write-ImportMarker([string]$Path,[string]$Text) {
             $buffer = [Text.Encoding]::UTF8.GetBytes($Text)
             $file = [IO.File]::Open($Path,'CreateNew','Write','None')
@@ -4001,13 +4032,14 @@ function Invoke-RemoteProfileImport([object]$Session,[string]$Root,[string]$Arch
         if (-not (Test-Path -LiteralPath $script -PathType Leaf) -or -not (Test-Path -LiteralPath $binary -PathType Leaf)) {
             throw 'Отсутствует удалённый сценарий импорта или Windows PowerShell.'
         }
+        $launchOptions = @(Get-MigrationLaunchOptions $script)
         $lockedZip = [IO.File]::Open($zip,'Open','Read','Read')
         try {
             if ((Get-FileHash -InputStream $lockedZip -Algorithm SHA256 -ErrorAction Stop).Hash -ne $hash) {
                 throw 'SHA-256 ZIP изменился до запуска импорта.'
             }
             Write-ImportMarker $started $tag
-            & $binary -NoProfile -NonInteractive -File $script -ToolRoot $root -RemoteImportArchive $zip -RemoteTargetAccount $account
+            & $binary @launchOptions -File $script -ToolRoot $root -RemoteImportArchive $zip -RemoteTargetAccount $account
             if ($LASTEXITCODE -ne 0) { throw ('На целевом ПК импорт завершился кодом ' + $LASTEXITCODE + '.') }
             Write-ImportMarker $done $tag
             'WPM_REMOTE_SUCCESS'
@@ -4064,6 +4096,7 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
     $remoteRoot = $null
     $remoteArchive = $null
     $zipStream = $null
+    $releaseDeploymentLock = $false
     try {
         Write-Host ('Проверка удалённого подключения: ' + $targetHost) -ForegroundColor Cyan
         Write-OperationReport 'СЕТЬ' ('Подключение к ' + $targetHost + '; протокол=' + $(if ($transport -eq 2) { 'HTTPS' } else { 'HTTP' }) + '; явные полномочия=' + ($auth -eq 2))
@@ -4185,6 +4218,7 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
         Advance-OperationStage 'ZIP передан и проверен по SHA-256'
         Write-OperationReport 'ПРОВЕРКА' ('ZIP передан без изменений, SHA-256: ' + $localHash)
 
+        $releaseDeploymentLock = $true
         $deployment = Enter-RemoteMigration $session $remoteRoot $localHash $targetAccount
         if ($deployment -eq 'Completed') {
             Write-OperationReport 'ВОЗОБНОВЛЕНИЕ' 'На получателе сохранено подтверждение завершения импорта этого ZIP для выбранного пользователя.'
@@ -4286,7 +4320,20 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
         throw
     } finally {
         if ($zipStream) { $zipStream.Dispose() }
-        if ($session) { Remove-PSSession -Session $session -ErrorAction SilentlyContinue }
+        if ($session) {
+            if ($releaseDeploymentLock -and $session.State -eq 'Opened') {
+                try {
+                    Invoke-Command -Session $session -ErrorAction Stop -ScriptBlock {
+                        $lock = Get-Variable -Name WpmDeploymentLock -Scope Global -ErrorAction SilentlyContinue
+                        if ($lock) {
+                            $lock.Value.Dispose()
+                            Remove-Variable -Name WpmDeploymentLock -Scope Global
+                        }
+                    }
+                } catch { }
+            }
+            Remove-PSSession -Session $session -ErrorAction SilentlyContinue
+        }
     }
 }
 

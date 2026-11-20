@@ -139,3 +139,36 @@ Invoke-WpmTest 'Network reconnect rejects a different device with same hostname'
     Assert-WpmThrows { Connect-RemoteMigration @{} $existing } 'другое устройство'
     Assert-WpmEqual $fakeSession.Removed $true
 }
+
+
+Invoke-WpmTest 'Network launch honors explicit execution policies before marking import started' {
+    $definition = Get-WpmFunctionDefinitions -Name 'Invoke-RemoteProfileImport'
+    $policyFunction = $definition.Ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-MigrationLaunchOptions'
+    },$true)
+    . ([scriptblock]::Create($policyFunction.Extent.Text))
+    $settings = [pscustomobject]@{Effective='Restricted'; Configured='Undefined'; Zone=''}
+    function Get-ExecutionPolicy {
+        param([switch]$List,$ErrorAction)
+        if ($List) { return [pscustomobject]@{ExecutionPolicy=$settings.Configured} }
+        return $settings.Effective
+    }
+    function Get-Content {
+        param($LiteralPath,$Stream,$ErrorAction)
+        return $settings.Zone
+    }
+    function Get-AuthenticodeSignature {
+        param($LiteralPath,$ErrorAction)
+        return [pscustomobject]@{Status='NotSigned';SignerCertificate=$null}
+    }
+    Assert-WpmEqual (Get-MigrationLaunchOptions 'ProfileMigration.ps1') @('-NoProfile','-NonInteractive','-ExecutionPolicy','RemoteSigned')
+    $settings.Configured = 'Restricted'
+    Assert-WpmThrows { Get-MigrationLaunchOptions 'ProfileMigration.ps1' } 'политика Windows PowerShell запрещает'
+    $settings.Effective = 'AllSigned'
+    Assert-WpmThrows { Get-MigrationLaunchOptions 'ProfileMigration.ps1' } 'требует подписанный сценарий'
+    $settings.Effective = 'RemoteSigned'
+    Assert-WpmEqual (Get-MigrationLaunchOptions 'ProfileMigration.ps1') @('-NoProfile','-NonInteractive')
+    $settings.Zone = 'ZoneId=3'
+    Assert-WpmThrows { Get-MigrationLaunchOptions 'ProfileMigration.ps1' } 'требует подписанный сценарий'
+}
