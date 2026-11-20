@@ -95,6 +95,11 @@ Invoke-WpmTest 'Extras manifest rejects Windows aliases and duplicates, and excl
         [IO.File]::WriteAllText($manifest,$validLine.Replace('ibases.v8i',$alias))
         Assert-WpmThrows { Test-ExtrasManifest $WpmTestRoot $meta } 'Недопустимый путь'
     }
+    [IO.File]::WriteAllText($manifest,'{"RelativePath":')
+    Assert-WpmThrows { Test-ExtrasManifest $WpmTestRoot $meta }
+    $exclusive = [IO.File]::Open($manifest,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+    $exclusive.Dispose()
+
 }
 
 Invoke-WpmTest 'Extras browser restore skips unexpected files and keeps other browsers independent' {

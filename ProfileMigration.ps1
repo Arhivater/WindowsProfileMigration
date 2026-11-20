@@ -2067,32 +2067,36 @@ function Test-ExtrasManifest([string]$Archive,[object]$Meta) {
     $approved = @{}
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $root = Join-Path $Archive 'Extras'
-    foreach ($line in [IO.File]::ReadLines($path)) {
-        if (-not $line.Trim()) { continue }
-        $entry = $line | ConvertFrom-Json -ErrorAction Stop
-        $rel = [string]$entry.RelativePath
-        $parts = $rel -split '[/\\]'
-        foreach ($part in $parts) {
-            if (-not (Test-ExtraPathComponent $part)) { throw 'Недопустимый путь в манифесте Extras.' }
+    # Закрываем поток и при ошибке разбора или проверки записи.
+    $reader = [IO.StreamReader]::new($path,[Text.Encoding]::UTF8,$true)
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if (-not $line.Trim()) { continue }
+            $entry = $line | ConvertFrom-Json -ErrorAction Stop
+            $rel = [string]$entry.RelativePath
+            $parts = $rel -split '[/\\]'
+            foreach ($part in $parts) {
+                if (-not (Test-ExtraPathComponent $part)) { throw 'Недопустимый путь в манифесте Extras.' }
+            }
+            $key = $parts -join '\'
+            if (-not $seen.Add($key)) { throw 'Повторяющийся путь в манифесте Extras.' }
+            $hash = [string]$entry.SHA256
+            if ($hash -notmatch '^[0-9a-fA-F]{64}$' -or [long]$entry.Length -lt 0) {
+                throw 'Некорректный размер или SHA-256 в манифесте Extras.'
+            }
+            $full = Join-Path $root ($parts -join [IO.Path]::DirectorySeparatorChar)
+            $ok = $false
+            try {
+                # Проверяем и корневой каталог Extras, и путь внутри него.
+                Assert-ProfileExtraPath $full $Archive
+                $file = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+                if (-not $file.PSIsContainer -and $file.Length -eq [long]$entry.Length -and
+                    (Get-ExactFileSha256 $full) -eq $hash) { $ok = $true }
+            } catch { }
+            if ($ok) { $approved[$key] = $hash }
+            else { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Extras: файл отсутствует или повреждён, пропускается: ' + $rel) }
         }
-        $key = $parts -join '\'
-        if (-not $seen.Add($key)) { throw 'Повторяющийся путь в манифесте Extras.' }
-        $hash = [string]$entry.SHA256
-        if ($hash -notmatch '^[0-9a-fA-F]{64}$' -or [long]$entry.Length -lt 0) {
-            throw 'Некорректный размер или SHA-256 в манифесте Extras.'
-        }
-        $full = Join-Path $root ($parts -join [IO.Path]::DirectorySeparatorChar)
-        $ok = $false
-        try {
-            # Проверяем и корневой каталог Extras, и путь внутри него.
-            Assert-ProfileExtraPath $full $Archive
-            $file = Get-Item -LiteralPath $full -Force -ErrorAction Stop
-            if (-not $file.PSIsContainer -and $file.Length -eq [long]$entry.Length -and
-                (Get-ExactFileSha256 $full) -eq $hash) { $ok = $true }
-        } catch { }
-        if ($ok) { $approved[$key] = $hash }
-        else { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Extras: файл отсутствует или повреждён, пропускается: ' + $rel) }
-    }
+    } finally { $reader.Dispose() }
     if ($seen.Count -ne [int]$info.Files) { throw 'Число записей Extras не совпадает с метаданными.' }
     if ([int]$info.Skipped -gt 0) {
         Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('При экспорте не удалось вычислить хеши Extras: ' + $info.Skipped)
