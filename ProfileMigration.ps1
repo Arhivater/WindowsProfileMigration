@@ -1627,44 +1627,130 @@ function Browser-Definitions {
 # Проверяет, запущен ли браузер именно от нужного пользователя.
 function Get-OpenTargetBrowsers([string]$Sid) {
     $found = @()
-    $names = @('chrome.exe','msedge.exe','browser.exe')
-    $processes = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -in $names })
+    $names = @(Browser-Definitions | ForEach-Object Process)
+    try {
+        $processes = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | Where-Object { $_.Name -in $names })
+    } catch {
+        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Нельзя проверить, закрыты ли браузеры: ' + $_.Exception.Message)
+        return $names
+    }
     foreach ($proc in $processes) {
         try {
             $who = Invoke-CimMethod -InputObject $proc -MethodName GetOwnerSid -ErrorAction Stop
-            if ($who.ReturnValue -eq 0 -and [string]$who.Sid -eq $Sid) { $found += $proc.Name }
-        } catch { }
+            if ($who.ReturnValue -ne 0 -or -not $who.Sid) {
+                throw ('GetOwnerSid вернул код ' + $who.ReturnValue)
+            }
+            if ([string]$who.Sid -eq $Sid) { $found += $proc.Name }
+        } catch {
+            $found += $proc.Name
+            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не определён владелец процесса ' + $proc.Name + ': ' + $_.Exception.Message)
+        }
     }
     return @($found | Sort-Object -Unique)
 }
-# Проверяет, что дополнительный файл браузера действительно находится внутри
-# профиля и не ведёт наружу через junction или символическую ссылку.
-function Assert-ProfileSourcePath([string]$Path,[string]$ProfileRoot) {
-    $root = [IO.Path]::GetFullPath($ProfileRoot).TrimEnd('\')
+
+function Test-ExtraPathComponent([string]$Name) {
+    return ($Name -and $Name -notmatch '[<>:"|?*\x00-\x1f]|[ .]$|^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)')
+}
+
+# Проверка идёт от корня к файлу, чтобы не открывать каталог за junction.
+function Assert-ProfileExtraPath([string]$Path,[string]$Root,[bool]$AllowMissing = $false) {
+    $rootPath = [IO.Path]::GetFullPath($Root)
+    $separator = [IO.Path]::DirectorySeparatorChar
+    $prefix = $rootPath.TrimEnd([char[]]@($separator,[IO.Path]::AltDirectorySeparatorChar)) + $separator
     $full = [IO.Path]::GetFullPath($Path)
-    $cmp = [StringComparison]::OrdinalIgnoreCase
-    if (-not $full.StartsWith(($root+'\'),$cmp)) { throw ('Файл вне выбранного профиля: ' + $full) }
-    $cur = $full
-    while ($cur.StartsWith(($root+'\'),$cmp) -or $cur.Equals($root,$cmp)) {
-        $item = Get-Item -LiteralPath $cur -Force -ErrorAction Stop
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw ('Ссылка за пределы профиля запрещена: ' + $cur) }
-        if ($cur.Equals($root,$cmp)) { break }
-        $cur = [IO.Path]::GetDirectoryName($cur)
+    if (-not $full.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) {
+        throw ('Путь вне разрешённого каталога: ' + $full)
+    }
+    $rootItem = Get-Item -LiteralPath $rootPath -Force -ErrorAction Stop
+    if (-not $rootItem.PSIsContainer -or ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw ('Недопустимый корень дополнительных файлов: ' + $rootPath)
+    }
+    $parts = $full.Substring($prefix.Length).Split($separator)
+    $current = $rootPath
+    foreach ($part in $parts) {
+        if (-not (Test-ExtraPathComponent $part)) { throw ('Имя в пути дополнительных файлов недопустимо: ' + $part) }
+    }
+    for ($i=0; $i -lt $parts.Length; $i++) {
+        $current = [IO.Path]::Combine($current,$parts[$i])
+        try { $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop }
+        catch [System.Management.Automation.ItemNotFoundException] {
+            if ($AllowMissing) { return }
+            throw
+        }
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw ('Ссылка в пути дополнительных файлов запрещена: ' + $current)
+        }
+        if ($i -lt $parts.Length-1 -and -not $item.PSIsContainer) {
+            throw ('Компонент пути не является каталогом: ' + $current)
+        }
     }
 }
-# Копирует отдельный пользовательский файл с проверкой размера.
-function Copy-RequiredFile([string]$From,[string]$To,[string]$AllowedSourceRoot = '') {
-    if (-not [IO.File]::Exists($From)) { return $false }
-    if ($AllowedSourceRoot) { Assert-ProfileSourcePath $From $AllowedSourceRoot }
-    $parent = Split-Path -Parent $To
-    if (-not (Test-Path -LiteralPath $parent)) { [void](New-Item -ItemType Directory -Path $parent -Force) }
-    Copy-Item -LiteralPath $From -Destination $To -Force -ErrorAction Stop
-    if ((Get-Item -LiteralPath $From -Force).Length -ne (Get-Item -LiteralPath $To -Force).Length) { throw ('Размер скопированного файла отличается: ' + $From) }
-    $before=Get-ExactFileSha256 $From
-    $after=Get-ExactFileSha256 $To
-    if ($before -ne $after) { throw ('SHA-256 скопированного файла отличается: ' + $From) }
-    return $true
+
+function Get-ExtraStreamSha256([IO.Stream]$Stream) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $Stream.Position = 0
+        return [BitConverter]::ToString($sha.ComputeHash($Stream)).Replace('-','')
+    } finally {
+        $Stream.Position = 0
+        $sha.Dispose()
+    }
 }
+
+# Копируем с открытым источником, чтобы другой процесс не изменил его между
+# чтением и проверкой. Ошибка копирования или SHA-256 не публикует файл.
+function Copy-RequiredFile(
+    [string]$From,
+    [string]$To,
+    [string]$AllowedSourceRoot = '',
+    [string]$AllowedDestinationRoot = '',
+    [string]$Backup = '',
+    [string]$ExpectedHash = ''
+) {
+    if ($AllowedSourceRoot) { Assert-ProfileExtraPath $From $AllowedSourceRoot $true }
+    if (-not [IO.File]::Exists($From)) { return $false }
+    if ($AllowedDestinationRoot) { Assert-ProfileExtraPath $To $AllowedDestinationRoot $true }
+    $parent = Split-Path -Parent $To
+    [void][IO.Directory]::CreateDirectory($parent)
+    if ($AllowedDestinationRoot) { Assert-ProfileExtraPath $To $AllowedDestinationRoot $true }
+    $temporary = Join-Path $parent ('.WPM_' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $source = [IO.File]::Open($From,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try {
+        $output = [IO.File]::Open($temporary,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        try {
+            $source.CopyTo($output)
+            $output.Flush($true)
+        } finally { $output.Dispose() }
+        $sourceHash = Get-ExtraStreamSha256 $source
+        if (($ExpectedHash -and $sourceHash -ne $ExpectedHash) -or
+            $sourceHash -ne (Get-ExactFileSha256 $temporary)) {
+            throw ('SHA-256 скопированного файла отличается: ' + $From)
+        }
+        if ($AllowedDestinationRoot) { Assert-ProfileExtraPath $To $AllowedDestinationRoot $true }
+        if ($Backup -and [IO.File]::Exists($To)) {
+            if (-not (Copy-RequiredFile -From $To -To $Backup -AllowedSourceRoot $AllowedDestinationRoot -AllowedDestinationRoot $env:ProgramData)) {
+                throw ('Не удалось резервировать целевой файл: ' + $To)
+            }
+            if ($AllowedDestinationRoot) { Assert-ProfileExtraPath $To $AllowedDestinationRoot }
+            if ((Get-ExactFileSha256 $Backup) -ne (Get-ExactFileSha256 $To)) {
+                throw ('Целевой файл изменился после резервирования: ' + $To)
+            }
+            # Замена на том же томе сохраняет существующие права целевого файла.
+            [IO.File]::Replace($temporary,$To,[NullString]::Value)
+        } else { [IO.File]::Move($temporary,$To) }
+        return $true
+    } finally {
+        $source.Dispose()
+        if ([IO.File]::Exists($temporary)) {
+            try {
+                if ($AllowedDestinationRoot) { Assert-ProfileExtraPath $temporary $AllowedDestinationRoot }
+                [IO.File]::Delete($temporary)
+            } catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалён временный файл: ' + $temporary + '; ' + $_.Exception.Message) }
+        }
+    }
+}
+
 # Создаёт контрольный реестр Extras: путь, размер и SHA-256 каждого файла.
 function New-ExtrasManifest([string]$Archive) {
     $extras=Join-Path $Archive 'Extras'
@@ -1675,9 +1761,11 @@ function New-ExtrasManifest([string]$Archive) {
     [long]$count=0; [long]$skipped=0
     try {
         if (Test-Path -LiteralPath $extras -PathType Container) {
+            Assert-ProfileExtraPath $extras $Archive
             foreach ($file in @(Get-ChildItem -LiteralPath $extras -Recurse -File -Force -ErrorAction Stop)) {
-                $rel=$file.FullName.Substring($extras.TrimEnd('\').Length).TrimStart('\')
+                $rel = $file.FullName.Substring($extras.Length).TrimStart([char[]]@('\','/')).Replace('/','\')
                 try {
+                    Assert-ProfileExtraPath $file.FullName $Archive
                     $sha=Get-ExactFileSha256 $file.FullName
                     $writer.WriteLine(([ordered]@{ RelativePath=$rel; Length=[long]$file.Length; SHA256=$sha } | ConvertTo-Json -Compress))
                     $count++
@@ -1692,39 +1780,63 @@ function New-ExtrasManifest([string]$Archive) {
     return [pscustomobject]@{Path='Validation/extras.jsonl'; Files=$count; Skipped=$skipped}
 }
 # Повреждённые файлы Extras исключаются из восстановления, но не останавливают USMT.
+function Read-ExtraJson([string]$Path,[string]$Root,[string]$ExpectedHash = '') {
+    Assert-ProfileExtraPath $Path $Root
+    $stream = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try {
+        if ($ExpectedHash -and (Get-ExtraStreamSha256 $stream) -ne $ExpectedHash) {
+            throw ('Файл дополнительных настроек изменился после проверки: ' + $Path)
+        }
+        $reader = [IO.StreamReader]::new($stream,[Text.Encoding]::UTF8,$true)
+        try { return ($reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop) }
+        finally { $reader.Dispose() }
+    } finally { $stream.Dispose() }
+}
+
 function Test-ExtrasManifest([string]$Archive,[object]$Meta) {
     if ([int]$Meta.SchemaVersion -lt 5) {
         Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Старый архив: у Extras нет отдельного контроля SHA-256.'
         return $null
     }
-    $info=$Meta.ExtrasManifest
+    $info = $Meta.ExtrasManifest
     if (-not $info -or $info.Path -ne 'Validation/extras.jsonl') { throw 'Нет корректных метаданных Extras.' }
-    $path=Join-Path $Archive 'Validation\extras.jsonl'
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'Манифест Extras отсутствует.' }
-    $approved=@{}; [int]$seen=0
-    $root=[IO.Path]::GetFullPath((Join-Path $Archive 'Extras')).TrimEnd('\')
+    $path = Join-Path $Archive 'Validation/extras.jsonl'
+    Assert-ProfileExtraPath $path $Archive
+    if (-not [IO.File]::Exists($path)) { throw 'Манифест Extras отсутствует.' }
+    $approved = @{}
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $root = Join-Path $Archive 'Extras'
     foreach ($line in [IO.File]::ReadLines($path)) {
         if (-not $line.Trim()) { continue }
-        $entry=$line | ConvertFrom-Json -ErrorAction Stop
-        $rel=[string]$entry.RelativePath
-        if (-not $rel -or [IO.Path]::IsPathRooted($rel) -or $rel.StartsWith('\') -or
-            $rel.Contains('..\') -or $rel.Contains('../')) { throw 'Недопустимый путь в манифесте Extras.' }
-        $full=[IO.Path]::GetFullPath((Join-Path $root $rel))
-        if (-not $full.StartsWith(($root+'\'),[StringComparison]::OrdinalIgnoreCase)) { throw 'Манифест Extras указывает за пределы архива.' }
-        $seen++; $ok=$false
+        $entry = $line | ConvertFrom-Json -ErrorAction Stop
+        $rel = [string]$entry.RelativePath
+        $parts = $rel -split '[/\\]'
+        foreach ($part in $parts) {
+            if (-not (Test-ExtraPathComponent $part)) { throw 'Недопустимый путь в манифесте Extras.' }
+        }
+        $key = $parts -join '\'
+        if (-not $seen.Add($key)) { throw 'Повторяющийся путь в манифесте Extras.' }
+        $hash = [string]$entry.SHA256
+        if ($hash -notmatch '^[0-9a-fA-F]{64}$' -or [long]$entry.Length -lt 0) {
+            throw 'Некорректный размер или SHA-256 в манифесте Extras.'
+        }
+        $full = Join-Path $root ($parts -join [IO.Path]::DirectorySeparatorChar)
+        $ok = $false
         try {
-            $file=Get-Item -LiteralPath $full -Force -ErrorAction Stop
-            if ($file.Length -eq [long]$entry.Length -and
-                (Get-ExactFileSha256 $full) -eq [string]$entry.SHA256) { $ok=$true }
+            # Проверяем и корневой каталог Extras, и путь внутри него.
+            Assert-ProfileExtraPath $full $Archive
+            $file = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+            if (-not $file.PSIsContainer -and $file.Length -eq [long]$entry.Length -and
+                (Get-ExactFileSha256 $full) -eq $hash) { $ok = $true }
         } catch { }
-        if ($ok) { $approved[$rel.ToLowerInvariant().Replace('/','\')]=$true }
+        if ($ok) { $approved[$key] = $hash }
         else { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Extras: файл отсутствует или повреждён, пропускается: ' + $rel) }
     }
-    if ($seen -ne [int]$info.Files) { throw 'Число записей Extras не совпадает с метаданными.' }
+    if ($seen.Count -ne [int]$info.Files) { throw 'Число записей Extras не совпадает с метаданными.' }
     if ([int]$info.Skipped -gt 0) {
         Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('При экспорте не удалось вычислить хеши Extras: ' + $info.Skipped)
     }
-    Write-OperationReport 'ПРОВЕРКА' ('Extras: проверено ' + $seen + '; совпало ' + $approved.Count)
+    Write-OperationReport 'ПРОВЕРКА' ('Extras: проверено ' + $seen.Count + '; совпало ' + $approved.Count)
     return $approved
 }
 function Is-AllowedExtra([hashtable]$Approved,[string]$Relative) {
@@ -1742,7 +1854,7 @@ function Export-ExplorerAndOneCExtras([object]$Profile,[string]$Archive) {
     if (Test-Path -LiteralPath $quickSource -PathType Leaf) {
         try {
             $quickDestination = Join-Path $Archive 'Extras\Explorer\QuickAccess.automaticDestinations-ms'
-            if (Copy-RequiredFile $quickSource $quickDestination $Profile.Path) {
+            if (Copy-RequiredFile $quickSource $quickDestination $Profile.Path $Archive) {
                 $saved++
                 Write-OperationReport 'ПРОВОДНИК' 'Закреплённые папки быстрого доступа: сохранён файл Explorer.'
             }
@@ -1751,12 +1863,13 @@ function Export-ExplorerAndOneCExtras([object]$Profile,[string]$Archive) {
     $sourceDir = Join-Path $Profile.Path 'AppData\Roaming\1C\1CEStart'
     [int]$oneCSaved = 0
     if (Test-Path -LiteralPath $sourceDir -PathType Container) {
+        Assert-ProfileExtraPath $sourceDir $Profile.Path
         foreach ($file in @(Get-ChildItem -LiteralPath $sourceDir -File -Force -ErrorAction Stop | Where-Object {
             $_.Name -match '(?i)^(ibases[^\\/]*\.v8i|1cestart\.cfg)$'
         })) {
             try {
                 $dest = Join-Path (Join-Path $Archive 'Extras\OneC') $file.Name
-                if (Copy-RequiredFile $file.FullName $dest $Profile.Path) {
+                if (Copy-RequiredFile $file.FullName $dest $Profile.Path $Archive) {
                     $oneCSaved++; $saved++
                     Write-OperationReport '1С' ('Сохранён файл списка баз/настроек запуска: ' + $file.Name + '; размер ' + (Format-ByteSize ([UInt64]$file.Length)))
                 }
@@ -1778,6 +1891,7 @@ function Restore-ExplorerAndOneCExtras([string]$Archive,[string]$TargetPath,[has
     }
     $oneCFolder = Join-Path $Archive 'Extras\OneC'
     if (Test-Path -LiteralPath $oneCFolder -PathType Container) {
+        Assert-ProfileExtraPath $oneCFolder $Archive
         foreach ($file in @(Get-ChildItem -LiteralPath $oneCFolder -File -Force -ErrorAction Stop | Where-Object {
             $_.Name -match '(?i)^(ibases[^\\/]*\.v8i|1cestart\.cfg)$'
         })) {
@@ -1791,6 +1905,7 @@ function Restore-ExplorerAndOneCExtras([string]$Archive,[string]$TargetPath,[has
     }
     $backupRoot = Join-Path $env:ProgramData ('WindowsProfileMigration\ConfigBackups\' +
         (Get-Date -Format 'yyyyMMdd_HHmmss_fff') + '_' + [guid]::NewGuid().ToString('N').Substring(0,8))
+    Update-TrackedState '' @{ConfigBackupPath=$backupRoot}
     [int]$done = 0
     foreach ($job in $jobs) {
         try {
@@ -1798,23 +1913,14 @@ function Restore-ExplorerAndOneCExtras([string]$Archive,[string]$TargetPath,[has
                 throw ('Файл не прошёл SHA-256: ' + $job.Key)
             }
             $dest = [string]$job.Destination
-            $temp = $dest + '.WPM_' + [guid]::NewGuid().ToString('N') + '.tmp'
-            $hadPrevious = Test-Path -LiteralPath $dest -PathType Leaf
-            try {
-                [void](Copy-RequiredFile ([string]$job.Source) $temp)
-                if ($hadPrevious) {
-                    $backup = Join-Path $backupRoot $job.Key
-                    [void](Copy-RequiredFile $dest $backup)
-                }
-                Move-Item -LiteralPath $temp -Destination $dest -Force -ErrorAction Stop
-                $done++
-                Write-OperationReport 'НАСТРОЙКИ' ('Восстановлено: ' + $job.Name + $(if ($hadPrevious) { '; прежний файл сохранён в ' + $backupRoot } else { '' }))
-            } finally {
-                if (Test-Path -LiteralPath $temp -PathType Leaf) {
-                    try { Remove-Item -LiteralPath $temp -Force -ErrorAction Stop }
-                    catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалён временный файл: ' + $temp) }
-                }
+            $backup = Join-Path $backupRoot $job.Key
+            $hash = if ($null -ne $ApprovedExtras) { [string]$ApprovedExtras[$job.Key] } else { '' }
+            if (-not (Copy-RequiredFile -From $job.Source -To $dest -AllowedSourceRoot $Archive -AllowedDestinationRoot $TargetPath -Backup $backup -ExpectedHash $hash)) {
+                throw ('Файл исчез до восстановления: ' + $job.Key)
             }
+            $done++
+            $backupNote = if ([IO.File]::Exists($backup)) { '; прежний файл сохранён в ' + $backup } else { '' }
+            Write-OperationReport 'НАСТРОЙКИ' ('Восстановлено: ' + $job.Name + $backupNote)
         } catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не перенесён ' + $job.Name + ': ' + $_.Exception.Message) }
     }
     Write-OperationReport 'НАСТРОЙКИ' ('Закрепления Проводника и 1С: восстановлено ' + $done + ' из ' + $jobs.Count + ' файлов.')
@@ -1822,31 +1928,52 @@ function Restore-ExplorerAndOneCExtras([string]$Archive,[string]$TargetPath,[has
 
 # Выполняет действие с реестром именно выбранного пользователя. При отсутствии
 # сеанса временно подключает NTUSER.DAT и гарантированно пытается выгрузить его.
-function Invoke-ProfileHive([string]$Sid,[string]$ProfilePath,[scriptblock]$Action) {
+function Invoke-ProfileHive([string]$Sid,[string]$ProfilePath,[scriptblock]$Action,[bool]$RequireOffline = $false) {
+    if ($Sid -notmatch '^S-1-(?:[0-9]+-){1,14}[0-9]+$') { throw 'Некорректный SID пользовательского реестра.' }
+    $reg = Join-Path $env:SystemRoot 'System32/reg.exe'
     $hku = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::Users,[Microsoft.Win32.RegistryView]::Default)
     $mount = $Sid
     $mountedHere = $false
     try {
         $probe = $hku.OpenSubKey($mount,$false)
-        if ($probe) { $probe.Dispose() }
-        else {
+        if ($probe) {
+            $probe.Dispose()
+            if ($RequireOffline) { throw 'Целевой пользователь должен завершить сеанс перед изменением реестра.' }
+        } else {
             $ntuser = Join-Path $ProfilePath 'NTUSER.DAT'
-            if (-not (Test-Path -LiteralPath $ntuser -PathType Leaf)) { throw ('Отсутствует пользовательский реестр: ' + $ntuser) }
-            Assert-ProfileSourcePath $ntuser $ProfilePath
+            Assert-ProfileExtraPath $ntuser $ProfilePath
+            if (-not [IO.File]::Exists($ntuser)) { throw ('Отсутствует пользовательский реестр: ' + $ntuser) }
             $mount = 'WPM_' + [guid]::NewGuid().ToString('N')
-            & reg.exe load ('HKU\' + $mount) $ntuser | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw ('reg load не смог подключить реестр пользователя: ' + $ProfilePath) }
+            & $reg load ('HKU\' + $mount) $ntuser | Out-Null
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw ('reg load: код ' + $code + '; реестр: ' + $ProfilePath) }
             $mountedHere = $true
         }
         return (& $Action $hku $mount)
     } finally {
         $hku.Dispose()
         if ($mountedHere) {
-            [GC]::Collect(); [GC]::WaitForPendingFinalizers()
-            & reg.exe unload ('HKU\' + $mount) | Out-Null
-            if ($LASTEXITCODE -ne 0) { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не выгружен временный пользовательский реестр: HKU\' + $mount) }
+            & $reg unload ('HKU\' + $mount) | Out-Null
+            $code = $LASTEXITCODE
+            if ($code -ne 0) {
+                Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('reg unload: код ' + $code + '; временный реестр HKU\' + $mount + ' остаётся подключён.')
+            }
         }
     }
+}
+
+function Test-NetworkDriveRemotePath([string]$Path) {
+    if (-not $Path.StartsWith('\\') -or $Path.Length -gt 1024 -or $Path -match '[<>:"/|?*\x00-\x1f]') {
+        return $false
+    }
+    $parts = $Path.Substring(2).TrimEnd('\').Split('\')
+    if ($parts.Count -lt 2 -or $parts[0] -notmatch '^[\p{L}\p{N}_-]+(?:\.[\p{L}\p{N}_-]+)*$') {
+        return $false
+    }
+    foreach ($part in $parts) {
+        if (-not $part -or $part -match '[ .]$') { return $false }
+    }
+    return $true
 }
 
 # Сохраняет постоянные подключения сетевых дисков из HKCU\Network
@@ -1863,7 +1990,10 @@ function Export-NetworkDrives([object]$Profile,[string]$Archive) {
                 if (-not $key) { continue }
                 try {
                     $remote = [string]$key.GetValue('RemotePath','')
-                    if (-not $remote.StartsWith('\\')) { continue }
+                    if (-not (Test-NetworkDriveRemotePath $remote)) {
+                        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Некорректный UNC-путь сетевого диска ' + $letter + ': пропущен.')
+                        continue
+                    }
                     [pscustomobject]@{ Letter=$letter.ToUpperInvariant(); RemotePath=$remote;
                         ProviderName=[string]$key.GetValue('ProviderName','Microsoft Windows Network');
                         ProviderType=[int]$key.GetValue('ProviderType',131072);
@@ -1894,34 +2024,41 @@ function Restore-NetworkDrives([string]$Archive,[string]$TargetSid,[string]$Targ
         Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Сетевые диски пропущены: файл не прошёл контроль SHA-256.'
         return
     }
-    $data = Get-Content -LiteralPath $source -Encoding UTF8 -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $hash = if ($null -ne $ApprovedExtras) { [string]$ApprovedExtras['NetworkDrives.json'] } else { '' }
+    $data = Read-ExtraJson $source $Archive $hash
     if ([int]$data.SchemaVersion -ne 1) { throw 'Неизвестный формат списка сетевых дисков.' }
     $mappings = @($data.Mappings | Where-Object { $null -ne $_ })
-    [int]$added = 0
-    foreach ($mapping in $mappings) {
-        $letter = [string]$mapping.Letter
-        $remote = [string]$mapping.RemotePath
-        $provider = [string]$mapping.ProviderName
-        $providerType = [int]$mapping.ProviderType
-        $connectionType = [int]$mapping.ConnectionType
-        $deferFlags = [int]$mapping.DeferFlags
-        if ($letter -notmatch '^[A-Z]$' -or -not $remote.StartsWith('\\') -or
-            $remote.Length -gt 1024 -or $remote -match '[\x00-\x1f]') {
-            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Пропущено некорректное сопоставление диска: ' + $letter)
-            continue
-        }
-        try {
-            if (-not $provider -or $provider.Length -gt 200 -or $providerType -lt 0 -or
-                $connectionType -lt 0 -or $deferFlags -lt 0) {
-                throw 'Некорректные параметры сетевого провайдера.'
-            }
-            $result = Invoke-ProfileHive $TargetSid $TargetPath {
-                param($hku,$mount)
+    if ($mappings.Count -eq 0) {
+        Write-OperationReport 'СЕТЕВЫЕ ДИСКИ' 'В архиве нет постоянных подключений.'
+        return
+    }
+    $localLetters = @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType <> 4' -ErrorAction Stop |
+        ForEach-Object { ([string]$_.DeviceID).TrimEnd(':') })
+    $added = Invoke-ProfileHive $TargetSid $TargetPath {
+        param($hku,$mount)
+        [int]$count = 0
+        foreach ($mapping in $mappings) {
+            $letter = ''
+            try {
+                $letter = [string]$mapping.Letter
+                $remote = [string]$mapping.RemotePath
+                if ($letter -notmatch '^[A-Z]$' -or -not (Test-NetworkDriveRemotePath $remote)) {
+                    throw 'Некорректная буква диска или UNC-путь.'
+                }
+                if ($letter -in $localLetters) { throw 'Буква занята локальным томом.' }
+                $provider = [string]$mapping.ProviderName
+                $providerType = [int]$mapping.ProviderType
+                $connectionType = [int]$mapping.ConnectionType
+                $deferFlags = [int]$mapping.DeferFlags
+                if (-not $provider -or $provider.Length -gt 200 -or $provider -match '[\x00-\x1f]' -or
+                    $providerType -lt 0 -or $connectionType -lt 0 -or $deferFlags -lt 0) {
+                    throw 'Некорректные параметры сетевого провайдера.'
+                }
                 $path = $mount + '\Network\' + $letter
                 $existing = $hku.OpenSubKey($path,$false)
                 if ($existing) {
-                    try { return ('Занята буква, существующее подключение: ' + [string]$existing.GetValue('RemotePath','')) }
-                    finally { $existing.Dispose() }
+                    $existing.Dispose()
+                    throw 'Буква уже назначена постоянному подключению.'
                 }
                 $key = $hku.CreateSubKey($path)
                 if (-not $key) { throw ('Не удалось создать ключ Network\' + $letter) }
@@ -1931,27 +2068,44 @@ function Restore-NetworkDrives([string]$Archive,[string]$TargetSid,[string]$Targ
                     $key.SetValue('ProviderType',$providerType,[Microsoft.Win32.RegistryValueKind]::DWord)
                     $key.SetValue('ConnectionType',$connectionType,[Microsoft.Win32.RegistryValueKind]::DWord)
                     $key.SetValue('DeferFlags',$deferFlags,[Microsoft.Win32.RegistryValueKind]::DWord)
-                } finally { $key.Dispose() }
-                return 'Добавлен'
-            }
-            if ($result -eq 'Добавлен') {
-                $added++
+                    $key.Flush()
+                } catch {
+                    $key.Dispose()
+                    $key = $null
+                    try { $hku.DeleteSubKey($path,$false) }
+                    catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалён неполный ключ сетевого диска ' + $letter + ': ' + $_.Exception.Message) }
+                    throw
+                } finally {
+                    if ($key) { $key.Dispose() }
+                }
+                $count++
                 Write-OperationReport 'СЕТЕВОЙ ДИСК' ('Восстановлено: ' + $letter + ': -> ' + $remote + '; подключение при входе пользователя')
-            } else { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ($letter + ': пропущено. ' + $result) }
-        } catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалось восстановить ' + $letter + ': -> ' + $remote + ': ' + $_.Exception.Message) }
-    }
+            } catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не восстановлен сетевой диск ' + $letter + ': ' + $_.Exception.Message) }
+        }
+        return $count
+    } $true
     Write-OperationReport 'СЕТЕВЫЕ ДИСКИ' ('Добавлено ' + $added + ' из ' + $mappings.Count + ' постоянных подключений.')
+}
+
+function Get-BrowserExtraFileNames {
+    return @('Bookmarks','Bookmarks.bak','History','Visited Links','Favicons',
+        'Top Sites','Preferences','Secure Preferences','Current Session','Last Session','Current Tabs','Last Tabs')
+}
+
+function Test-BrowserExtraRelativePath([string]$Relative) {
+    $parts = $Relative -split '[/\\]'
+    if ($parts.Count -lt 2 -or $parts[0] -notmatch '^(Default|Profile [0-9]+)$') { return $false }
+    if ($parts.Count -eq 2) { return ($parts[1] -in @(Get-BrowserExtraFileNames)) }
+    return ($parts.Count -eq 3 -and $parts[1] -eq 'Sessions' -and $parts[2] -match '^(Session|Tabs)_[0-9]+$')
 }
 
 # Сохраняет доступные закладки, историю и файлы сеансов; ошибка одного браузера не блокирует остальные.
 function Export-BrowserExtras([object]$Profile,[string]$Archive) {
     # Independent best-effort capture. An open/locked browser must not stop other browsers.
     $extras = Join-Path $Archive 'Extras\Browsers'
-    $reports = @()
     $busy = @(Get-OpenTargetBrowsers ([string]$Profile.SID))
     $total = 0
-    $fileNames = @('Bookmarks','Bookmarks.bak','History','Visited Links','Favicons',
-        'Top Sites','Preferences','Secure Preferences','Current Session','Last Session','Current Tabs','Last Tabs')
+    $fileNames = @(Get-BrowserExtraFileNames)
     Title 'ДОПОЛНИТЕЛЬНОЕ СОХРАНЕНИЕ БРАУЗЕРОВ'
     $browserDefinitions = @(Browser-Definitions)
     [int]$browserIndex = 0
@@ -1968,6 +2122,7 @@ function Export-BrowserExtras([object]$Profile,[string]$Archive) {
                 $state = 'Пропущен'
                 $reason = 'Браузер запущен; не копируем активные базы и сеансы'
             } else {
+                Assert-ProfileExtraPath $src $Profile.Path
                 $destRoot = Join-Path $extras $browser.Id
                 $folders = @(Get-ChildItem -LiteralPath $src -Directory -Force -ErrorAction Stop | Where-Object {
                     $_.Name -eq 'Default' -or $_.Name -match '^Profile [0-9]+$'
@@ -1977,7 +2132,7 @@ function Export-BrowserExtras([object]$Profile,[string]$Archive) {
                         $from = Join-Path $folder.FullName $filename
                         $to = Join-Path (Join-Path $destRoot $folder.Name) $filename
                         try {
-                            if (Copy-RequiredFile $from $to $Profile.Path) {
+                            if (Copy-RequiredFile $from $to $Profile.Path $Archive) {
                                 $saved++
                                 Write-OperationReport 'БРАУЗЕР ФАЙЛ' ('Сохранён: ' + $browser.Name + '/' + $folder.Name + '/' + $filename)
                             }
@@ -1989,12 +2144,13 @@ function Export-BrowserExtras([object]$Profile,[string]$Archive) {
                     $sessions = Join-Path $folder.FullName 'Sessions'
                     if (Test-Path -LiteralPath $sessions -PathType Container) {
                         try {
+                            Assert-ProfileExtraPath $sessions $Profile.Path
                             $sessionFiles = @(Get-ChildItem -LiteralPath $sessions -File -Force -ErrorAction Stop |
                                 Where-Object { $_.Name -match '^(Session|Tabs)_[0-9]+$' })
                             foreach ($file in $sessionFiles) {
                                 $to = Join-Path (Join-Path (Join-Path $destRoot $folder.Name) 'Sessions') $file.Name
                                 try {
-                                    if (Copy-RequiredFile $file.FullName $to $Profile.Path) {
+                                    if (Copy-RequiredFile $file.FullName $to $Profile.Path $Archive) {
                                         $saved++
                                         Write-OperationReport 'БРАУЗЕР ФАЙЛ' ('Сохранён: ' + $browser.Name + '/' + $folder.Name + '/Sessions/' + $file.Name)
                                     }
@@ -2024,8 +2180,6 @@ function Export-BrowserExtras([object]$Profile,[string]$Archive) {
             $reason = $_.Exception.Message
         }
         $total += $saved
-        $reports += [pscustomobject]@{Browser=$browser.Name; Result=$state; SavedFiles=$saved;
-            SkippedFiles=$missed; Note=$reason }
         Write-Host ('{0}: {1} (файлов: {2}; пропущено: {3})' -f $browser.Name,$state,$saved,$missed)
         $line = '{0}: {1}; скопировано: {2}; пропущено: {3}' -f $browser.Name,$state,$saved,$missed
         if ($reason) { $line += '; причина: ' + $reason }
@@ -2052,7 +2206,7 @@ function Restore-BrowserExtras([string]$Archive,[string]$TargetPath,[string]$Tar
     if (-not $AutoApprove -and -not (Confirm 'Восстановить доступные файлы браузеров?')) { Write-OperationReport 'ОТМЕНА' 'Восстановление браузеров отклонено пользователем.'; return }
     $busy = @(Get-OpenTargetBrowsers $TargetSid)
     $recovery = Join-Path $env:ProgramData ('WindowsProfileMigration\BrowserRestoreBackup_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '_' + [guid]::NewGuid().ToString('N').Substring(0,8))
-    $reports = @()
+    Update-TrackedState '' @{BrowserBackupPath=$recovery}
     foreach ($browser in @(Browser-Definitions)) {
         $restored = 0
         $skipped = 0
@@ -2067,42 +2221,57 @@ function Restore-BrowserExtras([string]$Archive,[string]$TargetPath,[string]$Tar
                 $state = 'Пропущен'
                 $reason = 'Браузер запущен на целевом устройстве'
             } else {
+                Assert-ProfileExtraPath $sourceRoot $Archive
                 $destRoot = Join-Path (Join-Path $TargetPath 'AppData\Local') $browser.Relative
-                $files = @(Get-ChildItem -LiteralPath $sourceRoot -Recurse -File -Force -ErrorAction Stop)
-                foreach ($file in $files) {
-                    $relative = $file.FullName.Substring($sourceRoot.Length).TrimStart('\')
-                    $manifestKey = 'Browsers\' + $browser.Id + '\' + $relative
-                    if (-not (Is-AllowedExtra $ApprovedExtras $manifestKey)) {
-                        $skipped++
-                        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Браузер: пропущен повреждённый файл: ' + $manifestKey)
-                        continue
-                    }
-                    $dest = Join-Path $destRoot $relative
-                    $temp = $dest + '.WPM_' + [guid]::NewGuid().ToString('N') + '.tmp'
-                    $backedUp = $false
-                    $prev = Join-Path (Join-Path $recovery $browser.Id) $relative
+                $folders = @(Get-ChildItem -LiteralPath $sourceRoot -Directory -Force -ErrorAction Stop |
+                    Where-Object { $_.Name -match '^(Default|Profile [0-9]+)$' })
+                foreach ($folder in $folders) {
                     try {
-                        # Stage the copy before touching the destination.
-                        [void](Copy-RequiredFile $file.FullName $temp)
-                        if (Test-Path -LiteralPath $dest -PathType Leaf) {
-                            [void](Copy-RequiredFile $dest $prev)
-                            $backedUp = $true
-                            $previous++
-                        }
-                        Move-Item -LiteralPath $temp -Destination $dest -Force -ErrorAction Stop
-                        $restored++
-                        Write-OperationReport 'БРАУЗЕР ФАЙЛ' ('Восстановлен: ' + $browser.Name + '/' + $relative)
+                        Assert-ProfileExtraPath $folder.FullName $Archive
+                        $files = @(Get-ChildItem -LiteralPath $folder.FullName -File -Force -ErrorAction Stop)
                     } catch {
                         $skipped++
-                        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Ошибка восстановления: ' + $browser.Name + '/' + $relative + ': ' + $_.Exception.Message)
-                        if ($backedUp) {
-                            # If replacement failed after a backup, attempt to restore the prior file.
-                            try { [void](Copy-RequiredFile $prev $dest) }
-                            catch { Write-Host ('  Не удалось восстановить старый файл: ' + $dest) -ForegroundColor Red; Write-OperationReport 'ОШИБКА' ('Не удалось вернуть старый файл браузера: ' + $dest + '; ' + $_.Exception.Message) }
+                        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалось прочитать профиль ' + $browser.Name + '/' + $folder.Name + ': ' + $_.Exception.Message)
+                        continue
+                    }
+                    $sessions = Join-Path $folder.FullName 'Sessions'
+                    if (Test-Path -LiteralPath $sessions -PathType Container) {
+                        try {
+                            Assert-ProfileExtraPath $sessions $Archive
+                            $files += @(Get-ChildItem -LiteralPath $sessions -File -Force -ErrorAction Stop)
+                        } catch {
+                            $skipped++
+                            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалось прочитать сеансы ' + $browser.Name + '/' + $folder.Name + ': ' + $_.Exception.Message)
                         }
-                    } finally {
-                        try { if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force -ErrorAction Stop } }
-                        catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалён временный файл браузера: ' + $temp) }
+                    }
+                    foreach ($file in $files) {
+                        $relative = $file.FullName.Substring($sourceRoot.Length).TrimStart([char[]]@('\','/'))
+                        if (-not (Test-BrowserExtraRelativePath $relative)) {
+                            $skipped++
+                            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Браузер: неподдерживаемый файл пропущен: ' + $browser.Name + '/' + $relative)
+                            continue
+                        }
+                        $manifestKey = 'Browsers\' + $browser.Id + '\' + $relative.Replace('/','\')
+                        if (-not (Is-AllowedExtra $ApprovedExtras $manifestKey)) {
+                            $skipped++
+                            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Браузер: пропущен повреждённый файл: ' + $manifestKey)
+                            continue
+                        }
+                        $dest = Join-Path $destRoot $relative
+                        $backup = Join-Path (Join-Path $recovery $browser.Id) $relative
+                        $hash = if ($null -ne $ApprovedExtras) { [string]$ApprovedExtras[$manifestKey] } else { '' }
+                        try {
+                            if (-not (Copy-RequiredFile -From $file.FullName -To $dest -AllowedSourceRoot $Archive -AllowedDestinationRoot $TargetPath -Backup $backup -ExpectedHash $hash)) {
+                                throw 'Файл исчез до восстановления.'
+                            }
+                            $restored++
+                            Write-OperationReport 'БРАУЗЕР ФАЙЛ' ('Восстановлен: ' + $browser.Name + '/' + $relative)
+                        } catch {
+                            $skipped++
+                            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Ошибка восстановления: ' + $browser.Name + '/' + $relative + ': ' + $_.Exception.Message)
+                        } finally {
+                            if ([IO.File]::Exists($backup)) { $previous++ }
+                        }
                     }
                 }
                 if ($restored -gt 0) {
@@ -2118,8 +2287,6 @@ function Restore-BrowserExtras([string]$Archive,[string]$TargetPath,[string]$Tar
             $state = if ($restored -gt 0) { 'Частично' } else { 'Не удалось' }
             $reason = $_.Exception.Message
         }
-        $reports += [pscustomobject]@{Browser=$browser.Name; Result=$state; RestoredFiles=$restored;
-            SkippedFiles=$skipped; BackedUpFiles=$previous; Note=$reason}
         Write-Host ('{0}: {1} (восстановлено: {2}; пропущено: {3})' -f $browser.Name,$state,$restored,$skipped)
         $line = '{0}: {1}; восстановлено: {2}; пропущено: {3}; резервировано прежних файлов: {4}' -f $browser.Name,$state,$restored,$skipped,$previous
         if ($reason) { $line += '; причина: ' + $reason }
@@ -2128,199 +2295,213 @@ function Restore-BrowserExtras([string]$Archive,[string]$TargetPath,[string]$Tar
     }
     Write-Host ('Резервные копии заменённых файлов (если были): ' + $recovery)
     Write-OperationReport 'РЕЗЕРВ' ('При замене браузерных файлов резервные копии сохраняются в: ' + $recovery)
-    Update-TrackedState '' @{BrowserBackupPath=$recovery}
     Write-Host 'Статус USMT не зависит от результатов дополнительного переноса браузеров.' -ForegroundColor Yellow
 }
-# Сохраняет записанное Explorer расположение значков; зависит от разрешения и конфигурации экрана.
-function Export-DesktopLayout([object]$Profile,[string]$Archive) {
-    # The desktop Shell can cache positions. Export the persisted last-saved layout.
-    # For an offline user, load NTUSER.DAT under a temporary HKU key.
-    $hku = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::Users, [Microsoft.Win32.RegistryView]::Default)
-    $mount = [string]$Profile.SID
-    $loaded = $false
-    try {
-        $probe = $hku.OpenSubKey($mount, $false)
-        if ($probe) { $probe.Close() }
-        else {
-            $hive = Join-Path $Profile.Path 'NTUSER.DAT'
-            if (-not (Test-Path -LiteralPath $hive -PathType Leaf)) { return $false }
-            Assert-ProfileSourcePath $hive $Profile.Path
-            $mount = 'WPM_' + [guid]::NewGuid().ToString('N')
-            & reg.exe load ('HKU\' + $mount) $hive | Out-Null
-            if ($LASTEXITCODE -ne 0) { return $false }
-            $loaded = $true
-        }
-        $subkey = $mount + '\Software\Microsoft\Windows\Shell\Bags\1\Desktop'
-        $key = $hku.OpenSubKey($subkey, $false)
-        if (-not $key) { return $false }
-        try {
-            $data = [ordered]@{ SchemaVersion=1; SourceSid=[string]$Profile.SID; RegistryItems=@{} }
-            foreach ($name in @('IconLayouts','IconSize','Mode','LogicalViewMode')) {
-                if ($name -notin @($key.GetValueNames())) { continue }
-                $kind = [string]$key.GetValueKind($name)
-                $value = $key.GetValue($name)
-                if ($kind -eq 'Binary') {
-                    $data.RegistryItems[$name] = @{ Type='Binary'; Data=[Convert]::ToBase64String([byte[]]$value) }
-                } elseif ($kind -eq 'DWord') {
-                    $data.RegistryItems[$name] = @{ Type='DWord'; Data=[int]$value }
-                }
-            }
-            if (-not $data.RegistryItems.ContainsKey('IconLayouts')) { return $false }
-            try {
-                Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-                $scr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-                $data['PrimaryWidth'] = $scr.Width
-                $data['PrimaryHeight'] = $scr.Height
-                $data['DisplayCount'] = @([System.Windows.Forms.Screen]::AllScreens).Count
-            } catch { }
-            $folder = Join-Path $Archive 'Extras'
-            [void](New-Item -ItemType Directory -Path $folder -Force)
-            $data | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $folder 'DesktopLayout.json') -Encoding UTF8
-            Write-Host 'Последнее сохранённое Windows расположение ярлыков записано.' -ForegroundColor Green
-            return $true
-        } finally { $key.Close() }
-    } finally {
-        $hku.Close()
-        if ($loaded) {
-            [GC]::Collect(); [GC]::WaitForPendingFinalizers()
-            & reg.exe unload ('HKU\' + $mount) | Out-Null
-            if ($LASTEXITCODE -ne 0) { Write-Host 'Предупреждение: реестр пользователя не был выгружен.' -ForegroundColor Yellow }
-        }
-    }
+# Меняем только известные значения Explorer, сохраняя их исходные типы.
+function Get-DesktopRegistryValueNames {
+    return @('IconLayouts','IconSize','Mode','LogicalViewMode')
 }
-# С подтверждением применяет сохранённые настройки значков, без гарантии точных координат.
-function Restore-DesktopLayout([string]$Archive,[string]$Sid,[string]$TargetPath,[bool]$AutoApprove = $false) {
-    $layoutFile = Join-Path $Archive 'Extras\DesktopLayout.json'
-    if (-not (Test-Path -LiteralPath $layoutFile -PathType Leaf)) { Write-OperationReport 'НАСТРОЙКИ' 'Расположение значков отсутствует в архиве.'; return }
-    $data = Get-Content -LiteralPath $layoutFile -Encoding UTF8 -Raw | ConvertFrom-Json
-    if ($data.SchemaVersion -ne 1 -or -not $data.RegistryItems.IconLayouts) { return }
+
+function Get-DesktopRegistryValues([object]$Hive,[string]$Path) {
+    $key = $Hive.OpenSubKey($Path,$false)
+    $values = @{}
+    try {
+        $names = if ($key) { @($key.GetValueNames()) } else { @() }
+        foreach ($name in @(Get-DesktopRegistryValueNames)) {
+            $values[$name] = $null
+            if ($name -in $names) {
+                $expectedKind = if ($name -eq 'IconLayouts') { 'Binary' } else { 'DWord' }
+                if ([string]$key.GetValueKind($name) -ne $expectedKind) {
+                    throw ('Неподдерживаемый тип значения рабочего стола: ' + $name)
+                }
+                $values[$name] = $key.GetValue($name)
+            }
+        }
+    } finally {
+        if ($key) { $key.Dispose() }
+    }
+    return $values
+}
+
+# Проверяем весь документ до открытия реестра на запись.
+function Convert-DesktopRegistryValues([object]$Data,[bool]$IsBackup = $false) {
+    if ([int]$Data.SchemaVersion -ne 1 -or $null -eq $Data.RegistryItems) {
+        throw 'Неизвестный формат расположения значков.'
+    }
+    $values = @{}
+    foreach ($name in @(Get-DesktopRegistryValueNames)) {
+        $property = $Data.RegistryItems.PSObject.Properties[$name]
+        if (-not $property) {
+            if ($IsBackup) { throw ('В резервной копии отсутствует значение ' + $name) }
+            continue
+        }
+        $item = $property.Value
+        if ($IsBackup) {
+            if ($item.Present -isnot [bool]) { throw ('Некорректное описание резервного значения ' + $name) }
+            if (-not $item.Present) {
+                $values[$name] = $null
+                continue
+            }
+        }
+        if ($name -eq 'IconLayouts' -and $item.Type -eq 'Binary' -and $item.Data -is [string]) {
+            $values[$name] = [Convert]::FromBase64String($item.Data)
+        } elseif ($name -ne 'IconLayouts' -and $item.Type -eq 'DWord' -and [string]$item.Data -match '^-?[0-9]{1,10}$') {
+            $values[$name] = [int]$item.Data
+        } else { throw ('Недопустимый тип или данные значения ' + $name) }
+    }
+    if (-not $IsBackup -and -not $values.ContainsKey('IconLayouts')) {
+        throw 'В архиве нет значения IconLayouts.'
+    }
+    return $values
+}
+
+function Write-DesktopRegistryValues([object]$Key,[hashtable]$Values) {
+    foreach ($name in $Values.Keys) {
+        $value = $Values[$name]
+        if ($null -eq $value) { $Key.DeleteValue($name,$false) }
+        elseif ($name -eq 'IconLayouts') { $Key.SetValue($name,$value,[Microsoft.Win32.RegistryValueKind]::Binary) }
+        else { $Key.SetValue($name,$value,[Microsoft.Win32.RegistryValueKind]::DWord) }
+    }
+    $Key.Flush()
+}
+
+function Set-DesktopRegistryValues([object]$Hive,[string]$Path,[hashtable]$Values,[hashtable]$Previous) {
+    $key = $Hive.CreateSubKey($Path)
+    if (-not $key) { throw 'Не удалось открыть ветку расположения рабочего стола.' }
+    try { Write-DesktopRegistryValues $key $Values }
+    catch {
+        # Запись нескольких параметров не атомарна. Возвращаем снимок при сбое.
+        try { Write-DesktopRegistryValues $key $Previous }
+        catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Автоматический возврат расположения значков не удался: ' + $_.Exception.Message) }
+        throw
+    } finally { $key.Dispose() }
+}
+
+# Сохраняет последнее расположение, записанное Explorer.
+function Export-DesktopLayout([object]$Profile,[string]$Archive) {
+    $values = Invoke-ProfileHive $Profile.SID $Profile.Path {
+        param($hku,$mount)
+        Get-DesktopRegistryValues $hku ($mount + '\Software\Microsoft\Windows\Shell\Bags\1\Desktop')
+    }
+    if ($null -eq $values['IconLayouts']) { return $false }
+    $items = @{}
+    foreach ($name in $values.Keys) {
+        if ($null -eq $values[$name]) { continue }
+        $items[$name] = if ($name -eq 'IconLayouts') {
+            @{Type='Binary'; Data=[Convert]::ToBase64String([byte[]]$values[$name])}
+        } else { @{Type='DWord'; Data=[int]$values[$name]} }
+    }
+    $data = [ordered]@{SchemaVersion=1; SourceSid=[string]$Profile.SID; RegistryItems=$items}
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+        $data['PrimaryWidth'] = $screen.Width
+        $data['PrimaryHeight'] = $screen.Height
+        $data['DisplayCount'] = @([System.Windows.Forms.Screen]::AllScreens).Count
+    } catch { }
+    $layoutFile = Join-Path $Archive 'Extras/DesktopLayout.json'
+    Assert-ProfileExtraPath $layoutFile $Archive $true
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $layoutFile))
+    $data | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $layoutFile -Encoding UTF8 -ErrorAction Stop
+    Write-Host 'Последнее сохранённое Windows расположение ярлыков записано.' -ForegroundColor Green
+    return $true
+}
+
+# С подтверждением применяет сохранённые настройки значков.
+function Restore-DesktopLayout(
+    [string]$Archive,[string]$Sid,[string]$TargetPath,[bool]$AutoApprove = $false,[string]$ExpectedHash = ''
+) {
+    $layoutFile = Join-Path $Archive 'Extras/DesktopLayout.json'
+    if (-not [IO.File]::Exists($layoutFile)) {
+        Write-OperationReport 'НАСТРОЙКИ' 'Расположение значков отсутствует в архиве.'
+        return
+    }
+    $data = Read-ExtraJson $layoutFile $Archive $ExpectedHash
+    $values = Convert-DesktopRegistryValues $data
     Write-Host 'Найдены сохранённые позиции значков рабочего стола.' -ForegroundColor Cyan
-    Write-Host 'Они могут отличаться при другой версии Windows, масштабе, разрешении или количестве мониторов.' -ForegroundColor Yellow
-    if ($data.PrimaryWidth -and $data.PrimaryHeight) {
+    Write-Host 'Расположение зависит от версии Windows, масштаба, разрешения и количества мониторов.' -ForegroundColor Yellow
+    if (@('PrimaryWidth','PrimaryHeight','DisplayCount' | Where-Object { $data.PSObject.Properties[$_] }).Count -eq 3) {
         try {
             Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-            $newScr = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-            if ($newScr.Width -ne $data.PrimaryWidth -or $newScr.Height -ne $data.PrimaryHeight -or
+            $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            if ($screen.Width -ne $data.PrimaryWidth -or $screen.Height -ne $data.PrimaryHeight -or
                 @([System.Windows.Forms.Screen]::AllScreens).Count -ne $data.DisplayCount) {
-                Write-Host 'Конфигурация мониторов отличается: точное расположение не гарантировано.' -ForegroundColor Yellow
+                Write-Host 'Конфигурация мониторов отличается. Проверьте расположение после входа.' -ForegroundColor Yellow
             }
         } catch { }
     }
-    if (-not $AutoApprove -and -not (Confirm 'Попробовать применить сохранённое расположение значков?')) { Write-OperationReport 'ОТМЕНА' 'Позиции значков не применялись по выбору пользователя.'; return }
-    $hku = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::Users, [Microsoft.Win32.RegistryView]::Default)
-    $mount = $Sid
-    $loaded = $false
-    try {
-        $probe = $hku.OpenSubKey($Sid, $false)
-        if ($probe) { $probe.Close() }
-        else {
-            $mount = 'WPM_' + [guid]::NewGuid().ToString('N')
-            $hive = Join-Path $TargetPath 'NTUSER.DAT'
-            if (-not (Test-Path -LiteralPath $hive -PathType Leaf)) { throw 'Не найден NTUSER.DAT нового пользователя.' }
-            & reg.exe load ('HKU\' + $mount) $hive | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'Не удалось загрузить реестр нового пользователя.' }
-            $loaded = $true
+    if (-not $AutoApprove -and -not (Confirm 'Попробовать применить сохранённое расположение значков?')) {
+        Write-OperationReport 'ОТМЕНА' 'Позиции значков не применялись по выбору пользователя.'
+        return
+    }
+    Invoke-ProfileHive $Sid $TargetPath {
+        param($hku,$mount)
+        $keyPath = $mount + '\Software\Microsoft\Windows\Shell\Bags\1\Desktop'
+        $previous = Get-DesktopRegistryValues $hku $keyPath
+        $snapshot = [ordered]@{SchemaVersion=1; TargetSid=$Sid; TargetProfile=$TargetPath;
+            RegistryItems=@{}; SavedAt=(Get-Date).ToString('o')}
+        foreach ($name in $previous.Keys) {
+            $snapshot.RegistryItems[$name] = if ($null -eq $previous[$name]) {
+                @{Present=$false; Type=''; Data=$null}
+            } elseif ($name -eq 'IconLayouts') {
+                @{Present=$true; Type='Binary'; Data=[Convert]::ToBase64String([byte[]]$previous[$name])}
+            } else { @{Present=$true; Type='DWord'; Data=[int]$previous[$name]} }
         }
-        # Сохраняем ВСЕ прежние значения до первого изменения реестра.
-        $oldRel=$mount + '\Software\Microsoft\Windows\Shell\Bags\1\Desktop'
-        $oldKey=$hku.OpenSubKey($oldRel,$false)
-        $snapshot=[ordered]@{ SchemaVersion=1; TargetSid=$Sid; TargetProfile=$TargetPath;
-            WasPresent=($null -ne $oldKey); RegistryItems=@{}; SavedAt=(Get-Date).ToString('o') }
+        $backupFolder = Join-Path $env:ProgramData 'WindowsProfileMigration\DesktopBackups'
+        $backupPath = Join-Path $backupFolder ('Desktop_' + [guid]::NewGuid().ToString('N') + '.json')
+        Assert-ProfileExtraPath $backupPath $env:ProgramData $true
+        [void][IO.Directory]::CreateDirectory($backupFolder)
+        Assert-ProfileExtraPath $backupPath $env:ProgramData $true
+        $bytes = [Text.Encoding]::UTF8.GetBytes(($snapshot | ConvertTo-Json -Depth 5))
+        $out = [IO.File]::Open($backupPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
         try {
-            foreach ($n in @('IconLayouts','IconSize','Mode','LogicalViewMode')) {
-                $snapshot.RegistryItems[$n]=@{Present=$false; Type=''; Data=$null}
-                if ($oldKey -and $n -in @($oldKey.GetValueNames())) {
-                    $kind=[string]$oldKey.GetValueKind($n)
-                    $oldValue=$oldKey.GetValue($n)
-                    if ($kind -eq 'Binary') {
-                        $snapshot.RegistryItems[$n]=@{Present=$true; Type='Binary'; Data=[Convert]::ToBase64String([byte[]]$oldValue)}
-                    } elseif ($kind -eq 'DWord') {
-                        $snapshot.RegistryItems[$n]=@{Present=$true; Type='DWord'; Data=[int]$oldValue}
-                    } else { throw ('Неподдерживаемый тип прежнего значения ' + $n + ': ' + $kind) }
-                }
-            }
-        } finally { if ($oldKey) { $oldKey.Close() } }
-        $backupFolder=Join-Path $env:ProgramData 'WindowsProfileMigration\DesktopBackups'
-        [void](New-Item -ItemType Directory -Path $backupFolder -Force)
-        $backupPath=Join-Path $backupFolder ('Desktop_' + [guid]::NewGuid().ToString('N') + '.json')
-        $snapshot | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $backupPath -Encoding UTF8 -ErrorAction Stop
+            $out.Write($bytes,0,$bytes.Length)
+            $out.Flush($true)
+        } finally { $out.Dispose() }
         Update-TrackedState '' @{DesktopBackup=$backupPath}
         Write-OperationReport 'РЕЗЕРВ' ('Прежние значения рабочего стола сохранены: ' + $backupPath)
-        $key = $hku.CreateSubKey($mount + '\Software\Microsoft\Windows\Shell\Bags\1\Desktop')
-        if (-not $key) { throw 'Не удалось открыть ветку расположения рабочего стола.' }
-        try {
-            foreach ($property in $data.RegistryItems.PSObject.Properties) {
-                $name = $property.Name
-                if ($name -notin @('IconLayouts','IconSize','Mode','LogicalViewMode')) { continue }
-                if ($property.Value.Type -eq 'Binary' -and $name -eq 'IconLayouts') {
-                    $value = [Convert]::FromBase64String([string]$property.Value.Data)
-                    $key.SetValue($name,$value,[Microsoft.Win32.RegistryValueKind]::Binary)
-                } elseif ($property.Value.Type -eq 'DWord') {
-                    $key.SetValue($name,[int]$property.Value.Data,[Microsoft.Win32.RegistryValueKind]::DWord)
-                }
-            }
-            $key.Flush()
-        } finally { $key.Close() }
-        Write-Host 'Расположение записано. Windows попробует применить его при входе пользователя.' -ForegroundColor Green
-        Write-OperationReport 'НАСТРОЙКИ' 'Позиции значков записаны в реестр (отображение не гарантируется).'
-    } finally {
-        $hku.Close()
-        if ($loaded) {
-            [GC]::Collect(); [GC]::WaitForPendingFinalizers()
-            & reg.exe unload ('HKU\' + $mount) | Out-Null
-            if ($LASTEXITCODE -ne 0) { Write-Host 'ВНИМАНИЕ: временная ветка реестра не выгрузилась.' -ForegroundColor Yellow }
-        }
-    }
+        Set-DesktopRegistryValues $hku $keyPath $values $previous
+    } $true
+    Write-Host 'Расположение записано. Windows попробует применить его при входе пользователя.' -ForegroundColor Green
+    Write-OperationReport 'НАСТРОЙКИ' 'Позиции значков записаны в реестр. Проверьте их при входе под целевым пользователем.'
 }
-# Восстанавливает сохранённые ранее значения расположения значков по подтверждению.
+
+# Восстанавливает только локальную резервную копию для зарегистрированного SID и пути.
 function Restore-PreviousDesktopLayout([string]$BackupFile) {
-    if (-not (Test-Path -LiteralPath $BackupFile -PathType Leaf)) { throw 'Резервная копия отсутствует.' }
-    $data=Get-Content -LiteralPath $BackupFile -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ([int]$data.SchemaVersion -ne 1 -or -not $data.TargetSid -or -not $data.TargetProfile) { throw 'Некорректная резервная копия.' }
-    $sid=[string]$data.TargetSid
-    if (-not (Confirm ('Восстановить прежние позиции значков пользователя ' + $sid + ' ?'))) { return }
-    $hku=[Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::Users,[Microsoft.Win32.RegistryView]::Default)
-    $mount=$sid; $loaded=$false
-    try {
-        $probe=$hku.OpenSubKey($sid,$false)
-        if ($probe) { $probe.Close() }
-        else {
-            $mount='WPM_' + [guid]::NewGuid().ToString('N')
-            $hive=Join-Path ([string]$data.TargetProfile) 'NTUSER.DAT'
-            if (-not (Test-Path -LiteralPath $hive -PathType Leaf)) { throw 'Файл NTUSER.DAT не найден.' }
-            & reg.exe load ('HKU\'+$mount) $hive | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'Не удалось загрузить реестр целевого пользователя.' }
-            $loaded=$true
-        }
-        $key=$hku.CreateSubKey($mount + '\Software\Microsoft\Windows\Shell\Bags\1\Desktop')
-        try {
-            foreach ($prop in $data.RegistryItems.PSObject.Properties) {
-                $n=$prop.Name; $item=$prop.Value
-                if ($n -notin @('IconLayouts','IconSize','Mode','LogicalViewMode')) { continue }
-                if (-not $item.Present) { $key.DeleteValue($n,$false); continue }
-                if ($item.Type -eq 'Binary') {
-                    $key.SetValue($n,[Convert]::FromBase64String([string]$item.Data),[Microsoft.Win32.RegistryValueKind]::Binary)
-                } elseif ($item.Type -eq 'DWord') {
-                    $key.SetValue($n,[int]$item.Data,[Microsoft.Win32.RegistryValueKind]::DWord)
-                } else { throw ('Недопустимый тип ' + $n) }
-            }
-            $key.Flush()
-        } finally { $key.Close() }
-    } finally {
-        $hku.Close()
-        if ($loaded) {
-            [GC]::Collect(); [GC]::WaitForPendingFinalizers()
-            & reg.exe unload ('HKU\'+$mount) | Out-Null
-        }
+    $backupRoot = [IO.Path]::GetFullPath((Join-Path $env:ProgramData 'WindowsProfileMigration\DesktopBackups'))
+    $backupPath = [IO.Path]::GetFullPath($BackupFile)
+    if ([IO.Path]::GetDirectoryName($backupPath) -ine $backupRoot -or
+        [IO.Path]::GetFileName($backupPath) -notmatch '^Desktop_[a-f0-9]{32}\.json$') {
+        throw 'Путь вне каталога резервных копий расположения значков.'
     }
+    $data = Read-ExtraJson $backupPath $env:ProgramData
+    $values = Convert-DesktopRegistryValues $data $true
+    $sid = [string]$data.TargetSid
+    if ($sid -notmatch '^S-1-(?:[0-9]+-){1,14}[0-9]+$' -or -not $data.TargetProfile) {
+        throw 'Некорректный пользователь в резервной копии.'
+    }
+    $registered = @(Get-CimInstance -ClassName Win32_UserProfile -Filter ("SID='" + $sid + "'") -ErrorAction Stop)
+    $targetPath = [IO.Path]::GetFullPath([string]$data.TargetProfile)
+    if ($registered.Count -ne 1 -or $registered[0].Special -or
+        [IO.Path]::GetFullPath([string]$registered[0].LocalPath) -ine $targetPath) {
+        throw 'SID или путь зарегистрированного профиля больше не совпадает с резервной копией.'
+    }
+    if (-not (Confirm ('Восстановить прежние позиции значков пользователя ' + $sid + ' ?'))) { return }
+    Invoke-ProfileHive $sid $targetPath {
+        param($hku,$mount)
+        $keyPath = $mount + '\Software\Microsoft\Windows\Shell\Bags\1\Desktop'
+        $current = Get-DesktopRegistryValues $hku $keyPath
+        Set-DesktopRegistryValues $hku $keyPath $values $current
+    } $true
     Write-Host 'Настройки возвращены. Проверьте их после нового входа пользователя.' -ForegroundColor Green
 }
 
 # Находит зарегистрированный в Windows целевой профиль по учётной записи.
 function Get-TargetUserProfile([string]$Account) {
     $sid = ([Security.Principal.NTAccount]::new($Account)).Translate([Security.Principal.SecurityIdentifier]).Value
-    $profile = @(Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $sid } | Select-Object -First 1)
-    if ($profile.Count -eq 0 -or -not (Test-Path -LiteralPath $profile[0].LocalPath -PathType Container)) {
+    $profile = @(Get-CimInstance -ClassName Win32_UserProfile -Filter ("SID='" + $sid + "'") -ErrorAction Stop)
+    if ($profile.Count -ne 1 -or $profile[0].Special -or (([int]$profile[0].Status) -band 9) -or
+        -not (Test-Path -LiteralPath $profile[0].LocalPath -PathType Container)) {
         throw ('Профиль назначения после USMT не обнаружен для ' + $Account + '. Дополнительные данные сохранены в архиве, но не восстановлены.')
     }
     return [pscustomobject]@{Sid=$sid; Path=[string]$profile[0].LocalPath}
