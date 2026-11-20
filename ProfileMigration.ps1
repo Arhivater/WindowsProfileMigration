@@ -3703,16 +3703,21 @@ function Prepare-RemoteReceiver {
 # После отключения питания исходный готовый ZIP остаётся на диске.
 # Новый запуск повторяет сетевой этап, не сканируя исходный профиль снова.
 function Select-DirectTransferArchive {
-    $root = Join-Path $env:ProgramData 'WindowsProfileMigration\DirectTransfers'
     $files = @()
-    if (Test-Path -LiteralPath $root -PathType Container) {
+    if (Test-Path -LiteralPath $Script:WpmWorkRoot) { Assert-WpmWorkRoot }
+    $roots = @(
+        (Join-Path $Script:WpmWorkRoot 'DirectTransfers'),
+        (Join-Path $env:ProgramData 'WindowsProfileMigration\DirectTransfers')
+    )
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        Assert-WpmDirectoryChain $root
         foreach ($file in @(Get-ChildItem -LiteralPath $root -File -Filter '*.zip' -ErrorAction Stop | Sort-Object LastWriteTime -Descending)) {
             try {
                 $info = Get-ProfileZipInfo $file.FullName
-                if ([int]$info.Metadata.SchemaVersion -ge 7) {
-                    $files += [pscustomobject]@{Path=$file.FullName;Name=$file.Name;
-                        User=[string]$info.Metadata.SourceAccount;Size=$file.Length;Date=$file.LastWriteTime}
-                }
+                Assert-ArchiveMetadata $info.Metadata $true
+                $files += [pscustomobject]@{Path=$file.FullName;Name=$file.Name;
+                    User=[string]$info.Metadata.SourceAccount;Size=$file.Length;Date=$file.LastWriteTime}
             } catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Неполный/повреждённый ZIP пропущен: ' + $file.Name + ': ' + $_.Exception.Message) }
         }
     }
@@ -4082,53 +4087,53 @@ function Invoke-RemoteProfileImport([object]$Session,[string]$Root,[string]$Arch
 
 # Требуется предварительно разрешённый администратором удалённый доступ.
 function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
-    if ($ResumeZip) {
-        if (-not (Test-Path -LiteralPath $ResumeZip -PathType Leaf)) { throw 'ZIP возобновления не найден.' }
-        $resumeInfo = Get-ProfileZipInfo $ResumeZip
-        if ([int]$resumeInfo.Metadata.SchemaVersion -lt 7) { throw 'Для прямого переноса требуется архив со строгим ограничением одним пользователем.' }
-        $sourceProfile = [pscustomobject]@{Account=[string]$resumeInfo.Metadata.SourceAccount;
-            Type=[string]$resumeInfo.Metadata.AccountType;Loaded=$false;Path='(готовый ZIP)' }
-        if (-not $sourceProfile.Account) { throw 'В архиве отсутствует имя исходного пользователя.' }
-        $Script:ProgressStepTotal=12
-        Write-OperationReport 'ВОЗОБНОВЛЕНИЕ' ('Повторный перенос из готового ZIP: ' + $ResumeZip)
-    } else {
-        $sourceProfile = Select-Profile
-        if (-not $sourceProfile) { Write-OperationReport 'ОТМЕНА' 'Профиль для прямого переноса не выбран.'; return }
-    }
-    if ($sourceProfile.Loaded) { throw 'Исходный профиль загружен. Пользователь должен выйти из Windows перед прямым переносом.' }
-    Advance-OperationStage 'Выбран профиль для прямого переноса'
-
-    Title 'ПРЯМОЙ ПЕРЕНОС ПО СЕТИ'
-    Write-Host 'Укажите целевой ПК: имя в локальной сети, полное DNS-имя (pc.domain.local) либо IP.'
-    Write-Host '0. Назад'
-    $targetHost = (Read-Host 'Целевой ПК / FQDN / IP').Trim()
-    if ($targetHost -eq '0') { Write-OperationReport 'ОТМЕНА' 'Ввод сетевого адреса отменён.'; return }
-    if ($targetHost -notmatch '^[a-zA-Z0-9_.:\-]{1,253}$' -or $targetHost.StartsWith('-')) {
-        throw 'Неверный адрес назначения. Введите имя ПК, FQDN или IP без пробелов и обратных слешей.'
-    }
-    Write-Host 'Протокол подключения:'
-    Write-Host '1. WinRM HTTP (Kerberos/Negotiate, обычно внутри домена или домашней сети)'
-    Write-Host '2. WinRM HTTPS (требуется настроенный сертификат целевого ПК)'
-    Write-Host '0. Назад'
-    $transport = Choice 'Выберите протокол' 2
-    if ($transport -eq 0) { Write-OperationReport 'ОТМЕНА' 'Выбор протокола отменён.'; return }
-    Write-Host 'Доступ к целевому компьютеру:'
-    Write-Host '1. Моя текущая учётная запись администратора (единый домен/доверие)'
-    Write-Host '2. Другой администратор назначения (в том числе другой домен/локальный ПК)'
-    Write-Host '0. Назад'
-    $auth = Choice 'Выберите способ входа' 2
-    if ($auth -eq 0) { Write-OperationReport 'ОТМЕНА' 'Выбор администратора отменён.'; return }
-    $remoteCredential = $null
-    if ($auth -eq 2) {
-        $remoteCredential = Get-Credential -Message ('Администратор компьютера ' + $targetHost + ' (DOMAIN\user или COMPUTER\user)')
-        if (-not $remoteCredential) { Write-OperationReport 'ОТМЕНА' 'Ввод учётных данных отменён.'; return }
-    }
     $session = $null
     $remoteRoot = $null
     $remoteArchive = $null
     $zipStream = $null
     $releaseDeploymentLock = $false
     try {
+        if ($ResumeZip) {
+            if (-not (Test-Path -LiteralPath $ResumeZip -PathType Leaf)) { throw 'ZIP возобновления не найден.' }
+            $zipStream = [IO.File]::Open($ResumeZip,'Open','Read','Read')
+            $resumeInfo = Get-ProfileZipInfo $ResumeZip
+            Assert-ArchiveMetadata $resumeInfo.Metadata $true
+            $sourceProfile = [pscustomobject]@{Account=[string]$resumeInfo.Metadata.SourceAccount;
+                Type=[string]$resumeInfo.Metadata.AccountType;Loaded=$false;Path='(готовый ZIP)' }
+            if (-not $sourceProfile.Account) { throw 'В архиве отсутствует имя исходного пользователя.' }
+            Write-OperationReport 'ВОЗОБНОВЛЕНИЕ' ('Повторный перенос из готового ZIP: ' + $ResumeZip)
+        } else {
+            $sourceProfile = Select-Profile
+            if (-not $sourceProfile) { Write-OperationReport 'ОТМЕНА' 'Профиль для прямого переноса не выбран.'; return }
+        }
+        if ($sourceProfile.Loaded) { throw 'Исходный профиль загружен. Пользователь должен выйти из Windows перед прямым переносом.' }
+        Advance-OperationStage 'Выбран профиль для прямого переноса'
+
+        Title 'ПРЯМОЙ ПЕРЕНОС ПО СЕТИ'
+        Write-Host 'Укажите целевой ПК: имя в локальной сети, полное DNS-имя (pc.domain.local) либо IP.'
+        Write-Host '0. Назад'
+        $targetHost = ([string](Read-Host 'Целевой ПК / FQDN / IP')).Trim()
+        if (-not $targetHost -or $targetHost -eq '0') { Write-OperationReport 'ОТМЕНА' 'Ввод сетевого адреса отменён.'; return }
+        if ($targetHost -notmatch '^[a-zA-Z0-9_.:\-]{1,253}$' -or $targetHost.StartsWith('-')) {
+            throw 'Неверный адрес назначения. Введите имя ПК, FQDN или IP без пробелов и обратных слешей.'
+        }
+        Write-Host 'Протокол подключения:'
+        Write-Host '1. WinRM HTTP (Kerberos/Negotiate, обычно внутри домена или домашней сети)'
+        Write-Host '2. WinRM HTTPS (требуется настроенный сертификат целевого ПК)'
+        Write-Host '0. Назад'
+        $transport = Choice 'Выберите протокол' 2
+        if ($transport -eq 0) { Write-OperationReport 'ОТМЕНА' 'Выбор протокола отменён.'; return }
+        Write-Host 'Доступ к целевому компьютеру:'
+        Write-Host '1. Моя текущая учётная запись администратора (единый домен/доверие)'
+        Write-Host '2. Другой администратор назначения (в том числе другой домен/локальный ПК)'
+        Write-Host '0. Назад'
+        $auth = Choice 'Выберите способ входа' 2
+        if ($auth -eq 0) { Write-OperationReport 'ОТМЕНА' 'Выбор администратора отменён.'; return }
+        $remoteCredential = $null
+        if ($auth -eq 2) {
+            $remoteCredential = Get-Credential -Message ('Администратор компьютера ' + $targetHost + ' (DOMAIN\user или COMPUTER\user)')
+            if (-not $remoteCredential) { Write-OperationReport 'ОТМЕНА' 'Ввод учётных данных отменён.'; return }
+        }
         Write-Host ('Проверка удалённого подключения: ' + $targetHost) -ForegroundColor Cyan
         Write-OperationReport 'СЕТЬ' ('Подключение к ' + $targetHost + '; протокол=' + $(if ($transport -eq 2) { 'HTTPS' } else { 'HTTP' }) + '; явные полномочия=' + ($auth -eq 2))
         $connection = @{ComputerName=$targetHost; ConfigurationName='Microsoft.PowerShell'; Authentication='Negotiate'; ErrorAction='Stop'}
@@ -4227,13 +4232,16 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
         # Экспорт может длиться часы. Завершаем проверочную сессию заранее,
         # чтобы ограничение WinRM по времени простоя не сорвало отправку.
         if ($session) { Remove-PSSession -Session $session -ErrorAction SilentlyContinue; $session=$null }
-        $localRoot = Join-Path $env:ProgramData 'WindowsProfileMigration\DirectTransfers'
-        [void](New-Item -ItemType Directory -Path $localRoot -Force -ErrorAction Stop)
-        $zipPath = if ($ResumeZip) { $ResumeZip } else { [string](Do-Export $Usmt $sourceProfile $localRoot $true $true) }
+        $zipPath = $ResumeZip
+        if (-not $zipPath) {
+            $localRoot = Join-Path $Script:WpmWorkRoot 'DirectTransfers'
+            Initialize-WpmWorkDirectory $localRoot
+            $zipPath = [string](Do-Export $Usmt $sourceProfile $localRoot $true $true)
+        }
         if (-not $zipPath -or -not (Test-Path -LiteralPath $zipPath -PathType Leaf)) { throw 'Экспорт не создал ZIP. Развёртывание остановлено.' }
         try { $session = Connect-RemoteMigration $connection $remote }
         catch { throw ('ZIP готов, но подключение к прежнему получателю не установлено. Архив сохранён: ' + $zipPath + '. При восстановлении связи выберите пункт 7. Ошибка: ' + $_.Exception.Message) }
-        $zipStream = [IO.File]::Open($zipPath,'Open','Read','Read')
+        if (-not $zipStream) { $zipStream = [IO.File]::Open($zipPath,'Open','Read','Read') }
         $zipInfo = Get-ProfileZipInfo $zipPath
         $localHash = (Get-FileHash -InputStream $zipStream -Algorithm SHA256 -ErrorAction Stop).Hash
         Write-OperationReport 'ЭКСПОРТ' ('Готов ZIP: ' + $zipPath)
@@ -4495,7 +4503,14 @@ try {
             Finish-OperationReport 'СБОЙ (операция не завершена)'
             Write-Host 'Исходные файлы не удалялись. При неполном экспорте папка архива остаётся для диагностики.'
         } finally {
-            # A return without a success status means the action was cancelled.
+            if ($Script:ActiveOpState -and $Script:ActiveOpState.ProcessId -eq $PID) {
+                try { Update-TrackedState '' @{ProcessId=0;ProcessStartTicks=0} }
+                catch {
+                    Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалось освободить запись операции: ' + $_.Exception.Message)
+                    Write-Host 'Запись операции станет доступна для восстановления после выхода из программы.' -ForegroundColor Yellow
+                }
+            }
+            # Возврат без итогового статуса означает отмену или неполное действие.
             if ($Script:ReportPath) { Finish-OperationReport 'ОТМЕНЕНО / НЕ ЗАВЕРШЕНО' }
             $Script:ActiveOpState=$null
         }

@@ -8,6 +8,27 @@ function Write-OperationReport([string]$Category,[string]$Message) {}
 function Write-DiagnosticFailure($ErrorRecord,[string]$Context) {}
 function Test-RunningProcessStopRequest([string]$Activity,[int]$ProgressId) { return $false }
 
+Invoke-WpmTest 'Network resume pins selected ZIP before confirmation and releases it on cancellation' {
+    . (Get-WpmFunctionDefinitions -Name @('Do-RemoteDeploy'))
+    $archive = Join-Path $WpmTestRoot 'chosen.zip'
+    [IO.File]::WriteAllText($archive,'synthetic')
+    function Get-ProfileZipInfo([string]$Path) {
+        Assert-WpmThrows {
+            $writer = [IO.File]::Open($Path,'Open','Write','None')
+            $writer.Dispose()
+        }
+        return [pscustomobject]@{Metadata=[pscustomobject]@{SourceAccount='WPM\source';AccountType='Local'}}
+    }
+    function Assert-ArchiveMetadata($Metadata,[bool]$RequireImportSchema) { Assert-WpmEqual $RequireImportSchema $true }
+    function Advance-OperationStage([string]$Stage) {}
+    function Title([string]$Value) {}
+    function Read-Host([string]$Prompt) { return '0' }
+    function New-PSSession { throw 'Cancelled confirmation attempted a network connection.' }
+    Do-RemoteDeploy 'synthetic' $archive
+    $writer = [IO.File]::Open($archive,'Open','Write','None')
+    $writer.Dispose()
+}
+
 Invoke-WpmTest 'Network receiver checks block hash and offset before publishing verified file' {
     $source = Join-Path $WpmTestRoot 'source.zip'
     $destination = Join-Path $WpmTestRoot 'destination.zip'
