@@ -190,30 +190,73 @@ function Append-UsmtLogTail([string[]]$Options) {
 
 # Оформление заголовка меню в консоли.
 # Хранит состояние операции на целевом устройстве. Пароли не записываются.
+function Assert-WpmDirectoryChain([string]$Path) {
+    $entry = [IO.DirectoryInfo]::new([IO.Path]::GetFullPath($Path))
+    while ($null -ne $entry) {
+        try {
+            $item = Get-Item -LiteralPath $entry.FullName -Force -ErrorAction Stop
+            if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw ('Рабочий каталог или его родитель является ссылкой либо файлом: ' + $entry.FullName)
+            }
+        } catch [System.Management.Automation.ItemNotFoundException] {
+            # Каталог может ещё не существовать, но его родители должны быть безопасны.
+        }
+        $entry = $entry.Parent
+    }
+}
+
+function New-OperationStateDirectory {
+    Assert-WpmDirectoryChain $Script:OpStateRoot
+    [void][IO.Directory]::CreateDirectory($Script:OpStateRoot)
+    Assert-WpmDirectoryChain $Script:OpStateRoot
+}
+
 function Save-TrackedState([hashtable]$State) {
-    [void](New-Item -ItemType Directory -Path $Script:OpStateRoot -Force)
+    if ([string]$State.Id -notmatch '^WPM_\d{8}_\d{6}_\d{3}_[a-f0-9]{12}$') {
+        throw 'Некорректный идентификатор операции.'
+    }
+    New-OperationStateDirectory
     $path = Join-Path $Script:OpStateRoot ($State.Id + '.json')
     $tmp = $path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    $stream = $null
     try {
         $State.LastUpdated = (Get-Date).ToString('o')
-        $State | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath $tmp -Encoding UTF8 -ErrorAction Stop
-        Move-Item -LiteralPath $tmp -Destination $path -Force -ErrorAction Stop
+        $bytes = [Text.Encoding]::UTF8.GetBytes(($State | ConvertTo-Json -Depth 7 -ErrorAction Stop))
+        $stream = [IO.File]::Open($tmp,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        $stream.Write($bytes,0,$bytes.Length)
+        $stream.Flush($true)
+        $stream.Dispose()
+        $stream = $null
+        # После сбоя читатель видит предыдущую или новую полную запись.
+        if ([IO.File]::Exists($path)) {
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Файл состояния является ссылкой.' }
+            [IO.File]::Replace($tmp,$path,[NullString]::Value)
+        } else {
+            [IO.File]::Move($tmp,$path)
+        }
     } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
         # Ошибка очистки временного JSON не перекрывает результат операции.
         try {
-            if (Test-Path -LiteralPath $tmp -PathType Leaf) { Remove-Item -LiteralPath $tmp -Force -ErrorAction Stop }
+            if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }
         } catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Временный файл состояния остался: ' + $tmp) }
     }
 }
 function Start-TrackedState([string]$Kind,[string]$Archive) {
+    $process = Get-Process -Id $PID -ErrorAction Stop
+    try { $startTicks = $process.StartTime.ToUniversalTime().Ticks }
+    finally { $process.Dispose() }
     $state = @{
         Id=('WPM_' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff') + '_' + [guid]::NewGuid().ToString('N').Substring(0,12));
         Kind=$Kind; Status='Начато'; SourceArchive=$Archive; TargetAccount='';
-        CreatedAccount=''; CreatedSid=''; CreatedByTool=$false; TargetProfile='';
+        CreatedAccount=''; CreatedSid=''; CreatedByTool=$false; AccountCreationPending=$false;
+        TargetSid=''; TargetProfile=''; RecoveryReviewed=$false; ImportCompleted=$false;
         StagingPath=''; StagingDisposition=''; StagingPurpose=''; DesktopBackup='';
-        NetworkPartialPath=''; BrowserBackupPath='';
+        NetworkPartialPath=''; BrowserBackupPath=''; ConfigBackupPath='';
         USMTStarted=$false; USMTFinished=$false; CleanupDone=$false;
-        LastError=''; LastUpdated=''; Report=[string]$Script:ReportPath
+        LastError=''; LastUpdated=''; Report=[string]$Script:ReportPath;
+        ProcessId=$PID; ProcessStartTicks=$startTicks
     }
     Save-TrackedState $state
     $Script:ActiveOpState=$state
@@ -224,31 +267,95 @@ function Update-TrackedState([string]$Status,[hashtable]$Fields = @{}) {
     foreach ($key in $Fields.Keys) { $Script:ActiveOpState[$key] = $Fields[$key] }
     Save-TrackedState $Script:ActiveOpState
 }
-function Get-TrackedStates {
-    if (-not (Test-Path -LiteralPath $Script:OpStateRoot -PathType Container)) { return @() }
+function Get-TrackedStates([switch]$RequireReadable,[string]$Id = '') {
+    Assert-WpmDirectoryChain $Script:OpStateRoot
+    if (-not (Test-Path -LiteralPath $Script:OpStateRoot -PathType Container -ErrorAction Stop)) { return }
     $results=@()
-    foreach ($file in @(Get-ChildItem -LiteralPath $Script:OpStateRoot -Filter 'WPM_*.json' -File -ErrorAction SilentlyContinue)) {
+    foreach ($file in @(Get-ChildItem -LiteralPath $Script:OpStateRoot -Filter 'WPM_*.json' -File -Force -ErrorAction Stop)) {
+        if ($Id -and $file.BaseName -cne $Id) { continue }
+        if ($file.BaseName -notmatch '^WPM_\d{8}_\d{6}_\d{3}_[a-f0-9]{12}$') { continue }
         try {
-            $item=Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
-            if ($item.Id -eq [IO.Path]::GetFileNameWithoutExtension($file.Name)) { $results += $item }
-        } catch { }
+            if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Файл состояния является ссылкой.' }
+            $stream = [IO.File]::Open($file.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,
+                ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+            try {
+                $reader = [IO.StreamReader]::new($stream,[Text.Encoding]::UTF8)
+                try { $item = ConvertFrom-Json -InputObject $reader.ReadToEnd() -ErrorAction Stop }
+                finally { $reader.Dispose() }
+            } finally { $stream.Dispose() }
+            if ($item -isnot [pscustomobject] -or $item.Id -cne $file.BaseName -or
+                $item.Kind -isnot [string] -or $item.Status -isnot [string] -or
+                $item.TargetAccount -isnot [string] -or $item.USMTStarted -isnot [bool] -or
+                $item.USMTFinished -isnot [bool] -or $item.CreatedByTool -isnot [bool]) {
+                throw 'Файл состояния повреждён.'
+            }
+            $results += $item
+        } catch {
+            $message = 'Не удалось проверить состояние операции: ' + $file.FullName
+            if ($RequireReadable) { throw $message }
+            Write-Host $message -ForegroundColor Yellow
+        }
     }
-    return @($results | Sort-Object LastUpdated -Descending)
+    $results | Sort-Object LastUpdated -Descending
+}
+
+# Общая блокировка получателя защищает импорт и управляемый откат разных сеансов.
+# Сам файл остаётся на месте, а дескриптор освобождается при завершении процесса.
+function Enter-ProfileMutationLock {
+    New-OperationStateDirectory
+    $path = Join-Path $Script:OpStateRoot 'profile-mutation.lock'
+    if (Test-Path -LiteralPath $path -ErrorAction Stop) {
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'Некорректный файл блокировки импорта.'
+        }
+    }
+    try {
+        return [IO.File]::Open($path,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+    } catch {
+        throw ('Не удалось получить блокировку. Проверьте, что другой импорт или восстановление завершены. ' + $_.Exception.Message)
+    }
+}
+
+function Assert-TrackedOperationStopped([object]$State) {
+    if (-not $State.PSObject.Properties['ProcessId'] -or -not $State.PSObject.Properties['ProcessStartTicks'] -or
+        [int]$State.ProcessId -le 0) { return }
+    if ([int]$State.ProcessId -eq $PID -and (-not $Script:ActiveOpState -or $Script:ActiveOpState.Id -ne $State.Id)) { return }
+    $process = Get-Process -Id ([int]$State.ProcessId) -ErrorAction SilentlyContinue
+    if ($null -eq $process) { return }
+    try {
+        if ($process.StartTime.ToUniversalTime().Ticks -eq [long]$State.ProcessStartTicks) {
+            throw 'Операция выполняется. Восстановление и очистка пока недоступны.'
+        }
+    } finally { $process.Dispose() }
+}
+
+function Assert-OperationTreeHasNoReparsePoint([string]$Path) {
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($Path)
+    while ($pending.Count -gt 0) {
+        $item = Get-Item -LiteralPath ($pending.Pop()) -Force -ErrorAction Stop
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw ('Зарегистрированный путь содержит ссылку: ' + $item.FullName)
+        }
+        if ($item.PSIsContainer) {
+            foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction Stop)) {
+                $pending.Push($child.FullName)
+            }
+        }
+    }
 }
 # Разрешена очистка только собственных временных каталогов под ProgramData.
 function Assert-SafeStaging([string]$Candidate) {
     if (-not $Candidate) { throw 'Временная папка не указана.' }
-    $base=[IO.Path]::GetFullPath((Join-Path $env:ProgramData 'WindowsProfileMigration\Staging')).TrimEnd('\')
-    $full=[IO.Path]::GetFullPath($Candidate).TrimEnd('\')
-    if (-not $full.StartsWith(($base+'\'),[StringComparison]::OrdinalIgnoreCase)) { throw 'Путь вне каталога временных файлов. Очистка запрещена.' }
-    if ([IO.Path]::GetFileName($full) -notmatch '^(ImportCache|Export)_') { throw 'Неожиданное имя временного каталога.' }
-    if (Test-Path -LiteralPath $full) {
-        $obj=Get-Item -LiteralPath $full -Force
-        if ($obj.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Очистка ссылки запрещена.' }
-        foreach ($dir in @(Get-ChildItem -LiteralPath $full -Directory -Recurse -Force -ErrorAction Stop)) {
-            if ($dir.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw ('Временная папка содержит ссылку: ' + $dir.FullName) }
-        }
+    $base = [IO.Path]::GetFullPath((Join-Path $env:ProgramData 'WindowsProfileMigration\Staging'))
+    $full = [IO.Path]::GetFullPath($Candidate)
+    if ([IO.Path]::GetDirectoryName($full) -ine $base -or
+        [IO.Path]::GetFileName($full) -notmatch '^(ImportCache|Export)_\d{8}_\d{6}_\d{3}_[a-f0-9]{8}$') {
+        throw 'Неверный путь временного каталога. Очистка запрещена.'
     }
+    Assert-WpmDirectoryChain $full
+    if (Test-Path -LiteralPath $full -ErrorAction Stop) { Assert-OperationTreeHasNoReparsePoint $full }
     return $full
 }
 function Clear-TrackedStaging([hashtable]$State,[bool]$Ask = $false) {
@@ -256,7 +363,8 @@ function Clear-TrackedStaging([hashtable]$State,[bool]$Ask = $false) {
     $safe=Assert-SafeStaging ([string]$State.StagingPath)
     if ($Ask -and -not (Confirm ('Удалить только временный каталог ' + $safe + ' ?'))) { return $false }
     try {
-        if (Test-Path -LiteralPath $safe) { Remove-Item -LiteralPath $safe -Recurse -Force -ErrorAction Stop }
+        if ($Ask) { $safe = Assert-SafeStaging ([string]$State.StagingPath) }
+        if (Test-Path -LiteralPath $safe -ErrorAction Stop) { Remove-Item -LiteralPath $safe -Recurse -Force -ErrorAction Stop }
         $State.CleanupDone=$true; $State.StagingDisposition='Временная копия удалена'
         Save-TrackedState $State
         Write-OperationReport 'ОЧИСТКА' ('Удалён временный каталог: ' + $safe)
@@ -284,20 +392,13 @@ function Clear-NetworkPartial([hashtable]$State,[bool]$Ask = $true) {
         -not ([IO.Path]::GetFileName($temp)).StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) {
         throw 'Подозрительный путь сетевого временного каталога. Очистка запрещена.'
     }
-    if (Test-Path -LiteralPath $temp) {
-        $obj=Get-Item -LiteralPath $temp -Force
-        if ($obj.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Папка является ссылкой. Очистка запрещена.' }
-        if ($obj.PSIsContainer) {
-            foreach ($item in @(Get-ChildItem -LiteralPath $temp -Directory -Recurse -Force -ErrorAction Stop)) {
-                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Внутри сетевой копии есть ссылка. Очистка запрещена.' }
-            }
-        }
-    }
+    Assert-WpmDirectoryChain $parent
+    if (Test-Path -LiteralPath $temp -ErrorAction Stop) { Assert-OperationTreeHasNoReparsePoint $temp }
     if ($Ask -and -not (Confirm ('Удалить незавершённую копию ' + $temp + ' ?'))) { return }
-    if (Test-Path -LiteralPath $temp) {
-        if ((Get-Item -LiteralPath $temp -Force).PSIsContainer) {
-            Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction Stop
-        } else { Remove-Item -LiteralPath $temp -Force -ErrorAction Stop }
+    Assert-WpmDirectoryChain $parent
+    if (Test-Path -LiteralPath $temp -ErrorAction Stop) {
+        Assert-OperationTreeHasNoReparsePoint $temp
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction Stop
     }
     $State.NetworkPartialPath=''
     Save-TrackedState $State
@@ -325,56 +426,95 @@ function Show-RecoveryMenu {
     Write-Host ('Временная копия: ' + $state.StagingPath)
     Write-Host ('Незавершённая публикация архива: ' + $state.NetworkPartialPath)
     Write-Host ('Резерв значков: ' + $state.DesktopBackup)
-    if ($state.LastError) { Write-Host ('Ошибка: ' + $state.LastError) -ForegroundColor Yellow }
-    Write-Host 'Повторный импорт возможен через главное меню, если у целевой учётной записи ещё нет профиля.'
-    Write-Host 'При частично восстановленном профиле повторное применение и автоудаление заблокированы.'
-    Write-Host 'Сначала сохраните целевые данные, затем очищайте профиль средствами Windows вручную.'
-    Write-Host '1. Удалить зарегистрированную временную копию'
-    Write-Host '2. Удалить только созданную программой локальную учётную запись БЕЗ профиля'
-    Write-Host '3. Восстановить прежние параметры значков (если сохранены)'
-    Write-Host '4. Удалить незавершённую копию архива (если есть)'
-    Write-Host '0. Назад'
-    switch (Choice 'Выберите действие' 4) {
-        1 {
-            $hash=@{}; foreach ($v in $state.PSObject.Properties) { $hash[$v.Name]=$v.Value }
-            if (-not $hash.StagingPath) { Write-Host 'Временной копии нет.'; return }
-            try { [void](Clear-TrackedStaging $hash $true) } catch { Write-Host $_.Exception.Message -ForegroundColor Red }
+    foreach ($entry in @(@('BrowserBackupPath','Резерв браузеров'),@('ConfigBackupPath','Резерв настроек'))) {
+        if ($state.PSObject.Properties[$entry[0]] -and $state.($entry[0])) {
+            Write-Host ($entry[1] + ': ' + $state.($entry[0]))
         }
-        2 {
-            if (-not $state.CreatedByTool -or -not $state.CreatedAccount -or -not $state.CreatedSid -or $state.Kind -ne 'Импорт') {
-                Write-Host 'Нет подтверждения создания этой учётной записи программой.'; return
+    }
+    if ($state.LastError) { Write-Host ('Ошибка: ' + $state.LastError) -ForegroundColor Yellow }
+    Write-Host 'Перед повторным импортом проверьте, что учётная запись назначения и её каталог не содержат данных.'
+    Write-Host '1. Удалить зарегистрированную временную копию'
+    Write-Host '2. Удалить только созданную программой локальную учётную запись без профиля'
+    Write-Host '3. Восстановить прежние параметры значков'
+    Write-Host '4. Удалить незавершённую копию архива'
+    Write-Host '5. Подтвердить возможность повторного импорта'
+    Write-Host '0. Назад'
+    $action = Choice 'Выберите действие' 5
+    if ($action -eq 0) { return }
+    $id = $state.Id
+    $lock = $null
+    try {
+        $lock = Enter-ProfileMutationLock
+        $state = Get-TrackedStates -RequireReadable -Id $id
+        if (-not $state) { throw 'Запись выбранной операции больше недоступна.' }
+        Assert-TrackedOperationStopped $state
+        $hash = @{}
+        foreach ($property in $state.PSObject.Properties) { $hash[$property.Name] = $property.Value }
+        switch ($action) {
+            1 {
+                if (-not $state.StagingPath -or $state.CleanupDone) { Write-Host 'Временной копии нет.'; return }
+                [void](Clear-TrackedStaging $hash $true)
             }
-            try {
-                $accountName=([string]$state.CreatedAccount -split '\\',2)[-1]
-                $account=Get-LocalUser -Name $accountName -ErrorAction Stop
-                if ($account.SID.Value -ne [string]$state.CreatedSid) { throw 'SID отличается от зарегистрированного.' }
-                if (@(Get-CimInstance Win32_UserProfile | Where-Object { $_.SID -eq $account.SID.Value }).Count -gt 0) {
-                    throw 'Профиль уже существует. Автоматическое удаление недопустимо.'
+            2 {
+                if ($state.Kind -ne 'Импорт' -or -not $state.CreatedByTool -or -not $state.CreatedAccount -or
+                    -not $state.CreatedSid -or $state.USMTStarted) {
+                    throw 'Допускается удаление только подтверждённой учётной записи до запуска LoadState.'
                 }
-                $possibleProfile=Join-Path (Get-ProfileStoreRoot) $accountName
-                if (Test-Path -LiteralPath $possibleProfile) {
-                    throw ('Обнаружен каталог возможного профиля: ' + $possibleProfile + '. Требуется ручная проверка.')
+                $computer,$name = [string]$state.CreatedAccount -split '\\',2
+                if ($computer -ine $env:COMPUTERNAME -or -not $name) { throw 'Учётная запись не локальная.' }
+                $account = Get-ImportLocalUser $name
+                if (-not $account -or $account.SID.Value -ne [string]$state.CreatedSid) {
+                    throw 'Локальный пользователь отсутствует или его SID уже отличается от зарегистрированного.'
                 }
+                Assert-ImportProfileUnused $account.SID.Value $account.Name
                 if (-not (Confirm ('Удалить только пустую учётную запись ' + $state.CreatedAccount + ' ?'))) { return }
                 if (-not (Confirm 'Повторное подтверждение удаления учётной записи')) { return }
-                Remove-LocalUser -Name $accountName -ErrorAction Stop
-                $hash=@{}; foreach ($v in $state.PSObject.Properties) { $hash[$v.Name]=$v.Value }
-                $hash.Status='Пустая учётная запись удалена по подтверждению'
-                $hash.CreatedByTool=$false
+                $account = Get-ImportLocalUser $name
+                if (-not $account -or $account.SID.Value -ne [string]$state.CreatedSid) {
+                    throw 'Учётная запись изменилась после подтверждения.'
+                }
+                Assert-ImportProfileUnused $account.SID.Value $account.Name
+                Remove-LocalUser -SID $account.SID -ErrorAction Stop
+                $hash.Status = 'Пустая учётная запись удалена по подтверждению'
+                $hash.CreatedByTool = $false
                 Save-TrackedState $hash
-                Write-Host 'Учётная запись удалена. Профили не удалялись.' -ForegroundColor Green
-            } catch { Write-Host ('Удаление не выполнено: ' + $_.Exception.Message) -ForegroundColor Red }
+                Write-Host 'Пустая учётная запись удалена.' -ForegroundColor Green
+            }
+            3 {
+                if (-not $state.DesktopBackup) { Write-Host 'Резервной копии значков нет.'; return }
+                Restore-PreviousDesktopLayout ([string]$state.DesktopBackup)
+            }
+            4 {
+                if (-not $state.NetworkPartialPath) { Write-Host 'Незавершённой копии нет.'; return }
+                Clear-NetworkPartial $hash
+            }
+            5 {
+                $pending = $state.PSObject.Properties['AccountCreationPending'] -and $state.AccountCreationPending -eq $true
+                if ($state.Kind -ne 'Импорт' -or -not $state.TargetAccount -or (-not $state.USMTStarted -and -not $pending)) {
+                    throw 'Нет незавершённой записи, требующей проверки перед повторным импортом.'
+                }
+                if ($state.PSObject.Properties['RecoveryReviewed'] -and $state.RecoveryReviewed -eq $true) {
+                    Write-Host 'Возможность повторного импорта уже подтверждена.'; return
+                }
+                $recordedSid = if ($state.PSObject.Properties['TargetSid']) { [string]$state.TargetSid } else { [string]$state.CreatedSid }
+                $identity = [pscustomobject]@{SourceAccount=$state.TargetAccount;SourceSid=$recordedSid;AccountType='Domain'}
+                $target = Resolve-ImportTarget $identity $state.TargetAccount
+                if ($recordedSid -and $target.Sid -and $recordedSid -ne $target.Sid) {
+                    throw 'SID назначения отличается от сохранённого. Проверьте учётную запись вручную.'
+                }
+                $possibleLocalName = if ($target.Local) { $target.Name } else { '' }
+                Assert-ImportProfileUnused $target.Sid $possibleLocalName
+                if (-not (Confirm ('Разрешить повторный импорт для ' + $state.TargetAccount + ' после ручной проверки?'))) { return }
+                Assert-ImportProfileUnused $target.Sid $possibleLocalName
+                $hash.RecoveryReviewed = $true
+                Save-TrackedState $hash
+                Write-Host 'Проверка записана. Импорт можно заново запустить через главное меню.' -ForegroundColor Green
+            }
         }
-        4 {
-            $hash=@{}; foreach ($v in $state.PSObject.Properties) { $hash[$v.Name]=$v.Value }
-            try { Clear-NetworkPartial $hash }
-            catch { Write-Host ('Очистка не выполнена: ' + $_.Exception.Message) -ForegroundColor Red }
-        }
-        3 {
-            if (-not $state.DesktopBackup) { Write-Host 'Резервной копии значков нет.'; return }
-            try { Restore-PreviousDesktopLayout ([string]$state.DesktopBackup) }
-            catch { Write-Host ('Не удалось восстановить настройки: ' + $_.Exception.Message) -ForegroundColor Red }
-        }
+    } catch {
+        Write-Host ('Действие восстановления не выполнено: ' + $_.Exception.Message) -ForegroundColor Red
+    } finally {
+        if ($null -ne $lock) { $lock.Dispose() }
     }
 }
 
@@ -2915,6 +3055,31 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
 }
 # Находит готовые архивы в указанной папке или её непосредственных подпапках.
 # Не пропускает новые форматы: все проверки используют SupportedArchiveSchemas.
+function Assert-ArchiveMetadata([object]$Metadata,[bool]$RequireImportSchema = $false) {
+    if ($Metadata -isnot [pscustomobject]) { throw 'metadata.json должен содержать один объект.' }
+    foreach ($name in @('SchemaVersion','SourceAccount','SourceSid','SourceMachine','AccountType')) {
+        if (-not $Metadata.PSObject.Properties[$name]) { throw ('В metadata.json не найдено поле ' + $name + '.') }
+    }
+    $schema = $Metadata.SchemaVersion
+    if (($schema -isnot [int] -and $schema -isnot [long]) -or $schema -notin $Script:SupportedArchiveSchemas) {
+        throw 'Версия формата архива не поддерживается.'
+    }
+    if ($RequireImportSchema -and $schema -lt 7) {
+        throw 'Формат архива не подтверждает ограничение одним профилем. Создайте новый экспорт.'
+    }
+    if ($Metadata.SourceAccount -isnot [string] -or
+        $Metadata.SourceAccount -notmatch '^[^\\/:*?"<>|\x00-\x1F]{1,64}\\[^\\/:*?"<>|\x00-\x1F]{1,64}$' -or
+        $Metadata.SourceMachine -isnot [string] -or $Metadata.SourceMachine -notmatch '^[^\\/:*?"<>|\x00-\x20]{1,64}$' -or
+        $Metadata.SourceSid -isnot [string] -or $Metadata.SourceSid -notmatch '^S-1-5-21-(?:[0-9]{1,10}-){3}[0-9]{1,10}$' -or
+        $Metadata.AccountType -isnot [string] -or $Metadata.AccountType -notin @('Local','Domain')) {
+        throw 'Метаданные архива повреждены или тип учётной записи не поддерживается.'
+    }
+    if ($Metadata.AccountType -ieq 'Local' -and
+        ($Metadata.SourceAccount -split '\\',2)[0] -ine $Metadata.SourceMachine) {
+        throw 'Локальная исходная учётная запись не соответствует имени компьютера.'
+    }
+}
+
 function Get-AvailableArchives([string]$Root = $Script:BackupRoot) {
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return @() }
     $list = @()
@@ -2926,11 +3091,10 @@ function Get-AvailableArchives([string]$Root = $Script:BackupRoot) {
         if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) { continue }
         try {
             $meta = Get-Content -LiteralPath $metadataPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-            if (-not $meta.SourceAccount -or -not $meta.SourceMachine -or
-                $meta.SchemaVersion -notin $Script:SupportedArchiveSchemas) { continue }
+            Assert-ArchiveMetadata $meta
             if (-not (Test-Path -LiteralPath (Join-Path $dir.FullName 'Store') -PathType Container)) { continue }
             $date = $dir.CreationTime
-            if ($meta.CreatedAt) {
+            if ($meta.PSObject.Properties['CreatedAt'] -and $meta.CreatedAt) {
                 $parsed = [datetime]::MinValue
                 if ([datetime]::TryParse([string]$meta.CreatedAt,[ref]$parsed)) { $date = $parsed }
             }
@@ -2944,10 +3108,9 @@ function Get-AvailableArchives([string]$Root = $Script:BackupRoot) {
         try {
             $info = Get-ProfileZipInfo $zipFile.FullName
             $meta = $info.Metadata
-            if (-not $meta.SourceAccount -or -not $meta.SourceMachine -or
-                $meta.SchemaVersion -notin $Script:SupportedArchiveSchemas) { continue }
+            Assert-ArchiveMetadata $meta
             $date = $zipFile.LastWriteTime
-            if ($meta.CreatedAt) {
+            if ($meta.PSObject.Properties['CreatedAt'] -and $meta.CreatedAt) {
                 $parsed = [datetime]::MinValue
                 if ([datetime]::TryParse([string]$meta.CreatedAt,[ref]$parsed)) { $date = $parsed }
             }
@@ -3036,34 +3199,143 @@ function New-StrongPassword {
     try { $rng.GetBytes($buffer) } finally { $rng.Dispose() }
     return ('A1!' + [Convert]::ToBase64String($buffer).TrimEnd('=').Replace('/','b').Replace('+','K'))
 }
+function Get-ImportLocalUser([string]$Name) {
+    # Query errors are distinct from a successful enumeration without that user.
+    Get-LocalUser -ErrorAction Stop | Where-Object { $_.Name -ieq $Name } | Select-Object -First 1
+}
+
+function Resolve-ImportTarget([object]$Metadata,[string]$Override) {
+    $source = [string]$Metadata.SourceAccount
+    $target = if ($Override) { $Override } elseif ($Metadata.AccountType -ieq 'Local') {
+        $env:COMPUTERNAME + '\' + ($source -split '\\',2)[1]
+    } else { $source }
+    if ($target -notmatch '^[^\\/:*?"<>|\x00-\x20]{1,64}\\[^\\/:*?"<>|\x00-\x1F]{1,64}$') {
+        throw 'Неверное имя назначения. Требуется DOMAIN\user или COMPUTER\user.'
+    }
+    $qualifier,$name = $target -split '\\',2
+    if ($qualifier -in @('BUILTIN','NT AUTHORITY','NT SERVICE','WINDOW MANAGER','FONT DRIVER HOST')) {
+        throw 'Системная учётная запись не может быть назначением.'
+    }
+    $sid = ''
+    $create = $false
+    $mapping = $null
+    $local = $qualifier -ieq $env:COMPUTERNAME
+    if ($local) {
+        if ($name -notmatch '^[^\\/:*?"<>|\[\];=,+\x00-\x1F]{1,20}$' -or $name -match '^[ ]|[. ]$' -or
+            $name -match '^(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)' -or
+            $name -in @('Administrator','Администратор','Guest','Гость','DefaultAccount','WDAGUtilityAccount')) {
+            throw 'Имя локальной учётной записи не подходит для импорта.'
+        }
+        $account = Get-ImportLocalUser $name
+        if ($account) {
+            $sid = [string]$account.SID.Value
+            if (-not $account.Enabled) { throw 'Локальная учётная запись назначения отключена.' }
+            if ($sid -notmatch '^S-1-5-21-(?:[0-9]{1,10}-){3}[0-9]{1,10}$' -or
+                [uint32]($sid -split '-')[-1] -lt 1000) {
+                throw 'Встроенная локальная учётная запись не может быть назначением.'
+            }
+            $name = [string]$account.Name
+        } else {
+            $create = $true
+        }
+        $target = $env:COMPUTERNAME + '\' + $name
+        $mapping = '/mu:' + $source + ':' + $target
+    } else {
+        if (-not (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).PartOfDomain) {
+            throw 'Целевой компьютер не в домене. Укажите локальную учётную запись COMPUTER\user.'
+        }
+        try {
+            $securityId = ([Security.Principal.NTAccount]::new($target)).Translate([Security.Principal.SecurityIdentifier])
+            $sid = $securityId.Value
+            $canonical = $securityId.Translate([Security.Principal.NTAccount]).Value
+        } catch {
+            throw ('Не удалось подтвердить доменную учётную запись назначения: ' + $target)
+        }
+        if ($sid -notmatch '^S-1-5-21-(?:[0-9]{1,10}-){3}[0-9]{1,10}$' -or
+            ($canonical -split '\\',2)[0] -ieq $env:COMPUTERNAME) {
+            throw 'Укажите пользователя целевого домена или локальное назначение COMPUTER\user.'
+        }
+        if (-not $Override -and $sid -ne $Metadata.SourceSid) {
+            throw 'SID доменного пользователя отличается от исходного.'
+        }
+        $target = $canonical
+        if ($target -ine $source -or $Metadata.AccountType -ine 'Domain' -or $sid -ne $Metadata.SourceSid) {
+            $mapping = '/mu:' + $source + ':' + $target
+        }
+    }
+    return [pscustomobject]@{ Account=$target; Sid=$sid; Local=$local; Name=$name; CreateLocal=$create; Mapping=$mapping }
+}
+
+function Select-ImportDestination([object]$Metadata) {
+    Title 'НАЗНАЧЕНИЕ ВОССТАНОВЛЕНИЯ'
+    if ($Metadata.AccountType -ieq 'Local') {
+        $default = $env:COMPUTERNAME + '\' + ($Metadata.SourceAccount -split '\\',2)[1]
+    } else {
+        $default = [string]$Metadata.SourceAccount
+    }
+    Write-Host ('1. Использовать учётную запись ' + $default)
+    Write-Host '2. Указать другую учётную запись DOMAIN\user или COMPUTER\user'
+    Write-Host '0. Назад'
+    switch (Choice 'Выберите назначение' 2) {
+        1 { return [pscustomobject]@{Override=''} }
+        2 {
+            $value = (Read-Host 'Введите DOMAIN\user или COMPUTER\user (0 - назад)').Trim()
+            if ($value -and $value -ne '0') { return [pscustomobject]@{Override=$value} }
+        }
+    }
+}
+
+function Assert-ImportProfileUnused([string]$Sid,[string]$PossibleLocalName = '') {
+    if ($Sid) {
+        if (@(Get-CimInstance Win32_UserProfile -ErrorAction Stop | Where-Object { $_.SID -eq $Sid }).Count -gt 0) {
+            throw 'У учётной записи уже есть профиль Windows. Перезапись заблокирована.'
+        }
+        # Win32_UserProfile может не показать резервный ключ или незавершённую регистрацию.
+        $registry = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+        foreach ($key in @($Sid, ($Sid + '.bak'))) {
+            if (Test-Path -LiteralPath (Join-Path $registry $key) -ErrorAction Stop) {
+                throw 'В реестре уже есть запись целевого профиля. Проверьте её средствами Windows.'
+            }
+        }
+    }
+    if ($PossibleLocalName) {
+        $possible = Join-Path (Get-ProfileStoreRoot) $PossibleLocalName
+        if (Test-Path -LiteralPath $possible -ErrorAction Stop) {
+            throw ('Обнаружен каталог возможного профиля: ' + $possible + '. Требуется ручная проверка.')
+        }
+    }
+}
+
+function Assert-NoUnreviewedImport([object]$Target) {
+    foreach ($prior in @(Get-TrackedStates -RequireReadable)) {
+        if ($prior.Kind -ne 'Импорт' -or $prior.Id -eq $Script:ActiveOpState.Id) { continue }
+        if ($prior.PSObject.Properties['RecoveryReviewed'] -and $prior.RecoveryReviewed -eq $true) { continue }
+        $sameSid = $Target.Sid -and $prior.PSObject.Properties['TargetSid'] -and $Target.Sid -eq $prior.TargetSid
+        $pending = $prior.PSObject.Properties['AccountCreationPending'] -and $prior.AccountCreationPending -eq $true
+        if (($sameSid -or $prior.TargetAccount -ieq $Target.Account) -and ($prior.USMTStarted -or $pending)) {
+            throw ('Для назначения уже есть операция ' + $prior.Id + '. Проверьте её состояние в пункте 4 перед повторным импортом.')
+        }
+    }
+}
+
 # Главный сценарий: выбор архива → локальный кеш при UNC → Verify → LoadState → проверка → дополнения.
 function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOverride = '',[string]$TargetOverride = '',[bool]$Unattended = $false) {
     $archive = if ($ArchiveOverride) { $ArchiveOverride } else { Select-Archive }
     if (-not $archive) { Write-OperationReport 'ОТМЕНА' 'Выбор архива отменён.'; return }
     $isZip = ([IO.Path]::GetExtension($archive) -ieq '.zip')
-    # Старые архивы могли содержать общие файлы компьютера. До сетевого
-    # копирования и тем более LoadState такой архив отклоняется.
-    if (-not $JustVerify) {
-        if ($isZip) {
-            $earlyMeta = (Get-ProfileZipInfo $archive).Metadata
-        } else {
-            $earlyMetaPath = Join-Path $archive 'metadata.json'
-            if (-not (Test-Path -LiteralPath $earlyMetaPath -PathType Leaf)) { throw 'Не найден metadata.json.' }
-            $earlyMeta = Get-Content -LiteralPath $earlyMetaPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        }
-        if ([int]$earlyMeta.SchemaVersion -lt 7) {
-            throw 'Этот архив создан без строгого ограничения профилем. Для импорта нужен экспорт v1.9.11 или новее.'
-        }
-    }
+    $archive = [IO.Path]::GetFullPath($archive)
     $selectedArchive = $archive
-    Start-TrackedState 'Импорт' $selectedArchive
-    Advance-OperationStage 'Архив выбран'
+    $operationKind = if ($JustVerify) { 'Проверка архива' } else { 'Импорт' }
+    Start-TrackedState $operationKind $selectedArchive
     $stagedArchive = $null
+    $mutationLock = $null
     try {
+    Advance-OperationStage 'Архив выбран'
     if ($isZip) {
-        $zipInfo = Get-ProfileZipInfo $archive
         $isNetworkZip = Test-IsUncPath $archive
         if ($isNetworkZip) { Ensure-PathAvailable $archive 'Сетевой ZIP' }
+        $zipInfo = Get-ProfileZipInfo $archive
+        Assert-ArchiveMetadata $zipInfo.Metadata (-not $JustVerify)
         $stagingRoot = Join-Path $env:ProgramData 'WindowsProfileMigration\Staging'
         $stagingDrive = [IO.Path]::GetPathRoot($stagingRoot)
         $stagingFree = Get-PathFreeBytes $stagingDrive
@@ -3076,7 +3348,9 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
                 '. Нужно примерно ' + (Format-ByteSize $stagingNeeded) +
                 ', доступно ' + (Format-ByteSize $stagingFree) + '.')
         }
+        Assert-WpmDirectoryChain $stagingRoot
         $stagedArchive = New-StagingDirectory 'ImportCache'
+        [void](Assert-SafeStaging $stagedArchive)
         Update-TrackedState 'Подготовка распаковки ZIP' @{StagingPath=$stagedArchive; StagingPurpose='Распаковка ZIP для импорта'}
         $zipToExpand = $archive
         if ($isNetworkZip) {
@@ -3090,39 +3364,42 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         Write-Host 'Распаковка ZIP перед проверкой и импортом...' -ForegroundColor Cyan
         Expand-ProfileArchive $zipToExpand $extracted
         $archive = $extracted
-    } elseif (Test-IsUncPath $archive) {
-        Ensure-PathAvailable $archive 'Выбранный сетевой архив'
-        # Avoid partially downloading a large backup to an undersized system disk.
-        $archiveVolume = Get-FolderMetrics $archive
+    } else {
+        if (Test-IsUncPath $archive) { Ensure-PathAvailable $archive 'Выбранный сетевой архив' }
+        $archiveFiles = Get-ArchiveFileMap $archive
+        $metadataPath = Join-Path $archive 'metadata.json'
+        $earlyMeta = Get-Content -LiteralPath $metadataPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        Assert-ArchiveMetadata $earlyMeta (-not $JustVerify)
+        # USMT читает только локальную копию, которую проверили после копирования.
+        [UInt64]$folderBytes = 0
+        foreach ($file in $archiveFiles.Values) { $folderBytes += [UInt64]$file.Length }
         $stagingRoot = Join-Path $env:ProgramData 'WindowsProfileMigration\Staging'
         $stagingDrive = [IO.Path]::GetPathRoot($stagingRoot)
         $stagingFree = Get-PathFreeBytes $stagingDrive
-        $stagingNeeded = [UInt64]([double]$archiveVolume.Bytes + [Math]::Max([double]1GB,[double]$archiveVolume.Bytes * 0.10))
+        $stagingNeeded = [UInt64]([double]$folderBytes + [Math]::Max([double]1GB,[double]$folderBytes * 0.10))
         if ($stagingFree -lt $stagingNeeded) {
-            throw ('Недостаточно места для локальной копии сетевого архива на ' + $stagingDrive +
+            throw ('Недостаточно места для локальной копии архива на ' + $stagingDrive +
                 '. Нужно примерно ' + (Format-ByteSize $stagingNeeded) + ', доступно ' + (Format-ByteSize $stagingFree) + '.')
         }
+        Assert-WpmDirectoryChain $stagingRoot
         $stagedArchive = New-StagingDirectory 'ImportCache'
-        Update-TrackedState 'Подготовка локального кеша' @{StagingPath=$stagedArchive; StagingPurpose='Импорт из сети'}
-        Write-Host 'Архив находится в сети. Создаётся локальная копия перед проверкой и импортом...' -ForegroundColor Cyan
-        Write-OperationReport 'СЕТЬ' ('Выбран сетевой архив: ' + $archive)
+        [void](Assert-SafeStaging $stagedArchive)
+        Update-TrackedState 'Подготовка локального кеша' @{StagingPath=$stagedArchive; StagingPurpose='Локальная копия архива'}
+        Write-Host 'Создаётся локальная копия архива перед проверкой и импортом...' -ForegroundColor Cyan
         Copy-DirectoryRobust $archive $stagedArchive 'локальное кэширование архива'
+        Assert-NetworkArchiveCopy $archive $stagedArchive
         $archive = $stagedArchive
-        Write-OperationReport 'СЕТЬ' ('Локальная копия сетевого архива создана: ' + $archive)
     }
     Write-OperationReport 'АРХИВ' ('Выбран: ' + $selectedArchive)
     Advance-OperationStage 'Архив подготовлен локально'
     Update-TrackedState 'Архив подготовлен'
-    $meta = Get-Content -LiteralPath (Join-Path $archive 'metadata.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($meta.SchemaVersion -notin $Script:SupportedArchiveSchemas -or $meta.AccountType -notin @('Local','Domain') -or
-        -not $meta.SourceAccount -or -not $meta.SourceSid -or -not $meta.SourceMachine) {
-        throw 'Метаданные архива повреждены или тип учётной записи не поддерживается.'
-    }
+    $meta = Get-Content -LiteralPath (Join-Path $archive 'metadata.json') -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    Assert-ArchiveMetadata $meta (-not $JustVerify)
     Advance-OperationStage 'Проверены метаданные архива'
     $store = Join-Path $archive 'Store'
     if (-not $JustVerify) {
         $requiredImportBytes = if ($meta.PSObject.Properties.Name -contains 'EstimatedProfileBytes' -and $meta.EstimatedProfileBytes) { [UInt64]$meta.EstimatedProfileBytes } else { [UInt64](Get-FolderMetrics $store).Bytes }
-        if (-not $JustVerify) { Test-TargetFreeSpace $requiredImportBytes }
+        Test-TargetFreeSpace $requiredImportBytes
     }
     $logRoot = Join-Path $env:ProgramData ('WindowsProfileMigration\Logs\' + $(if ($JustVerify) { 'Check_' } else { 'Import_' }) + (Get-Date -Format 'yyyyMMdd_HHmmss_fff') + '_' + [guid]::NewGuid().ToString('N').Substring(0,8))
     [void](New-Item -ItemType Directory -Path $logRoot -Force)
@@ -3137,92 +3414,51 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     Verify-Store $Usmt $store $logRoot
     Advance-OperationStage 'USMT-архив проверен'
     Write-OperationReport 'АРХИВ' 'Целостность USMT проверена; это не доказывает полноту исходных данных.'
-    $approvedExtras = Test-ExtrasManifest $archive $meta
-    Advance-OperationStage 'Дополнительные файлы проверены по SHA-256'
+    try {
+        $approvedExtras = Test-ExtrasManifest $archive $meta
+        Advance-OperationStage 'Проверены манифест и хеши дополнительных файлов'
+    } catch {
+        if ($JustVerify) { throw }
+        $approvedExtras = @{}
+        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Дополнительные файлы пропущены: ' + $_.Exception.Message)
+        Advance-OperationStage 'Дополнительные файлы исключены из импорта'
+    }
     if ($JustVerify) {
-        Write-Host 'Архив прошёл проверку USMT и дополнительного манифеста Extras.' -ForegroundColor Green
+        if ([int]$meta.SchemaVersion -ge 5 -and $approvedExtras.Count -ne [int]$meta.ExtrasManifest.Files) {
+            throw 'Проверка USMT завершена, но один или несколько дополнительных файлов не прошли проверку.'
+        }
+        Write-Host 'Проверка USMT-хранилища завершена. Подробности проверки дополнительных файлов в отчёте.' -ForegroundColor Green
         Advance-OperationStage 'Проверка архива завершена'
         Update-TrackedState 'Проверка архива завершена'
-        if ($stagedArchive) { [void](Clear-TrackedStaging $Script:ActiveOpState $false) }
-        Advance-OperationStage 'Временные файлы проверки очищены'
+        if (Clear-TrackedStaging $Script:ActiveOpState $false) {
+            Advance-OperationStage 'Временные файлы проверки очищены'
+        }
         Finish-OperationReport 'УСПЕШНО'
         return $true
     }
     $targetWindows = (Get-CimInstance Win32_OperatingSystem).Caption
-    if ([string]$meta.SourceWindows -match 'Windows 11' -and $targetWindows -match 'Windows 10') {
+    if ($meta.PSObject.Properties['SourceWindows'] -and [string]$meta.SourceWindows -match 'Windows 11' -and $targetWindows -match 'Windows 10') {
         throw 'Перенос с Windows 11 на Windows 10 не поддерживается этим комплектом.'
     }
     if ($meta.SourceMachine -ieq $env:COMPUTERNAME) {
         Write-Host 'ВНИМАНИЕ: имя исходного и целевого компьютера совпадает.' -ForegroundColor Yellow
         if ($Unattended -or -not (Confirm 'Это другой экземпляр Windows? Продолжить проверку импорта?')) { Write-OperationReport 'ОТМЕНА' 'Отказано в импорте на компьютер с тем же именем.'; return }
     }
-    $existing = @(Get-CimInstance Win32_UserProfile | Where-Object { -not $_.Special })
-    $source = [string]$meta.SourceAccount
-    $target = $source
-    $map = $null
-    $createLocal = $false
-    $localName = $null
-    $targetSid = ''
-    if ($TargetOverride) {
-        if ($TargetOverride -notmatch '^[^\\/:*?"<>|]{1,64}\\[^\\/:*?"<>|]{1,64}$') {
-            throw 'Неверное имя назначения. Требуется DOMAIN\user или COMPUTER\user.'
-        }
-        $target = $TargetOverride
-        $parts = $target -split '\\',2
-        if ($parts[0] -match '^(?i:BUILTIN|NT AUTHORITY|NT SERVICE)$') { throw 'Системная учётная запись не может быть назначением.' }
-        if ($parts[0] -ieq $env:COMPUTERNAME) {
-            $localName = $parts[1]
-            if ($localName.Length -gt 20 -or $localName -in @('Administrator','Администратор','DefaultAccount','WDAGUtilityAccount')) {
-                throw 'Небезопасное имя локального пользователя назначения.'
-            }
-            $local = Get-LocalUser -Name $localName -ErrorAction SilentlyContinue
-            if ($local) {
-                if (-not $local.Enabled) { throw 'Локальная учётная запись назначения отключена.' }
-                if (@($existing | Where-Object { $_.SID -eq $local.SID.Value }).Count -gt 0) {
-                    throw 'Локальный профиль назначения уже существует. Перезапись заблокирована.'
-                }
-            } else { $createLocal = $true }
-            $target = $env:COMPUTERNAME + '\' + $localName
-        } else {
-            $computer = Get-CimInstance Win32_ComputerSystem
-            if (-not $computer.PartOfDomain) { throw 'Целевой компьютер не в домене: назначение должно быть локальным COMPUTER\user.' }
-            try { $targetSid = ([Security.Principal.NTAccount]::new($target)).Translate([Security.Principal.SecurityIdentifier]).Value }
-            catch { throw ('Невозможно определить SID целевого пользователя: ' + $target) }
-            if (@($existing | Where-Object { $_.SID -eq $targetSid }).Count -gt 0) {
-                throw 'Целевой доменный пользователь уже имеет профиль. Перезапись заблокирована.'
-            }
-        }
-        $map = '/mu:' + $source + ':' + $target
-        if ($target -ieq $source -and $meta.AccountType -eq 'Domain' -and
-            $targetSid -eq [string]$meta.SourceSid) { $map = $null }
-    } elseif ($meta.AccountType -eq 'Domain') {
-        $computer = Get-CimInstance Win32_ComputerSystem
-        if (-not $computer.PartOfDomain) { throw 'Целевое устройство не присоединено к домену Active Directory.' }
-        try {
-            $sid = ([Security.Principal.NTAccount]::new($source)).Translate([Security.Principal.SecurityIdentifier]).Value
-            if ($sid -ne $meta.SourceSid) { throw 'SID доменного пользователя отличается от исходного.' }
-        } catch { throw 'Не удалось подтвердить исходную доменную учётную запись. Проверьте доступ к домену.' }
-        if (@($existing | Where-Object {$_.SID -eq $meta.SourceSid}).Count -gt 0) {
-            throw 'Целевой профиль уже существует. Автоматическое перезаписывание запрещено.'
-        }
-    } else {
-        $sourceName = ($source -split '\\',2)[1]
-        if (-not $sourceName -or $sourceName -notmatch '^[^\\/:*?"<>|]{1,20}$' -or
-            $sourceName -in @('Administrator','Администратор','DefaultAccount','WDAGUtilityAccount')) {
-            throw 'Исходное имя локального пользователя невозможно безопасно создать.'
-        }
-        $localName = $sourceName
-        $local = Get-LocalUser -Name $localName -ErrorAction SilentlyContinue
-        if ($null -ne $local) {
-            if (@($existing | Where-Object { $_.SID -eq $local.SID.Value }).Count -gt 0) {
-                throw 'Локальная учётная запись уже имеет профиль: автоматический импорт заблокирован.'
-            }
-            if (-not $local.Enabled) { throw 'Целевая учётная запись отключена.' }
-        } else { $createLocal = $true }
-        $target = $env:COMPUTERNAME + '\' + $localName
-        $map = '/mu:' + $source + ':' + $target
+    if (-not $Unattended -and -not $TargetOverride) {
+        $selection = Select-ImportDestination $meta
+        if (-not $selection) { Write-OperationReport 'ОТМЕНА' 'Выбор назначения отменён.'; return }
+        $TargetOverride = $selection.Override
     }
-    Update-TrackedState 'Назначение проверено' @{TargetAccount=$target}
+    $mutationLock = Enter-ProfileMutationLock
+    $destination = Resolve-ImportTarget $meta $TargetOverride
+    $target = $destination.Account
+    $map = $destination.Mapping
+    $createLocal = $destination.CreateLocal
+    $localName = $destination.Name
+    $possibleProfileName = if ($createLocal) { $localName } else { '' }
+    Assert-ImportProfileUnused $destination.Sid $possibleProfileName
+    Assert-NoUnreviewedImport $destination
+    Update-TrackedState 'Назначение проверено' @{TargetAccount=$target;TargetSid=$destination.Sid}
     Advance-OperationStage 'Проверена целевая учётная запись'
     Write-Host ('Назначение: ' + $target) -ForegroundColor Cyan
     Write-Host 'До импорта установите программы, нужные пользователю.'
@@ -3231,19 +3467,47 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     Write-OperationReport 'НАЗНАЧЕНИЕ' ('Целевая учётная запись: ' + $target + '; создание локального пользователя: ' + $createLocal)
     if (-not $Unattended -and -not (Confirm 'НАЧАТЬ ВОССТАНОВЛЕНИЕ ПРОФИЛЯ?')) { Write-OperationReport 'ОТМЕНА' 'Подтверждение импорта отклонено.'; return }
     Advance-OperationStage 'Импорт подтверждён'
+    # Пока пользователь подтверждал импорт, другое ПО могло изменить учётную запись или профиль.
+    $confirmed = Resolve-ImportTarget $meta $TargetOverride
+    if ($confirmed.Account -ine $destination.Account -or $confirmed.Sid -ne $destination.Sid -or
+        $confirmed.CreateLocal -ne $destination.CreateLocal) {
+        throw 'Учётная запись назначения изменилась после проверки.'
+    }
+    Assert-ImportProfileUnused $confirmed.Sid $possibleProfileName
+    $targetSid = $confirmed.Sid
     if ($createLocal) {
         $password = New-StrongPassword
         $secure = ConvertTo-SecureString -String $password -AsPlainText -Force
-        $createdUser=New-LocalUser -Name $localName -Password $secure -Description 'Created by WindowsProfileMigration' -ErrorAction Stop
-        Update-TrackedState 'Создан локальный пользователь, импорт не завершён' @{CreatedByTool=$true; CreatedAccount=$target; CreatedSid=[string]$createdUser.SID.Value}
-        Write-Host ''
-        Write-Host ('НОВЫЙ ПАРОЛЬ УЧЁТНОЙ ЗАПИСИ ' + $localName + ':') -ForegroundColor Yellow
-        Write-Host $password -ForegroundColor Yellow
-        Write-Host 'Пароль виден на экране и может попасть в видеозапись или журнал консоли.' -ForegroundColor Yellow
-        Write-Host 'Запишите пароль в защищённое место. Скрипт не сохраняет его в файлах.'
+        try {
+            Update-TrackedState 'Создаётся локальная учётная запись' @{AccountCreationPending=$true}
+            $createdUser = New-LocalUser -Name $localName -Password $secure -Description 'Created by WindowsProfileMigration' -ErrorAction Stop
+            $targetSid = [string]$createdUser.SID.Value
+            Update-TrackedState 'Создан локальный пользователь, импорт не завершён' @{
+                CreatedByTool=$true;CreatedAccount=$target;CreatedSid=$targetSid;TargetSid=$targetSid;AccountCreationPending=$false
+            }
+            if ($Unattended) {
+                Write-Host ('Локальная учётная запись создана: ' + $target + '. Администратор получателя должен задать пароль перед входом.')
+            } else {
+                Write-Host ('НОВЫЙ ПАРОЛЬ УЧЁТНОЙ ЗАПИСИ ' + $localName + ':') -ForegroundColor Yellow
+                Write-Host $password -ForegroundColor Yellow
+                Write-Host 'Запишите пароль в защищённое место. Скрипт не сохраняет его в отчёте.'
+            }
+        } finally {
+            $secure.Dispose()
+            $password = $null
+        }
         Write-OperationReport 'УЧЁТНАЯ ЗАПИСЬ' ('Создан локальный пользователь: ' + $localName + '. Пароль в отчёт не записывается.')
-        if (-not $Unattended -and -not (Confirm 'Пароль записан, продолжить миграцию?')) { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Импорт отменён, но локальная учётная запись уже создана.'; return }
+        if (-not $Unattended -and -not (Confirm 'Пароль записан, продолжить миграцию?')) {
+            Update-TrackedState 'Импорт отменён до LoadState; локальная учётная запись сохранена'
+            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Импорт отменён. Учётная запись уже создана и доступна в меню восстановления.'
+            return
+        }
     }
+    $latest = Resolve-ImportTarget $meta $TargetOverride
+    if ($latest.CreateLocal -or $latest.Sid -ne $targetSid -or $latest.Account -ine $target) {
+        throw 'Целевая учётная запись изменилась до LoadState.'
+    }
+    Assert-ImportProfileUnused $targetSid
     $log = Join-Path $logRoot ('loadstate_'+(Get-Date -Format 'yyyyMMdd_HHmmss_fff')+'_'+[guid]::NewGuid().ToString('N').Substring(0,8)+'.log')
     $progressLog = Join-Path $logRoot 'load-progress.log'
     $opts = @($store,('/i:'+(Join-Path $archive 'Rules\ProfileOnly.xml')),
@@ -3258,6 +3522,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     Write-OperationReport 'USMT' 'LoadState завершился с кодом 0; проверка файлов выполняется отдельно.'
     Write-Host 'USMT завершился с кодом 0. Выполняется проверка восстановленного профиля...' -ForegroundColor Green
     $targetProfile = Get-TargetUserProfile $target
+    if ($targetProfile.Sid -ne $targetSid) { throw 'SID восстановленного профиля отличается от подтверждённой учётной записи.' }
     Advance-OperationStage 'Целевой профиль обнаружен'
     Update-TrackedState 'Профиль найден, выполняется проверка' @{TargetProfile=$targetProfile.Path}
     $validation = Validate-RestoredProfile $meta $targetProfile
@@ -3306,8 +3571,9 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
             catch { Write-Host ('Дополнительные данные браузеров пропущены: ' + $_.Exception.Message) -ForegroundColor Yellow
                 Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Дополнительные данные браузеров: ' + $_.Exception.Message) }
             try {
-                if (Is-AllowedExtra $approvedExtras 'DesktopLayout.json') { Restore-DesktopLayout $archive $targetProfile.Sid $targetProfile.Path $Unattended }
-                else { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Позиции значков не применены: не прошли проверку Extras.' }
+                if (Is-AllowedExtra $approvedExtras 'DesktopLayout.json') {
+                    Restore-DesktopLayout $archive $targetProfile.Sid $targetProfile.Path $Unattended -ExpectedHash ($approvedExtras['DesktopLayout.json'])
+                } else { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Позиции значков не применены: не прошли проверку Extras.' }
             }
             catch { Write-Host ('Расположение значков не удалось восстановить: ' + $_.Exception.Message) -ForegroundColor Yellow
                 Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Расположение значков: ' + $_.Exception.Message) }
@@ -3318,17 +3584,18 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         } catch { Write-Host ('Дополнительные настройки пропущены: ' + $_.Exception.Message) -ForegroundColor Yellow
             Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Дополнительные настройки: ' + $_.Exception.Message) }
     }
-    Advance-OperationStage 'Дополнительные настройки восстановлены'
+    Advance-OperationStage 'Завершена обработка дополнительных настроек'
     Write-Host 'Проверьте вход пользователя, файлы, историю браузеров и значки рабочего стола.' -ForegroundColor Green
     Write-Host ('Пользователь: '+$target)
     Write-Host ('Журнал: '+$log)
     Write-OperationReport 'ПРОВЕРИТЬ' 'Рекомендуется войти под целевым пользователем и проверить документы, историю браузеров, приложения и значки рабочего стола.'
     Write-OperationReport 'ПРИЁМКА' 'Не выполнена. Для подтверждения доступа, настроек и программ пользователь должен войти под своей учётной записью.'
     Write-OperationReport 'USMT' ('Технический импорт выполнен для: '+$target)
-    Update-TrackedState 'Технически завершено, ожидает приёмки'
+    Update-TrackedState 'Технически завершено, ожидает приёмки' @{ImportCompleted=$true}
     Advance-OperationStage 'Результаты восстановления записаны в отчёт'
-    if ($stagedArchive) { [void](Clear-TrackedStaging $Script:ActiveOpState $false) }
-    Advance-OperationStage 'Временные файлы очищены'
+    if (Clear-TrackedStaging $Script:ActiveOpState $false) {
+        Advance-OperationStage 'Временные файлы очищены'
+    }
     Finish-OperationReport ('ТЕХНИЧЕСКИ ЗАВЕРШЕНО; '+$validationStatus+'; ОЖИДАЕТ ПРИЁМКИ')
     Write-Host 'Не удаляйте источник и архив до проверки всех данных.' -ForegroundColor Yellow
     return $true
@@ -3337,6 +3604,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         # Сохраняем состояние для пункта 4, но не удаляем учётную запись.
         $partial = $Script:ActiveOpState.USMTStarted -and -not $Script:ActiveOpState.USMTFinished
         $status = if ($partial) { 'Отменено во время LoadState - возможен частичный профиль' }
+                  elseif ($Script:ActiveOpState.USMTFinished) { 'Отменено после LoadState - требуется проверка профиля' }
                   else { 'Отменено до LoadState' }
         Update-TrackedState $status @{LastError=$_.Exception.Message}
         if ($partial) {
@@ -3349,13 +3617,23 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Импорт не завершён. Повторный запуск и управляемая очистка описаны в пункте 4 главного меню. Автоматического удаления профиля нет.'
         throw
     } finally {
-        # Импортный кеш удаляется и при отмене, и при ошибке. Исходный архив не затрагивается.
-        if ($stagedArchive -and $Script:ActiveOpState -and -not $Script:ActiveOpState.CleanupDone) {
-            try { [void](Clear-TrackedStaging $Script:ActiveOpState $false) }
-            catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Очистка кеша импорта не завершена: ' + $_.Exception.Message) }
-        }
-        if ($Script:ActiveOpState -and [string]$Script:ActiveOpState.Status -in @('Начато','Подготовка локального кеша','Архив подготовлен','Назначение проверено')) {
-            Update-TrackedState 'Отменено до запуска LoadState'
+        try {
+            # Ошибка удаления не затрагивает исходный архив и не меняет результат LoadState.
+            if ($stagedArchive -and $Script:ActiveOpState -and -not $Script:ActiveOpState.CleanupDone) {
+                try {
+                    if (-not $Script:ActiveOpState.StagingPath) { $Script:ActiveOpState.StagingPath = $stagedArchive }
+                    [void](Clear-TrackedStaging $Script:ActiveOpState $false)
+                } catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Очистка кеша импорта не завершена: ' + $_.Exception.Message) }
+            }
+            if ($Script:ActiveOpState) {
+                $status = if ([string]$Script:ActiveOpState.Status -in @('Начато','Подготовка локального кеша','Архив подготовлен','Назначение проверено')) {
+                    'Отменено до запуска LoadState'
+                } else { '' }
+                try { Update-TrackedState $status @{ProcessId=0;ProcessStartTicks=0} }
+                catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалось закрыть запись операции: ' + $_.Exception.Message) }
+            }
+        } finally {
+            if ($null -ne $mutationLock) { $mutationLock.Dispose() }
         }
     }
 }
