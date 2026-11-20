@@ -1123,6 +1123,34 @@ function Get-ProfileZipInfo([string]$ZipPath) {
     finally { $zip.Dispose() }
 }
 
+function Read-BoundedArchiveMetadata([IO.Stream]$Stream,[long]$Length) {
+    if ($Length -le 0 -or $Length -gt 2MB) { throw 'Размер metadata.json должен быть от 1 байта до 2 МБ.' }
+    # ZIP сообщает заявленную длину, поэтому проверяем и фактический поток.
+    $bytes = [byte[]]::new([int]$Length)
+    $offset = 0
+    while ($offset -lt $bytes.Length) {
+        $read = $Stream.Read($bytes,$offset,$bytes.Length - $offset)
+        if ($read -le 0) { throw 'metadata.json обрезан.' }
+        $offset += $read
+    }
+    if ($Stream.ReadByte() -ne -1) { throw 'Размер metadata.json не совпадает с содержимым.' }
+    $reader = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes,$false),[Text.Encoding]::UTF8,$true)
+    try {
+        $json = $reader.ReadToEnd().Trim()
+        if (-not $json.StartsWith('{')) { throw 'metadata.json должен содержать один JSON-объект.' }
+        $metadata = $json | ConvertFrom-Json -ErrorAction Stop
+        if ($metadata -isnot [pscustomobject]) { throw 'metadata.json должен содержать один JSON-объект.' }
+        return $metadata
+    } finally { $reader.Dispose() }
+}
+
+function Read-ArchiveMetadataFile([string]$Path) {
+    Assert-NoReparseAncestor $Path
+    $stream = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try { return Read-BoundedArchiveMetadata $stream $stream.Length }
+    finally { $stream.Dispose() }
+}
+
 function Read-ProfileZipInfo([IO.Compression.ZipArchive]$Zip) {
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $directories = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -1161,29 +1189,12 @@ function Read-ProfileZipInfo([IO.Compression.ZipArchive]$Zip) {
         if ($name -ceq 'metadata.json') { $metaEntry = $entry }
         if ($name -match '^Store/.+\.mig$') { $storeFiles++ }
     }
-    if (-not $metaEntry -or $metaEntry.Length -le 0 -or $metaEntry.Length -gt 2MB -or $storeFiles -ne 1) {
+    if (-not $metaEntry -or $storeFiles -ne 1) {
         throw 'ZIP должен содержать metadata.json размером до 2 МБ и ровно одно USMT-хранилище.'
     }
-    # Лимит применяется к данным в потоке, даже если ZIP заявил меньший размер.
-    $bytes = [byte[]]::new([int]$metaEntry.Length)
     $stream = $metaEntry.Open()
-    try {
-        $offset = 0
-        while ($offset -lt $bytes.Length) {
-            $read = $stream.Read($bytes,$offset,$bytes.Length - $offset)
-            if ($read -le 0) { throw 'metadata.json в ZIP обрезан.' }
-            $offset += $read
-        }
-        if ($stream.ReadByte() -ne -1) { throw 'Размер metadata.json не совпадает с ZIP.' }
-    } finally { $stream.Dispose() }
-    $reader = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes,$false),[Text.Encoding]::UTF8,$true)
-    try {
-        $json = $reader.ReadToEnd().Trim()
-        if (-not $json.StartsWith('{')) { throw 'metadata.json должен содержать один JSON-объект.' }
-        $meta = $json | ConvertFrom-Json -ErrorAction Stop
-    }
-    finally { $reader.Dispose() }
-    if ($meta -isnot [pscustomobject]) { throw 'metadata.json должен содержать один JSON-объект.' }
+    try { $meta = Read-BoundedArchiveMetadata $stream $metaEntry.Length }
+    finally { $stream.Dispose() }
     return [pscustomobject]@{ Metadata=$meta; ExpandedBytes=$expanded; Files=$filePaths.Count }
 }
 # Сжимает каталог в один ZIP с поддержкой больших файлов (ZIP64) и клавиши 0.
@@ -1570,8 +1581,8 @@ function New-StagingDirectory([string]$Prefix) {
 }
 # Копирует каталог через Robocopy с повторами и контролем ошибок.
 function Copy-DirectoryRobust([string]$Source,[string]$Destination,[string]$Purpose,[string]$FileName = '') {
-    $src = [IO.Path]::GetFullPath($Source).TrimEnd('\\')
-    $dst = [IO.Path]::GetFullPath($Destination).TrimEnd('\\')
+    $src = [IO.Path]::GetFullPath($Source)
+    $dst = [IO.Path]::GetFullPath($Destination)
     $parent = Split-Path -Parent $dst
     if ($parent -and -not (Test-Path -LiteralPath $parent -PathType Container)) {
         [void](New-Item -ItemType Directory -Path $parent -Force)
@@ -1599,8 +1610,14 @@ function Copy-DirectoryRobust([string]$Source,[string]$Destination,[string]$Purp
             Write-Progress -Id 4 -Activity $Purpose -Status 'Копирование файлов, возможны повторные попытки...'
             if (Test-RunningProcessStopRequest $Purpose 4) {
                 if ($proc.HasExited) { break }
-                $proc.Kill()
-                $proc.WaitForExit()
+                try { $proc.Kill() }
+                catch {
+                    if ($proc.HasExited) { break }
+                    throw
+                }
+                if (-not $proc.WaitForExit(30000)) {
+                    throw 'Robocopy не подтвердил завершение после запроса остановки.'
+                }
                 throw [System.OperationCanceledException]::new(('Копирование остановлено пользователем: ' + $Purpose))
             }
         }
@@ -1612,7 +1629,8 @@ function Copy-DirectoryRobust([string]$Source,[string]$Destination,[string]$Purp
     if ($null -eq $copyCode) {
         throw ('Не удалось прочитать код завершения Robocopy: ' + $Purpose + '. Успех копирования не подтверждён.')
     }
-    if ($copyCode -gt 7) {
+    Write-OperationReport 'ДИАГНОСТИКА' ('Код завершения Robocopy: ' + $copyCode)
+    if ($copyCode -lt 0 -or $copyCode -gt 7) {
         throw ('Robocopy не смог выполнить ' + $Purpose + '. Код: ' + $copyCode)
     }
 }
@@ -3089,17 +3107,29 @@ function Assert-ArchiveMetadata([object]$Metadata,[bool]$RequireImportSchema = $
     }
 }
 
+function Assert-ArchiveCacheOutsideSource([string]$Source,[string]$StagingRoot) {
+    $separator = [IO.Path]::DirectorySeparatorChar
+    $separators = [char[]]@($separator,[IO.Path]::AltDirectorySeparatorChar)
+    $sourcePath = [IO.Path]::GetFullPath($Source).TrimEnd($separators)
+    $cachePath = [IO.Path]::GetFullPath($StagingRoot).TrimEnd($separators)
+    if ($cachePath.Equals($sourcePath,[StringComparison]::OrdinalIgnoreCase) -or
+        $cachePath.StartsWith(($sourcePath + $separator),[StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Папка выбранного архива содержит рабочий каталог программы. Выберите архив в отдельной папке.'
+    }
+}
+
 function Get-AvailableArchives([string]$Root = $Script:BackupRoot) {
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return @() }
+    try { Assert-NoReparseAncestor $Root }
+    catch { return @() }
     $list = @()
     $dirs = @((Get-Item -LiteralPath $Root -ErrorAction Stop))
     $dirs += @(Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue)
     foreach ($dir in $dirs) {
         if ($dir.Name -match '\.partial_[a-fA-F0-9]+$') { continue }
         $metadataPath = Join-Path $dir.FullName 'metadata.json'
-        if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) { continue }
         try {
-            $meta = Get-Content -LiteralPath $metadataPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $meta = Read-ArchiveMetadataFile $metadataPath
             Assert-ArchiveMetadata $meta
             if (-not (Test-Path -LiteralPath (Join-Path $dir.FullName 'Store') -PathType Container)) { continue }
             $date = $dir.CreationTime
@@ -3375,14 +3405,15 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         $archive = $extracted
     } else {
         if (Test-IsUncPath $archive) { Ensure-PathAvailable $archive 'Выбранный сетевой архив' }
-        $archiveFiles = Get-ArchiveFileMap $archive
+        $stagingRoot = Join-Path $env:ProgramData 'WindowsProfileMigration\Staging'
+        Assert-ArchiveCacheOutsideSource $archive $stagingRoot
         $metadataPath = Join-Path $archive 'metadata.json'
-        $earlyMeta = Get-Content -LiteralPath $metadataPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $earlyMeta = Read-ArchiveMetadataFile $metadataPath
         Assert-ArchiveMetadata $earlyMeta (-not $JustVerify)
         # USMT читает только локальную копию, которую проверили после копирования.
+        $archiveFiles = Get-ArchiveFileMap $archive
         [UInt64]$folderBytes = 0
         foreach ($file in $archiveFiles.Values) { $folderBytes += [UInt64]$file.Length }
-        $stagingRoot = Join-Path $env:ProgramData 'WindowsProfileMigration\Staging'
         $stagingDrive = [IO.Path]::GetPathRoot($stagingRoot)
         $stagingFree = Get-PathFreeBytes $stagingDrive
         $stagingNeeded = [UInt64]([double]$folderBytes + [Math]::Max([double]1GB,[double]$folderBytes * 0.10))
@@ -3402,7 +3433,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     Write-OperationReport 'АРХИВ' ('Выбран: ' + $selectedArchive)
     Advance-OperationStage 'Архив подготовлен локально'
     Update-TrackedState 'Архив подготовлен'
-    $meta = Get-Content -LiteralPath (Join-Path $archive 'metadata.json') -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $meta = Read-ArchiveMetadataFile (Join-Path $archive 'metadata.json')
     Assert-ArchiveMetadata $meta (-not $JustVerify)
     Advance-OperationStage 'Проверены метаданные архива'
     $store = Join-Path $archive 'Store'

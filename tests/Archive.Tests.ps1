@@ -2,10 +2,12 @@
 
 . (Get-WpmFunctionDefinitions -Name Format-ByteSize,Assert-WindowsPathComponent,Get-WindowsRelativePathParts,
     Get-ProfileDataItem,Assert-NoReparseAncestor,Get-ArchiveFileMap,Initialize-ZipSupport,Get-ProfileZipInfo,
-    Read-ProfileZipInfo,Compress-ProfileArchive,Expand-ProfileArchive,Get-ExactFileSha256,Read-MigrationXml,
+    Read-ProfileZipInfo,Read-BoundedArchiveMetadata,Read-ArchiveMetadataFile,
+    Compress-ProfileArchive,Expand-ProfileArchive,Get-ExactFileSha256,Read-MigrationXml,
     Get-ValidationSourceDirectories,Get-ValidationSourceFiles,Read-ValidationManifestRecord,
     New-ValidationManifest,Assert-ValidationSourceStable,Assert-ValidationManifestIntegrity,Test-ValidationManifest,
-    Assert-ExportProfileReady,Write-EmbeddedProfileOnlyRule)
+    Assert-ExportProfileReady,Write-EmbeddedProfileOnlyRule,Assert-ArchiveCacheOutsideSource,
+    Copy-DirectoryRobust,Quote-WindowsArgument)
 
 function Write-OperationReport {}
 function Test-RunningProcessStopRequest { $false }
@@ -95,6 +97,7 @@ Invoke-WpmTest 'Archive folder and profile verification reject linked ancestors'
     $link = Join-Path $profile 'Documents'
     [void](New-Item -ItemType $kind -Path $link -Target $other)
     Assert-WpmThrows { Get-ArchiveFileMap (Join-Path $link 'nested') } 'ссылку'
+    Assert-WpmThrows { Read-ArchiveMetadataFile (Join-Path $link 'marker.txt') } 'ссылку'
     Assert-WpmEqual (Get-ProfileDataItem $profile 'Documents\marker.txt') $null
     Assert-WpmEqual @(Get-ValidationSourceFiles $profile).Count 0
 }
@@ -157,4 +160,62 @@ Invoke-WpmTest 'Export guard rejects concurrent load or reassignment of selected
     $actual.Loaded = $false
     $actual.LocalPath = 'C:\Users\Different'
     Assert-WpmThrows { Assert-ExportProfileReady $profile 'test' } 'Состояние выбранного профиля'
+}
+
+Invoke-WpmTest 'Folder metadata requires one object and uses the same byte limit as ZIP' {
+    $file = Join-Path $WpmTestRoot 'metadata.json'
+    [IO.File]::WriteAllText($file,'{"SchemaVersion":7}',[Text.UTF8Encoding]::new($true))
+    Assert-WpmEqual (Read-ArchiveMetadataFile $file).SchemaVersion 7
+    [IO.File]::WriteAllText($file,'[{"SchemaVersion":7}]')
+    Assert-WpmThrows { Read-ArchiveMetadataFile $file } 'один JSON-объект'
+    $fileStream = [IO.File]::OpenWrite($file)
+    try { $fileStream.SetLength(2MB + 1) }
+    finally { $fileStream.Dispose() }
+    Assert-WpmThrows { Read-ArchiveMetadataFile $file } 'до 2 МБ'
+}
+
+Invoke-WpmTest 'Folder archive cannot contain its cache including a volume-root selection' {
+    $cache = Join-Path $WpmTestRoot 'LocalCache'
+    Assert-WpmThrows { Assert-ArchiveCacheOutsideSource $WpmTestRoot $cache } 'содержит рабочий каталог'
+    Assert-WpmThrows { Assert-ArchiveCacheOutsideSource $cache $cache } 'содержит рабочий каталог'
+    $volume = [IO.Path]::GetPathRoot($WpmTestRoot)
+    Assert-WpmThrows { Assert-ArchiveCacheOutsideSource $volume $cache } 'содержит рабочий каталог'
+    Assert-ArchiveCacheOutsideSource (Join-Path $WpmTestRoot 'Local') $cache
+}
+
+Invoke-WpmTest 'Robocopy preserves the volume root and tolerates an exit racing cancellation' {
+    $oldSystemRoot = $env:SystemRoot
+    try {
+        $env:SystemRoot = $WpmTestRoot
+        $source = [IO.Path]::GetPathRoot($WpmTestRoot)
+        $destination = Join-Path $WpmTestRoot 'Copy'
+        $state = @{ Arguments=''; Disposed=0; Mode='Exit'; Wait=0; ExitCode=1 }
+        function Test-RunningProcessStopRequest { $true }
+        function Start-Process($FilePath,$ArgumentList,[switch]$PassThru,[switch]$NoNewWindow,$ErrorAction) {
+            $state.Arguments = $ArgumentList
+            $proc = [pscustomobject]@{ Handle=1; ExitCode=$state.ExitCode; HasExited=$false; State=$state }
+            $proc | Add-Member ScriptMethod WaitForExit {
+                $this.State.Wait = $args[0]
+                return $false
+            }
+            $proc | Add-Member ScriptMethod Kill {
+                if ($this.State.Mode -eq 'Exit') {
+                    $this.HasExited = $true
+                    throw [InvalidOperationException]::new('process exited')
+                }
+            }
+            $proc | Add-Member ScriptMethod Dispose { $this.State.Disposed++ }
+            return $proc
+        }
+        Copy-DirectoryRobust $source $destination 'synthetic'
+        Assert-WpmEqual ($state.Arguments.StartsWith((Quote-WindowsArgument $source) + ' ')) $true
+        Assert-WpmEqual $state.Disposed 1
+        $state.Mode = 'Timeout'
+        Assert-WpmThrows { Copy-DirectoryRobust $source $destination 'synthetic' } 'не подтвердил завершение'
+        Assert-WpmEqual $state.Wait 30000
+        Assert-WpmEqual $state.Disposed 2
+        $state.Mode = 'Exit'
+        $state.ExitCode = -1
+        Assert-WpmThrows { Copy-DirectoryRobust $source $destination 'synthetic' } 'Код: -1'
+    } finally { $env:SystemRoot = $oldSystemRoot }
 }
