@@ -21,12 +21,36 @@ permissions:
 
 jobs:
   windows-powershell:
-    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-11-arm]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Run synthetic Windows PowerShell 5.1 tests
         shell: powershell
         run: .\tests\Run-Tests.ps1
+      - name: Check Windows 11 client and elevated session
+        if: matrix.os == 'windows-11-arm'
+        shell: powershell
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host "$($os.Caption), build $($os.BuildNumber), $env:PROCESSOR_ARCHITECTURE"
+          if ($os.ProductType -ne 1 -or [int]$os.BuildNumber -lt 22000) {
+              throw 'Expected a Windows 11 client.'
+          }
+          $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+              throw 'The unattended launcher check requires an elevated runner.'
+          }
+      - name: Start the application and exit the menu
+        if: matrix.os == 'windows-11-arm'
+        timeout-minutes: 2
+        shell: cmd
+        run: |
+          echo 0|call Start.cmd
+          exit /b %ERRORLEVEL%

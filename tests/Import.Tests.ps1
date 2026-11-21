@@ -72,6 +72,39 @@ Invoke-WpmTest 'State replace preserves exactly one complete durable record' {
     Assert-WpmThrows { Save-TrackedState @{Id='../invalid'} } 'идентификатор'
 }
 
+if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    Invoke-WpmTest 'Windows operation directories restrict access and the journal inherits their DACL' {
+        Set-ImportTestDirectories $WpmTestRoot
+        $state = New-ImportTestState
+        Save-TrackedState $state
+        $journal = Join-Path $script:OpStateRoot ($state.Id + '.json')
+        $administrators = 'S-1-5-32-544'
+        $system = 'S-1-5-18'
+        $sidType = [Security.Principal.SecurityIdentifier]
+        foreach ($path in @($script:WpmWorkRoot, $script:OpStateRoot, $journal)) {
+            $isJournal = $path -eq $journal
+            $acl = Get-Acl -LiteralPath $path -ErrorAction Stop
+            Assert-WpmEqual $acl.AreAccessRulesProtected (-not $isJournal) "DACL protection for $path"
+            if (-not $isJournal) {
+                Assert-WpmEqual ($acl.GetOwner($sidType).Value) $administrators "Directory owner for $path"
+            }
+            $rules = $acl.GetAccessRules($true, $true, $sidType)
+            $identities = @($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object)
+            Assert-WpmEqual $identities @($system, $administrators) "Access identities for $path"
+            foreach ($rule in $rules) {
+                Assert-WpmEqual $rule.IsInherited $isJournal "Inherited rule for $path"
+                Assert-WpmEqual $rule.AccessControlType ([Security.AccessControl.AccessControlType]::Allow) "Rule type for $path"
+                Assert-WpmEqual $rule.FileSystemRights ([Security.AccessControl.FileSystemRights]::FullControl) "Access rights for $path"
+                if (-not $isJournal) {
+                    $inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+                    Assert-WpmEqual $rule.InheritanceFlags $inheritance "Directory inheritance for $path"
+                    Assert-WpmEqual $rule.PropagationFlags ([Security.AccessControl.PropagationFlags]::None) "Rule propagation for $path"
+                }
+            }
+        }
+    }
+}
+
 Invoke-WpmTest 'Corrupt retained operation cannot be mistaken for no prior import' {
     Set-ImportTestDirectories $WpmTestRoot
     $state = New-ImportTestState
