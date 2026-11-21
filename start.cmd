@@ -4,10 +4,10 @@ REM Arhivater - WindowsProfileMigration
 set "ERRORLEVEL="
 set "WPM_ENGINE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 if exist "%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe" set "WPM_ENGINE=%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
-if not exist "%~dp0Bootstrap.ps1" goto missing
+if not exist "%~dp0Program\Bootstrap.ps1" goto missing
 if not exist "%WPM_ENGINE%" goto missing
 
-"%WPM_ENGINE%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0Bootstrap.ps1"
+"%WPM_ENGINE%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0Program\Bootstrap.ps1"
 set "WPM_EXIT=%ERRORLEVEL%"
 if "%WPM_EXIT%"=="0" goto done
 if "%WPM_EXIT%"=="1223" goto done

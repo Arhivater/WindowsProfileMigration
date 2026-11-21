@@ -6,13 +6,15 @@ on:
       - main
       - 'release/**'
     paths:
-      - '**.ps1'
-      - 'Start.cmd'
+      - 'Program/**'
+      - 'tests/**/*.ps1'
+      - 'start.cmd'
       - '.github/workflows/tests.yml'
   pull_request:
     paths:
-      - '**.ps1'
-      - 'Start.cmd'
+      - 'Program/**'
+      - 'tests/**/*.ps1'
+      - 'start.cmd'
       - '.github/workflows/tests.yml'
   workflow_dispatch:
 
@@ -52,5 +54,5 @@ jobs:
         timeout-minutes: 2
         shell: cmd
         run: |
-          echo 0|call Start.cmd
+          echo 0|call start.cmd
           exit /b %ERRORLEVEL%

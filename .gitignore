@@ -1,0 +1,5 @@
+# Отчёты и профили содержат личные данные и остаются на компьютере.
+Backups/*
+!Backups/.gitkeep
+Reports/*
+!Reports/.gitkeep

@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 [CmdletBinding()]
 param(
     [string]$ProjectRoot = (Split-Path -Parent $PSScriptRoot),
@@ -10,7 +10,8 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $script:WpmProjectRoot = (Get-Item -LiteralPath $ProjectRoot).FullName
 $script:WpmTestCases = [Collections.Generic.List[object]]::new()
-$script:WpmScriptAsts = @{}
+$script:WpmProgramRoot = Join-Path $script:WpmProjectRoot 'Program'
+$script:WpmFunctions = @{ 'Bootstrap.ps1' = @{}; 'ProfileMigration.ps1' = @{} }
 
 function Get-WpmFunctionDefinitions {
     param(
@@ -18,16 +19,15 @@ function Get-WpmFunctionDefinitions {
         [string]$ScriptName = 'ProfileMigration.ps1',
         [string[]]$Name
     )
-    $definitions = @($script:WpmScriptAsts[$ScriptName].EndBlock.Statements | Where-Object {
-        $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and
-            (-not $Name -or $_.Name -in $Name)
-    })
-    $defined = @($definitions | ForEach-Object Name)
-    $missing = @($Name | Where-Object { $_ -and $_ -notin $defined })
-    if ($missing.Count) {
-        throw ('Functions missing from {0}: {1}' -f $ScriptName, ($missing -join ', '))
+    $functions = $script:WpmFunctions[$ScriptName]
+    $requested = if ($Name) { $Name } else { $functions.Keys }
+    $definitions = foreach ($functionName in $requested) {
+        if (-not $functions.ContainsKey($functionName)) {
+            throw ('Function missing from {0}: {1}' -f $ScriptName, $functionName)
+        }
+        $functions[$functionName].Extent.Text
     }
-    return [scriptblock]::Create(($definitions | ForEach-Object { $_.Extent.Text }) -join [Environment]::NewLine)
+    return [scriptblock]::Create(($definitions -join [Environment]::NewLine))
 }
 
 function Assert-WpmEqual {
@@ -82,21 +82,31 @@ function Invoke-WpmTest {
 }
 
 Write-Host ('PowerShell {0} | {1}' -f $PSVersionTable.PSVersion, [Environment]::OSVersion.Platform)
-foreach ($name in @('Bootstrap.ps1', 'ProfileMigration.ps1')) {
-    $path = Join-Path $script:WpmProjectRoot $name
-    Invoke-WpmTest "Parse $name" {
+$entryPoints = @('Bootstrap.ps1', 'ProfileMigration.ps1')
+# Каждый файл из Program читаем отдельно. При этом само меню миграции не запускается.
+$programFiles = @(Get-ChildItem -LiteralPath $script:WpmProgramRoot -File -Filter '*.ps1' | Sort-Object Name)
+foreach ($name in $entryPoints) {
+    if ($name -notin $programFiles.Name) { throw ('Entry point missing from Program: ' + $name) }
+}
+foreach ($file in $programFiles) {
+    Invoke-WpmTest ('Parse Program/' + $file.Name) {
         $tokens = $null
         $errors = $null
-        $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+        $ast = [Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors)
         if (@($errors).Count) {
             throw (($errors | ForEach-Object { '{0}: {1}' -f $_.Extent.StartLineNumber, $_.Message }) -join [Environment]::NewLine)
         }
-        Assert-WpmEqual ([string]$ast.ScriptRequirements.RequiredPSVersion) '5.1'
-        $script:WpmScriptAsts[$name] = $ast
+        if ($file.Name -in $entryPoints) { Assert-WpmEqual ([string]$ast.ScriptRequirements.RequiredPSVersion) '5.1' }
+        $group = if ($file.Name -eq 'Bootstrap.ps1') { 'Bootstrap.ps1' } else { 'ProfileMigration.ps1' }
+        foreach ($statement in $ast.EndBlock.Statements) {
+            if ($statement -is [Management.Automation.Language.FunctionDefinitionAst]) {
+                $script:WpmFunctions[$group].Add($statement.Name, $statement)
+            }
+        }
     }
 }
 
-if ($script:WpmScriptAsts.Count -eq 2) {
+if (@($script:WpmTestCases | Where-Object { -not $_.Passed }).Count -eq 0) {
     $testDirectory = Join-Path $script:WpmProjectRoot 'tests'
     $files = @(Get-ChildItem -LiteralPath $testDirectory -File -Filter '*.Tests.ps1' | Sort-Object Name)
     if ($Suite) {

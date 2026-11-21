@@ -2,12 +2,14 @@
 # Автор: Arhivater
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$Script:WpmVersion = '1.10.1'
+$Script:WpmVersion = '1.11.0'
+# Program лежит рядом с папками для отчётов и архивов. Корень диска тоже допустим.
+$Script:KitRoot = [IO.Directory]::GetParent($PSScriptRoot).FullName
 
 # При отказе UAC/ошибке запуска оставляем один диагностический TXT.
 # В штатном запуске отдельный отчёт не создаётся: его пишет основной скрипт.
 function Write-BootstrapFailure([object]$Record) {
-    $paths = @((Join-Path $PSScriptRoot 'Reports'),
+    $paths = @((Join-Path $Script:KitRoot 'Reports'),
         (Join-Path $env:TEMP 'WindowsProfileMigration\Reports'))
     foreach ($folder in $paths) {
         try {
@@ -82,8 +84,8 @@ function Quote-LaunchPath([string]$Path) {
 $exitCode = 1
 $process = $null
 try {
-    $root = Resolve-OriginalFolder $PSScriptRoot
-    $main = Join-Path $root 'ProfileMigration.ps1'
+    $root = Resolve-OriginalFolder $Script:KitRoot
+    $main = Join-Path $root 'Program\ProfileMigration.ps1'
     if (-not (Test-Path -LiteralPath $main -PathType Leaf)) {
         throw ('Не найден основной скрипт: ' + $main)
     }

@@ -40,7 +40,7 @@ function New-LabProfile([string]$Prefix) {
 function Invoke-LabMenu([string]$Root, $Source) {
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'
-    $start.Arguments = '/d /q /c call Start.cmd'
+    $start.Arguments = '/d /q /c call start.cmd'
     $start.WorkingDirectory = $Root
     $start.UseShellExecute = $false
     $start.RedirectStandardInput = $true
@@ -59,7 +59,8 @@ function Invoke-LabMenu([string]$Root, $Source) {
                 $remaining = [Math]::Max(0, 60000 - [int]$clock.ElapsedMilliseconds)
                 if (-not $read.Wait($remaining) -or $null -eq $read.Result) { throw 'PROFILE_MENU' }
             } until ($read.Result -match $row)
-            $inputs = @($Matches[1], '1', '1', '0', '0')
+            # Профиль, без отдельной копии папок, каталог Backups, обычный ZIP, подтверждение, назад, выход.
+            $inputs = @($Matches[1], '2', '1', '1', '1', '0', '0')
         } else {
             # A clean Backups directory was checked to contain exactly the ZIP from the preceding export.
             $inputs = @('3', '1', '0', '0')
@@ -122,9 +123,9 @@ try {
     }
     $kit = Join-Path $env:RUNNER_TEMP ('WpmExportLab-' + [guid]::NewGuid().ToString('N'))
     [void](New-Item -Path $kit -ItemType Directory)
-    foreach ($file in @('Start.cmd','Bootstrap.ps1','ProfileMigration.ps1')) {
-        Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) $file) -Destination $kit
-    }
+    $project = Split-Path -Parent $PSScriptRoot
+    Copy-Item -LiteralPath (Join-Path $project 'start.cmd') -Destination $kit
+    Copy-Item -LiteralPath (Join-Path $project 'Program') -Destination $kit -Recurse
     $stage = 'PROFILES'
     Add-Type -TypeDefinition @'
 using System.Runtime.InteropServices;
@@ -186,12 +187,29 @@ public static class WpmLabUserEnv {
             $body = [IO.File]::ReadAllText($last.FullName)
             $diagnostics = [ordered]@{
                 NATIVE = 'Код завершения [\w.]+: (\d+)'
-                LINE = 'Строка: (\d+); файл:'
+                LINE = '(?m)Строка: (\d+); файл: [^\r\n]*[\\/]Program[\\/]([a-zA-Z0-9_-]+\.ps1)\r?$'
                 PHASE = 'выполнено этапов: (\d+)'
             }
             foreach ($key in $diagnostics.Keys) {
                 $numbers = [regex]::Matches($body,$diagnostics[$key])
-                if ($numbers.Count) { Write-Host ($key + ' ' + $numbers[$numbers.Count - 1].Groups[1].Value) }
+                if (-not $numbers.Count) { continue }
+                $value = $numbers[$numbers.Count - 1].Groups[1].Value
+                Write-Host ($key + ' ' + $value)
+                if ($key -eq 'LINE') {
+                    $tokens = $null
+                    $errors = $null
+                    $module = $numbers[$numbers.Count - 1].Groups[2].Value
+                    $sourceFile = Join-Path (Join-Path $kit 'Program') $module
+                    if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) { continue }
+                    $ast = [Management.Automation.Language.Parser]::ParseFile($sourceFile,[ref]$tokens,[ref]$errors)
+                    $function = $ast.Find({ param($node)
+                        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                        $node.Extent.StartLineNumber -le [int]$value -and $node.Extent.EndLineNumber -ge [int]$value
+                    },$true)
+                    if ($function -and $function.Name -match '^[a-zA-Z][a-zA-Z0-9-]{0,72}$') {
+                        Write-Host ('FUNCTION ' + $function.Name)
+                    }
+                }
             }
         }
     }

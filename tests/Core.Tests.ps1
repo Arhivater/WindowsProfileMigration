@@ -1,8 +1,9 @@
 ﻿#Requires -Version 5.1
 
-Invoke-WpmTest 'Primary scripts include the Windows PowerShell UTF-8 BOM' {
-    foreach ($scriptName in @('ProfileMigration.ps1','Bootstrap.ps1')) {
-        $bytes = [IO.File]::ReadAllBytes((Join-Path $script:WpmProjectRoot $scriptName))
+Invoke-WpmTest 'Program scripts include the Windows PowerShell UTF-8 BOM' {
+    foreach ($file in Get-ChildItem -LiteralPath $script:WpmProgramRoot -File -Filter '*.ps1') {
+        $scriptName = $file.Name
+        $bytes = [IO.File]::ReadAllBytes($file.FullName)
         Assert-WpmEqual ($bytes[0..2] -join ' ') '239 187 191' "$scriptName BOM"
     }
 }
@@ -331,10 +332,11 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
 
     Invoke-WpmTest 'CMD launcher forwards success and errors from a harmless fixture' {
         $kit = Join-Path $WpmTestRoot 'комплект с пробелами!'
-        [void][IO.Directory]::CreateDirectory($kit)
-        $launcher = Join-Path $kit 'Start.cmd'
-        $fixture = Join-Path $kit 'Bootstrap.ps1'
-        [IO.File]::Copy((Join-Path $script:WpmProjectRoot 'Start.cmd'), $launcher)
+        $program = Join-Path $kit 'Program'
+        [void][IO.Directory]::CreateDirectory($program)
+        $launcher = Join-Path $kit 'start.cmd'
+        $fixture = Join-Path $program 'Bootstrap.ps1'
+        [IO.File]::Copy((Join-Path $script:WpmProjectRoot 'start.cmd'), $launcher)
         foreach ($code in @(0,19,1223)) {
             [IO.File]::WriteAllText($fixture, "exit $code")
             # Pass the precise CMD command line and close stdin to release its pause.
@@ -351,7 +353,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
                     $process.Kill()
                     throw 'The fixture launcher did not exit.'
                 }
-                Assert-WpmEqual $process.ExitCode $code 'Code through Start.cmd'
+                Assert-WpmEqual $process.ExitCode $code 'Code through start.cmd'
             } finally { $process.Dispose() }
         }
     }

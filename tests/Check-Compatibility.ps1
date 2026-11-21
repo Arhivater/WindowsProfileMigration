@@ -21,9 +21,10 @@ $settings = @{
     }
 }
 
+$program = Join-Path $ProjectRoot 'Program'
 $findings = @(
-    foreach ($file in @('ProfileMigration.ps1','Bootstrap.ps1')) {
-        Invoke-ScriptAnalyzer -Path (Join-Path $ProjectRoot $file) -Settings $settings
+    foreach ($file in Get-ChildItem -LiteralPath $program -File -Filter '*.ps1') {
+        Invoke-ScriptAnalyzer -Path $file.FullName -Settings $settings
     }
 )
 $findings | Select-Object RuleName,ScriptName,Line,Message | Format-List
