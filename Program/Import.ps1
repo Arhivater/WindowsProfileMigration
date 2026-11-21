@@ -140,6 +140,53 @@ function Assert-NoUnreviewedImport([object]$Target) {
 }
 
 # Главный сценарий: выбор архива → локальный кеш при UNC → Verify → LoadState → проверка → дополнения.
+# Сначала записываем начало импорта в журнал. Даже после сбоя будет видно, запускался ли LoadState.
+function Invoke-ProfileLoad($Usmt, $Store, $Archive, $Map, $LogRoot, $Log) {
+    $progressLog = Join-Path $logRoot 'load-progress.log'
+    $opts = @($store,('/i:'+(Join-Path $archive 'Rules\ProfileOnly.xml')),
+        ('/config:'+(Join-Path $archive 'Rules\Config.xml')),'/v:5',('/l:'+$log),('/progress:'+$progressLog))
+    if ($map) { $opts += $map }
+    Update-TrackedState 'LoadState выполняется' @{USMTStarted=$true}
+    Write-Host 'Импорт USMT...' -ForegroundColor Cyan
+    Write-OperationReport 'ЖУРНАЛ USMT' ('Импорт: ' + $log)
+    Invoke-USMT (Join-Path $Usmt 'LoadState.exe') $opts $Usmt $progressLog
+    Advance-OperationStage 'LoadState завершён'
+    Update-TrackedState 'LoadState завершён, проверка продолжается' @{USMTFinished=$true}
+    Write-OperationReport 'USMT' 'LoadState завершился с кодом 0; проверка файлов выполняется отдельно.'
+    Write-Host 'USMT завершился с кодом 0. Выполняется проверка восстановленного профиля...' -ForegroundColor Green
+}
+
+# Создаём учётную запись только после подтверждения. В журнал сохраняется её SID, по которому Windows узнаёт пользователя.
+function New-ImportLocalAccount([string]$LocalName, [string]$Target, [bool]$Unattended) {
+    $password = New-StrongPassword
+    $secure = ConvertTo-SecureString -String $password -AsPlainText -Force
+    try {
+        Update-TrackedState 'Создаётся локальная учётная запись' @{AccountCreationPending=$true}
+        $createdUser = New-LocalUser -Name $localName -Password $secure -Description 'Created by WindowsProfileMigration' -ErrorAction Stop
+        $targetSid = [string]$createdUser.SID.Value
+        Update-TrackedState 'Создан локальный пользователь, импорт не завершён' @{
+            CreatedByTool=$true;CreatedAccount=$target;CreatedSid=$targetSid;TargetSid=$targetSid;AccountCreationPending=$false
+        }
+        if ($Unattended) {
+            Write-Host ('Локальная учётная запись создана: ' + $target + '. Администратор получателя должен задать пароль перед входом.')
+        } else {
+            Write-Host ('НОВЫЙ ПАРОЛЬ УЧЁТНОЙ ЗАПИСИ ' + $localName + ':') -ForegroundColor Yellow
+            Write-Host $password -ForegroundColor Yellow
+            Write-Host 'Запишите пароль в защищённое место. Скрипт не сохраняет его в отчёте.'
+        }
+    } finally {
+        $secure.Dispose()
+        $password = $null
+    }
+    Write-OperationReport 'УЧЁТНАЯ ЗАПИСЬ' ('Создан локальный пользователь: ' + $localName + '. Пароль в отчёт не записывается.')
+    if (-not $Unattended -and -not (Confirm 'Пароль записан, продолжить миграцию?')) {
+        Update-TrackedState 'Импорт отменён до LoadState; локальная учётная запись сохранена'
+        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Импорт отменён. Учётная запись уже создана и доступна в меню восстановления.'
+        return $null
+    }
+    return $targetSid
+}
+
 function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOverride = '',[string]$TargetOverride = '',[bool]$Unattended = $false) {
     $archive = if ($ArchiveOverride) { $ArchiveOverride } else { Select-Archive }
     if (-not $archive) { Write-OperationReport 'ОТМЕНА' 'Выбор архива отменён.'; return }
@@ -300,32 +347,8 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     Assert-ImportProfileUnused $confirmed.Sid $possibleProfileName
     $targetSid = $confirmed.Sid
     if ($createLocal) {
-        $password = New-StrongPassword
-        $secure = ConvertTo-SecureString -String $password -AsPlainText -Force
-        try {
-            Update-TrackedState 'Создаётся локальная учётная запись' @{AccountCreationPending=$true}
-            $createdUser = New-LocalUser -Name $localName -Password $secure -Description 'Created by WindowsProfileMigration' -ErrorAction Stop
-            $targetSid = [string]$createdUser.SID.Value
-            Update-TrackedState 'Создан локальный пользователь, импорт не завершён' @{
-                CreatedByTool=$true;CreatedAccount=$target;CreatedSid=$targetSid;TargetSid=$targetSid;AccountCreationPending=$false
-            }
-            if ($Unattended) {
-                Write-Host ('Локальная учётная запись создана: ' + $target + '. Администратор получателя должен задать пароль перед входом.')
-            } else {
-                Write-Host ('НОВЫЙ ПАРОЛЬ УЧЁТНОЙ ЗАПИСИ ' + $localName + ':') -ForegroundColor Yellow
-                Write-Host $password -ForegroundColor Yellow
-                Write-Host 'Запишите пароль в защищённое место. Скрипт не сохраняет его в отчёте.'
-            }
-        } finally {
-            $secure.Dispose()
-            $password = $null
-        }
-        Write-OperationReport 'УЧЁТНАЯ ЗАПИСЬ' ('Создан локальный пользователь: ' + $localName + '. Пароль в отчёт не записывается.')
-        if (-not $Unattended -and -not (Confirm 'Пароль записан, продолжить миграцию?')) {
-            Update-TrackedState 'Импорт отменён до LoadState; локальная учётная запись сохранена'
-            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Импорт отменён. Учётная запись уже создана и доступна в меню восстановления.'
-            return
-        }
+        $targetSid = New-ImportLocalAccount $localName $target $Unattended
+        if (-not $targetSid) { return }
     }
     $latest = Resolve-ImportTarget $meta $TargetOverride
     if ($latest.CreateLocal -or $latest.Sid -ne $targetSid -or $latest.Account -ine $target) {
@@ -333,18 +356,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     }
     Assert-ImportProfileUnused $targetSid
     $log = Join-Path $logRoot ('loadstate_'+(Get-Date -Format 'yyyyMMdd_HHmmss_fff')+'_'+[guid]::NewGuid().ToString('N').Substring(0,8)+'.log')
-    $progressLog = Join-Path $logRoot 'load-progress.log'
-    $opts = @($store,('/i:'+(Join-Path $archive 'Rules\ProfileOnly.xml')),
-        ('/config:'+(Join-Path $archive 'Rules\Config.xml')),'/v:5',('/l:'+$log),('/progress:'+$progressLog))
-    if ($map) { $opts += $map }
-    Update-TrackedState 'LoadState выполняется' @{USMTStarted=$true}
-    Write-Host 'Импорт USMT...' -ForegroundColor Cyan
-    Write-OperationReport 'ЖУРНАЛ USMT' ('Импорт: ' + $log)
-    Invoke-USMT (Join-Path $Usmt 'LoadState.exe') $opts $Usmt $progressLog
-    Advance-OperationStage 'LoadState завершён'
-    Update-TrackedState 'LoadState завершён, проверка продолжается' @{USMTFinished=$true}
-    Write-OperationReport 'USMT' 'LoadState завершился с кодом 0; проверка файлов выполняется отдельно.'
-    Write-Host 'USMT завершился с кодом 0. Выполняется проверка восстановленного профиля...' -ForegroundColor Green
+    Invoke-ProfileLoad $Usmt $store $archive $map $logRoot $log
     $targetProfile = Get-TargetUserProfile $target
     if ($targetProfile.Sid -ne $targetSid) { throw 'SID восстановленного профиля отличается от подтверждённой учётной записи.' }
     Advance-OperationStage 'Целевой профиль обнаружен'

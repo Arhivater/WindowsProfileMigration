@@ -213,6 +213,39 @@ function Assert-ExportProfileReady([object]$Profile,[string]$Phase) {
 }
 
 # Главный сценарий: профиль → оценка объёма → ScanState → проверка .mig → дополнения → публикация.
+# ScanState упаковывает данные. Параметр /ui выбирает ровно одну учётную запись.
+function Invoke-ProfileScan($Usmt, $Store, $Rules, $Logs, $ListPath, $Account) {
+    $scanArguments = @($store, ('/i:'+$rules.Rule),('/config:'+$rules.Config),('/listfiles:'+$listPath),'/localonly','/efs:abort',
+        '/ue:*\*',('/ui:' + $Account), '/v:5',('/l:'+(Join-Path $logs 'scanstate.log')),
+        ('/progress:'+(Join-Path $logs 'scan-progress.log')))
+    Write-Host 'Экспорт USMT...' -ForegroundColor Cyan
+    Write-OperationReport 'ЖУРНАЛ USMT' ('Экспорт: ' + (Join-Path $logs 'scanstate.log'))
+    Update-TrackedState 'ScanState выполняется' @{USMTStarted=$true}
+    Invoke-USMT (Join-Path $Usmt 'ScanState.exe') $scanArguments $Usmt (Join-Path $logs 'scan-progress.log')
+    Advance-OperationStage 'ScanState завершён'
+    Update-TrackedState 'ScanState завершён' @{USMTFinished=$true}
+    Write-OperationReport 'УСПЕХ' 'USMT ScanState: экспорт завершён, код 0.'
+}
+
+# Сверяем список, который выдал ScanState, и сохраняем доказательство для будущего импорта.
+function Save-ProfileScopeProof($ListPath, $ProfilePath, $Archive, $Rules) {
+    # До публикации проверяем ФАКТИЧЕСКИЙ перечень файлов USMT, а не оценку.
+    # В случае выхода за пределы профиля уничтожаем только принадлежащую
+    # этому экспорту локальную временную копию.
+    try {
+        $scopeCount = Inspect-UsmtFileScope $listPath $ProfilePath
+    } catch {
+        [void](Clear-TrackedStaging $Script:ActiveOpState $false)
+        throw
+    }
+    Advance-OperationStage 'Подтверждена область одного профиля'
+    $scopeList = Join-Path $archive 'Validation\usmt-files.txt'
+    Copy-Item -LiteralPath $listPath -Destination $scopeList -Force -ErrorAction Stop
+    return [ordered]@{Policy='ArhivaterProfileOnlyV1'; ProfilePath=$ProfilePath; Files=$scopeCount;
+        RuleSHA256=$rules.RuleSHA256; ConfigSHA256=$rules.ConfigSHA256;
+        ListSHA256=(Get-ExactFileSha256 $scopeList)}
+}
+
 function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$ForcedRoot = '',[bool]$KeepReportOpen = $false,[bool]$AutoApprove = $false) {
     $p = if ($SelectedProfile) { $SelectedProfile } else { Select-Profile }
     if (-not $p) { Write-OperationReport 'ОТМЕНА' 'Выбор профиля отменён.'; return }
@@ -301,31 +334,8 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
     Advance-OperationStage 'Создан контрольный реестр до ScanState'
     Assert-ExportProfileReady $p 'перед ScanState'
     $listPath = Join-Path $logs 'usmt-files.txt'
-    $args = @($store, ('/i:'+$rules.Rule),('/config:'+$rules.Config),('/listfiles:'+$listPath),'/localonly','/efs:abort',
-        '/ue:*\*',('/ui:' + $p.Account), '/v:5',('/l:'+(Join-Path $logs 'scanstate.log')),
-        ('/progress:'+(Join-Path $logs 'scan-progress.log')))
-    Write-Host 'Экспорт USMT...' -ForegroundColor Cyan
-    Write-OperationReport 'ЖУРНАЛ USMT' ('Экспорт: ' + (Join-Path $logs 'scanstate.log'))
-    Update-TrackedState 'ScanState выполняется' @{USMTStarted=$true}
-    Invoke-USMT (Join-Path $Usmt 'ScanState.exe') $args $Usmt (Join-Path $logs 'scan-progress.log')
-    Advance-OperationStage 'ScanState завершён'
-    Update-TrackedState 'ScanState завершён' @{USMTFinished=$true}
-    Write-OperationReport 'УСПЕХ' 'USMT ScanState: экспорт завершён, код 0.'
-    # До публикации проверяем ФАКТИЧЕСКИЙ перечень файлов USMT, а не оценку.
-    # В случае выхода за пределы профиля уничтожаем только принадлежащую
-    # этому экспорту локальную временную копию.
-    try {
-        $scopeCount = Inspect-UsmtFileScope $listPath $p.Path
-    } catch {
-        [void](Clear-TrackedStaging $Script:ActiveOpState $false)
-        throw
-    }
-    Advance-OperationStage 'Подтверждена область одного профиля'
-    $scopeList = Join-Path $archive 'Validation\usmt-files.txt'
-    Copy-Item -LiteralPath $listPath -Destination $scopeList -Force -ErrorAction Stop
-    $scopeProof = [ordered]@{Policy='ArhivaterProfileOnlyV1'; ProfilePath=$p.Path; Files=$scopeCount;
-        RuleSHA256=$rules.RuleSHA256; ConfigSHA256=$rules.ConfigSHA256;
-        ListSHA256=(Get-ExactFileSha256 $scopeList)}
+    Invoke-ProfileScan $Usmt $store $rules $logs $listPath $p.Account
+    $scopeProof = Save-ProfileScopeProof $listPath $p.Path $archive $rules
     Verify-Store $Usmt $store $logs
     Advance-OperationStage 'Целостность USMT проверена'
     Write-OperationReport 'УСПЕХ' ('USMT-архив проверен. Файл: ' + (MigFile $store))
