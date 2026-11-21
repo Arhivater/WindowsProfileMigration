@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 210" role="img" aria-labelledby="title desc">
+  <title id="title">Перенос одного профиля между двумя ПК</title>
+  <desc id="desc">Исходный компьютер сохраняет профиль в архив. На целевом компьютере программа проверяет архив перед восстановлением.</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2=".25" gradientUnits="objectBoundingBox"><stop stop-color="#122b48"/><stop offset=".55" stop-color="#102337"/><stop offset="1" stop-color="#123b3b"/></linearGradient>
+    <pattern id="grid" width="20" height="20" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#b7e1fc" opacity=".15"/></pattern>
+    <g id="pc" fill="none" stroke="currentColor" stroke-width="4" stroke-linejoin="round" stroke-linecap="round">
+      <rect x="-55" y="-39" width="110" height="72" rx="7" fill="#142e46"/>
+      <path d="M-18 46h36m-18-12v12"/>
+    </g>
+  </defs>
+  <rect width="1000" height="210" rx="18" fill="url(#bg)"/>
+  <rect width="1000" height="210" rx="18" fill="url(#grid)"/>
+  <g fill="none" stroke-linecap="round" stroke-width="3">
+    <path d="M258 91h174m137 0h174" stroke="#50878d" stroke-dasharray="4 8"/>
+    <path d="m425 84 8 7-8 7m311-14 8 7-8 7" stroke="#97dee1"/>
+  </g>
+  <g transform="translate(185 89)" color="#9ac9ff"><use href="#pc"/><g fill="none" stroke="#a5d0ff" stroke-width="3"><circle cy="-13" r="8"/><path d="M-16 11c0-18 32-18 32 0z"/></g></g>
+  <g transform="translate(500 90)" stroke="#ace6d9" stroke-width="3" stroke-linejoin="round" fill="#204745">
+    <path d="M-37-35h55l19 18v54h-74z"/><path d="M18-35v18h19" fill="none"/>
+    <path d="M-11-34v8h6v7h-6v7h6v7h-6" fill="none"/><rect x="-16" y="-4" width="14" height="13" rx="3"/>
+  </g>
+  <g transform="translate(815 89)" color="#91dfcc"><use href="#pc"/><path d="m-16-3 11 11 24-25" fill="none" stroke="#93efd1" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></g>
+  <g font-family="Segoe UI,Arial,sans-serif" text-anchor="middle" font-size="24" font-weight="600" fill="#f0f6fc">
+    <text x="185" y="176">Исходный ПК</text><text x="500" y="176">Архив профиля</text><text x="815" y="176">Новый ПК</text>
+  </g>
+</svg>

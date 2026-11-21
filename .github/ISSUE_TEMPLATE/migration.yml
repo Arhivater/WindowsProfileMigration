@@ -1,0 +1,36 @@
+name: Сбой при переносе профиля
+description: Сообщить об ошибке запуска, экспорта, проверки, импорта или передачи по сети.
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Версия WindowsProfileMigration
+      placeholder: Например, v1.10.1
+    validations:
+      required: true
+  - type: input
+    id: systems
+    attributes:
+      label: Windows на исходном и целевом ПК
+      placeholder: Например, Windows 10 22H2 x64 → Windows 11 25H2 x64
+  - type: dropdown
+    id: stage
+    attributes:
+      label: На каком этапе возникла ошибка?
+      options:
+        - Запуск программы
+        - Экспорт
+        - Проверка архива
+        - Импорт
+        - Передача по сети
+        - Вход в восстановленный профиль
+        - Другой этап
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Что произошло?
+      description: Укажите пункт меню, ожидаемый результат и текст ошибки или код USMT. Для публичного сообщения достаточно обезличенного фрагмента отчёта. Архив профиля и пароли прикладывать не нужно.
+    validations:
+      required: true
