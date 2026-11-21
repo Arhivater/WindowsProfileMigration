@@ -74,13 +74,18 @@ function Convert-WpmArchive([string]$Source, [string]$Destination, [Security.Sec
 # Расшифровываем в закрытой папке и читаем ZIP только после проверки OpenPGP.
 function Get-WpmTransferArchiveInfo([string]$Path, [Security.SecureString]$Password) {
     if (-not (Test-WpmProtectedArchive $Path)) { return Get-ProfileZipInfo $Path }
-    $folder = New-StagingDirectory 'ImportCache'
-    $plain = Join-Path $folder 'profile.zip'
+    Initialize-WpmEncryption
+    Initialize-ZipSupport
+    Initialize-WpmWorkDirectory $Script:WpmStagingRoot
+    $temp = Join-Path $Script:WpmStagingRoot ([guid]::NewGuid().ToString('N') + '.tmp')
+    $cache = [IO.FileStream]::new($temp,'CreateNew','ReadWrite','None',65536,'DeleteOnClose')
     try {
-        Convert-WpmArchive $Path $plain $Password -Decrypt
-        return Get-ProfileZipInfo $plain
-    } finally {
-        [IO.File]::Delete($plain)
-        [IO.Directory]::Delete($folder)
-    }
+        $inputFile = [IO.File]::Open($Path,'Open','Read','Read')
+        try {
+            [WindowsProfileMigration.OpenPgpArchive]::Decrypt($inputFile,$cache,$Password,$null)
+        } finally { $inputFile.Dispose() }
+        $cache.Position = 0
+        $zip = [IO.Compression.ZipArchive]::new($cache,'Read',$true)
+        try { return Read-ProfileZipInfo $zip } finally { $zip.Dispose() }
+    } finally { $cache.Dispose() }
 }

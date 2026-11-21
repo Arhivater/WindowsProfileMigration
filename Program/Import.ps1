@@ -198,7 +198,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     $stagedArchive = $null
     $mutationLock = $null
     try {
-    $plainDirectory = $null
+    $plainFile = $null
     $ownedPassword = $false
     try {
     Advance-OperationStage 'Архив выбран'
@@ -208,8 +208,9 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
             $ArchivePassword = Read-WpmArchivePassword
             $ownedPassword = $true
         }
-        $plainDirectory = New-StagingDirectory 'ImportCache'
-        $plainFile = Join-Path $plainDirectory 'profile.zip'
+        $stagedArchive = New-StagingDirectory 'ImportCache'
+        Update-TrackedState 'Открытие защищённого архива' @{StagingPath=$stagedArchive; StagingPurpose='Проверка защищённого архива'}
+        $plainFile = Join-Path $stagedArchive 'profile.zip'
         Convert-WpmArchive $archive $plainFile $ArchivePassword -Decrypt
         $archive = $plainFile
         $isZip = $true
@@ -232,7 +233,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
                 ', доступно ' + (Format-ByteSize $stagingFree) + '.')
         }
         Assert-WpmDirectoryChain $stagingRoot
-        $stagedArchive = New-StagingDirectory 'ImportCache'
+        if (-not $stagedArchive) { $stagedArchive = New-StagingDirectory 'ImportCache' }
         [void](Assert-SafeStaging $stagedArchive)
         Update-TrackedState 'Подготовка распаковки ZIP' @{StagingPath=$stagedArchive; StagingPurpose='Распаковка ZIP для импорта'}
         $zipToExpand = $archive
@@ -246,6 +247,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         $extracted = Join-Path $stagedArchive 'Archive'
         Write-Host 'Распаковка ZIP перед проверкой и импортом...' -ForegroundColor Cyan
         Expand-ProfileArchive $zipToExpand $extracted
+        if ($plainFile) { [IO.File]::Delete($plainFile); $plainFile = $null }
         $archive = $extracted
     } else {
         if (Test-IsUncPath $archive) { Ensure-PathAvailable $archive 'Выбранный сетевой архив' }
@@ -454,10 +456,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     return $true
     } finally {
         if ($ownedPassword -and $ArchivePassword) { $ArchivePassword.Dispose() }
-        if ($plainDirectory) {
-            [IO.File]::Delete((Join-Path $plainDirectory 'profile.zip'))
-            [IO.Directory]::Delete($plainDirectory)
-        }
+        if ($plainFile -and [IO.File]::Exists($plainFile)) { [IO.File]::Delete($plainFile) }
     }
     } catch [System.OperationCanceledException] {
         # При остановке LoadState профиль мог быть создан частично.
