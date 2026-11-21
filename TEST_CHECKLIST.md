@@ -44,16 +44,25 @@ pwsh -NoLogo -NoProfile -NonInteractive -File tests/Check-Compatibility.ps1
 | --- | --- | --- |
 | Синтаксис и командлеты профиля 5.1 | PASS | Анализ отчитал 0 замечаний `PSUseCompatibleSyntax` и 0 `PSUseCompatibleCmdlets`. |
 | Windows Forms во время работы | BLOCKED | Четыре указания на `System.Windows.Forms.Screen`. Сборка загружается явно перед обращениями. Поведение реальных экранов проверяется в W16. |
-| Закрытая DACL на Windows | BLOCKED | Анализ указал на `IO.FileSystemAclExtensions` в ветке PowerShell Core. Windows PowerShell 5.1 использует перегрузку `Directory.CreateDirectory`. Создание и наследование проверяются в W22. |
+| Ветка PowerShell Core для DACL на Windows | BLOCKED | Анализ указал на `IO.FileSystemAclExtensions` в ветке PowerShell Core. Windows PowerShell 5.1 использует перегрузку `Directory.CreateDirectory`. Создание и наследование через Windows PowerShell 5.1 проверены в дополнительном прогоне ниже. Проверка доступа под отдельной учётной записью входит в W22. |
 | CMD и пути на Windows Server | PASS | `Windows drive root and UNC share remain absolute` и `CMD launcher forwards success and errors from a harmless fixture`. [Журнал GitHub Actions](https://github.com/Arhivater/WindowsProfileMigration/actions/runs/44786728590) |
+
+## Дополнительный прогон после публикации
+
+Проверки в `main` на коммите `23d2c68` используют исполняемые файлы релиза v1.10.1 без изменений. Добавлена проверка прав NTFS. [Журнал обеих систем](https://github.com/Arhivater/WindowsProfileMigration/actions/runs/44879715221)
+
+| Среда | Статус | Доказательство |
+| --- | --- | --- |
+| Windows 11 Enterprise ARM64, сборка 26200 | PASS | 76 из 76. Из повышенной консоли настоящий `Start.cmd` открыл меню. При вводе `0` процесс завершился с кодом 0. |
+| Windows Server 2022 x64 | PASS | 76 из 76 в Windows PowerShell 5.1. На обеих ОС проверены владелец, закрытая DACL рабочих каталогов и разрешения, унаследованные файлом журнала. |
 
 ## Стенд Windows
 
-ID и ожидаемые результаты описаны в `TESTING_GUIDE.md`. В текущей среде отсутствуют Windows 10/11, целевые профили, USMT, Active Directory и WinRM между двумя Windows-машинами.
+ID и ожидаемые результаты описаны в `TESTING_GUIDE.md`. Для сквозных сценариев требуются исходный и целевой ПК с тестовыми профилями, USMT и интерактивным входом. Для сетевой и доменной матриц требуются WinRM и тестовый домен.
 
 | ID | Проверка | Статус |
 | --- | --- | --- |
-| W01–W03 | UAC, выход, другой администратор, флешка, путь с кириллицей и UNC | BLOCKED |
+| W01–W03 | Интерактивный UAC, другой администратор, флешка и реальные сетевые пути. Запуск уже повышенного процесса и выход подтверждены выше. | BLOCKED |
 | W04 | Наличие и установка USMT с цифровыми подтверждениями | BLOCKED |
 | W05 | Экспорт одного пользователя и проверка содержимого USMT-хранилища | BLOCKED |
 | W06 | Проверка реальных ZIP и архивов-папок, включая образцы предыдущих схем | BLOCKED |
@@ -63,7 +72,7 @@ ID и ожидаемые результаты описаны в `TESTING_GUIDE.m
 | W17–W18 | Домашняя сеть, домены, FQDN, IP, аутентификация и WinRM | BLOCKED |
 | W19–W20 | Большой ZIP, обрыв сети и повторный вход в прерванный удалённый импорт | BLOCKED |
 | W21 | Получатель другой архитектуры и наличие нужного USMT | BLOCKED |
-| W22 | Владелец, ACL и доступ к рабочим данным со стандартной учётной записи | BLOCKED |
+| W22 | Доступ со стандартной учётной записи. Владелец, DACL и наследование файла журнала подтверждены выше. | BLOCKED |
 | Матрица ОС | Windows 10 → 10, Windows 10 → 11, Windows 11 → 11 | BLOCKED |
 | Матрица учётных записей | Локальная → локальная, доменная → доменная в одном или разных доменах, доменная → локальная | BLOCKED |
 | Большие реальные профили | Пропускная способность и восстановление связи в сети заказчика | NOT_TESTED |
