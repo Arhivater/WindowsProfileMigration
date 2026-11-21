@@ -88,7 +88,7 @@ Invoke-WpmTest 'Windows process arguments preserve account, UNC, spaces and quot
 }
 
 Invoke-WpmTest 'Bootstrap rejects empty launch folders and quotes trailing separators' {
-    . (Get-WpmFunctionDefinitions -ScriptName Bootstrap.ps1 -Name Resolve-OriginalFolder,Quote-LaunchPath)
+    . (Get-WpmFunctionDefinitions -ScriptName Bootstrap.ps1 -Name Get-NetworkDriveShare,Resolve-OriginalFolder,Quote-LaunchPath)
     Assert-WpmThrows { Resolve-OriginalFolder ' ' } 'папка комплекта'
     Assert-WpmEqual (Quote-LaunchPath 'C:\') '"C:\\"'
     Assert-WpmEqual (Quote-LaunchPath '\\host\Общая папка\') '"\\host\Общая папка\\"'
@@ -324,7 +324,7 @@ Invoke-WpmTest 'Report records warning, duration and final status; all progress 
 
 if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
     Invoke-WpmTest 'Windows drive root and UNC share remain absolute' {
-        . (Get-WpmFunctionDefinitions -ScriptName Bootstrap.ps1 -Name Resolve-OriginalFolder)
+        . (Get-WpmFunctionDefinitions -ScriptName Bootstrap.ps1 -Name Get-NetworkDriveShare,Resolve-OriginalFolder)
         $nativeRoot = [IO.Path]::GetPathRoot($env:SystemRoot)
         Assert-WpmEqual (Resolve-OriginalFolder $nativeRoot) $nativeRoot
         Assert-WpmEqual (Resolve-OriginalFolder '\\fixtures\Общая папка\каталог\') '\\fixtures\Общая папка\каталог'

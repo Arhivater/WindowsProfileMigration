@@ -77,6 +77,11 @@ function Get-AvailableArchives([string]$Root = $Script:BackupRoot) {
                 Account=[string]$meta.SourceAccount; Date=$date; Type=[string]$meta.AccountType; Schema=[int]$meta.SchemaVersion; Format='ZIP' }
         } catch { continue }
     }
+    foreach ($item in @(Get-ChildItem -LiteralPath $Root -File -Filter '*.wpm.pgp' -Force -ErrorAction SilentlyContinue)) {
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+        $list += [pscustomobject]@{Path=$item.FullName; Computer=''; Account=$item.Name; Date=$item.LastWriteTime;
+            Type='С паролем'; Schema=$null; Format='OpenPGP'}
+    }
     return @($list | Sort-Object Date -Descending)
 }
 function Show-DetectedArchives([object[]]$Archives) {

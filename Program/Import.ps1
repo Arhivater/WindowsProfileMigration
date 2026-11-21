@@ -187,7 +187,7 @@ function New-ImportLocalAccount([string]$LocalName, [string]$Target, [bool]$Unat
     return $targetSid
 }
 
-function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOverride = '',[string]$TargetOverride = '',[bool]$Unattended = $false) {
+function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOverride = '',[string]$TargetOverride = '',[bool]$Unattended = $false, [Security.SecureString]$ArchivePassword = $null) {
     $archive = if ($ArchiveOverride) { $ArchiveOverride } else { Select-Archive }
     if (-not $archive) { Write-OperationReport 'ОТМЕНА' 'Выбор архива отменён.'; return }
     $isZip = ([IO.Path]::GetExtension($archive) -ieq '.zip')
@@ -198,7 +198,22 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     $stagedArchive = $null
     $mutationLock = $null
     try {
+    $plainDirectory = $null
+    $ownedPassword = $false
+    try {
     Advance-OperationStage 'Архив выбран'
+    if (Test-WpmProtectedArchive $archive) {
+        if (-not $ArchivePassword) {
+            if ($Unattended) { throw 'Для защищённого архива нужен пароль.' }
+            $ArchivePassword = Read-WpmArchivePassword
+            $ownedPassword = $true
+        }
+        $plainDirectory = New-StagingDirectory 'ImportCache'
+        $plainFile = Join-Path $plainDirectory 'profile.zip'
+        Convert-WpmArchive $archive $plainFile $ArchivePassword -Decrypt
+        $archive = $plainFile
+        $isZip = $true
+    }
     if ($isZip) {
         $isNetworkZip = Test-IsUncPath $archive
         if ($isNetworkZip) { Ensure-PathAvailable $archive 'Сетевой ZIP' }
@@ -294,6 +309,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Дополнительные файлы пропущены: ' + $_.Exception.Message)
         Advance-OperationStage 'Дополнительные файлы исключены из импорта'
     }
+    Assert-PersonalFilesInventory $meta $approvedExtras
     if ($JustVerify) {
         if ([int]$meta.SchemaVersion -ge 5 -and $approvedExtras.Count -ne [int]$meta.ExtrasManifest.Files) {
             throw 'Проверка USMT завершена, но один или несколько дополнительных файлов не прошли проверку.'
@@ -359,6 +375,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     Invoke-ProfileLoad $Usmt $store $archive $map $logRoot $log
     $targetProfile = Get-TargetUserProfile $target
     if ($targetProfile.Sid -ne $targetSid) { throw 'SID восстановленного профиля отличается от подтверждённой учётной записи.' }
+    Restore-PersonalFiles $archive $targetProfile $meta $approvedExtras
     Advance-OperationStage 'Целевой профиль обнаружен'
     Update-TrackedState 'Профиль найден, выполняется проверка' @{TargetProfile=$targetProfile.Path}
     $validation = Validate-RestoredProfile $meta $targetProfile
@@ -435,6 +452,13 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     Finish-OperationReport ('ТЕХНИЧЕСКИ ЗАВЕРШЕНО; '+$validationStatus+'; ОЖИДАЕТ ПРИЁМКИ')
     Write-Host 'Не удаляйте источник и архив до проверки всех данных.' -ForegroundColor Yellow
     return $true
+    } finally {
+        if ($ownedPassword -and $ArchivePassword) { $ArchivePassword.Dispose() }
+        if ($plainDirectory) {
+            [IO.File]::Delete((Join-Path $plainDirectory 'profile.zip'))
+            [IO.Directory]::Delete($plainDirectory)
+        }
+    }
     } catch [System.OperationCanceledException] {
         # При остановке LoadState профиль мог быть создан частично.
         # Сохраняем состояние для пункта 4, но не удаляем учётную запись.

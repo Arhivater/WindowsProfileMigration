@@ -4,7 +4,8 @@
     'Initialize-WpmWorkDirectory','Assert-WpmWorkRoot',
     'Save-TrackedState','Get-TrackedStates','Read-BoundedArchiveMetadata','Enter-ProfileMutationLock','Assert-TrackedOperationStopped',
     'Assert-OperationTreeHasNoReparsePoint','Assert-SafeStaging','Resolve-ImportTarget',
-    'Select-ImportDestination','Assert-NoUnreviewedImport','Show-RecoveryMenu','Assert-RegularNetworkPartial',
+    'Select-ImportDestination','Assert-NoUnreviewedImport','Show-RecoveryMenu','Select-RecoveryRecord',
+    'Show-LegacyRecoveryRecord','Assert-RegularNetworkPartial',
     'Clear-NetworkPartial','Restore-PreviousDesktopLayout','Read-ExtraJson','Assert-ProfileExtraPath',
     'Get-ExtraStreamSha256','Test-ExtraPathComponent'
 ))

@@ -246,7 +246,7 @@ function Save-ProfileScopeProof($ListPath, $ProfilePath, $Archive, $Rules) {
         ListSHA256=(Get-ExactFileSha256 $scopeList)}
 }
 
-function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$ForcedRoot = '',[bool]$KeepReportOpen = $false,[bool]$AutoApprove = $false) {
+function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$ForcedRoot = '',[bool]$KeepReportOpen = $false,[bool]$AutoApprove = $false, [Security.SecureString]$ArchivePassword = $null) {
     $p = if ($SelectedProfile) { $SelectedProfile } else { Select-Profile }
     if (-not $p) { Write-OperationReport 'ОТМЕНА' 'Выбор профиля отменён.'; return }
     Advance-OperationStage 'Выбран исходный профиль'
@@ -262,10 +262,17 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
         return
     }
     Assert-ExportProfileReady $p 'перед оценкой файлов'
+    $ownedPassword = -not $PSBoundParameters.ContainsKey('ArchivePassword')
+    try {
+    $includeDocuments = Read-PersonalFilesChoice
+    if ($ownedPassword) { $ArchivePassword = Read-WpmExportPassword }
     Assert-NoReparseAncestor $p.Path
     Write-Host 'Оценка размера профиля...' -ForegroundColor Cyan
     $profileMetrics = Get-FolderMetrics $p.Path
     $estimatedBytes = [UInt64]$profileMetrics.Bytes
+    $personalFolders = Get-PersonalFolders $p.SID $p.Path $includeDocuments
+    $personalBytes = Measure-PersonalFiles $personalFolders $p.Path
+    $packageInputBytes = [UInt64]($estimatedBytes + $personalBytes)
     $baseline = Get-ProfileValidationBaseline $p.Path
     Advance-OperationStage 'Подсчитан размер исходного профиля'
     Write-Host ('Оценочный размер профиля: ' + (Format-ByteSize $estimatedBytes) + '; файлов: ' + $profileMetrics.Files) -ForegroundColor Green
@@ -277,11 +284,13 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
     $root = if ($ForcedRoot) { $ForcedRoot } else { Select-SaveLocation }
     if (-not $root) { Write-OperationReport 'ОТМЕНА' 'Выбор каталога сохранения отменён.'; return }
     Write-OperationReport 'ПУТЬ' ('Папка резервных копий: ' + $root)
-    Test-StoreLocation $root $p.Path $estimatedBytes
+    Test-StoreLocation $root $p.Path $packageInputBytes
     Advance-OperationStage 'Проверена папка назначения'
     $safe = $p.Account -replace '[^a-zA-Z0-9а-яА-ЯёЁ_-]', '_'
     $folderName = '{0}_{1}_{2}_{3}' -f $env:COMPUTERNAME,$safe,(Get-Date -Format 'yyyyMMdd_HHmmss_fff'),([guid]::NewGuid().ToString('N').Substring(0,8))
-    $finalArchive = Join-Path $root ($folderName + '.zip')
+    $extension = '.zip'
+    if ($ArchivePassword) { $folderName = 'Profile_' + [guid]::NewGuid().ToString('N'); $extension = '.wpm.pgp' }
+    $finalArchive = Join-Path $root ($folderName + $extension)
     Start-TrackedState 'Экспорт' $finalArchive
     $networkPublish = Test-IsUncPath $root
     if ($networkPublish) { Ensure-PathAvailable $root 'Сетевая папка архива' }
@@ -290,13 +299,13 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
     $stagingRoot = $Script:WpmStagingRoot
     $stagingDrive = [IO.Path]::GetPathRoot($stagingRoot)
     $stagingFree = Get-PathFreeBytes $stagingDrive
-    $stagingNeeded = [UInt64]([double]$estimatedBytes * 2.2 + [double]1GB)
+    $stagingNeeded = [UInt64]([double]$packageInputBytes * $(if ($ArchivePassword) { 3.3 } else { 2.2 }) + [double]1GB)
     if ($stagingFree -lt $stagingNeeded) {
         throw ('Недостаточно места для создания ZIP на ' + $stagingDrive +
             '. Нужно примерно ' + (Format-ByteSize $stagingNeeded) +
             ', доступно ' + (Format-ByteSize $stagingFree) + '.')
     }
-    $staging = New-StagingDirectory ('Export_' + $folderName)
+    $staging = New-StagingDirectory 'Export'
     $archive = Join-Path $staging 'Payload'
     Update-TrackedState 'Подготовка экспорта' @{StagingPath=$staging; StagingPurpose='Создание ZIP'}
     [void](New-Item -ItemType Directory -Path $archive -ErrorAction Stop)
@@ -355,6 +364,7 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
     Advance-OperationStage 'Сохранены дополнительные настройки Проводника, 1С и дисков'
     Write-OperationReport 'НАСТРОЙКИ' ('Расположение значков: ' + $(if ($layoutSaved) { 'сохранено (без гарантии восстановления на другом мониторе)' } else { 'не сохранено' }))
     Assert-ExportProfileReady $p 'перед повторной сверкой'
+    $personalFiles = Export-PersonalFiles $p $archive $includeDocuments $personalFolders
     Write-Host 'Повторная сверка SHA-256 источника ПОСЛЕ ScanState...' -ForegroundColor Cyan
     $consistency = Assert-ValidationSourceStable $p.Path $archive $manifest
     Assert-ExportProfileReady $p 'после повторной сверки'
@@ -370,20 +380,26 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
         SourceVersion=$os.Version; CreatedAt=(Get-Date).ToString('o'); StoreFolder='Store'; BrowserFiles=$browserCount;
         DesktopLayoutSaved=$layoutSaved; EstimatedProfileBytes=$estimatedBytes; EstimatedProfileFiles=$profileMetrics.Files;
         ArchiveBytes=[UInt64]$archiveMetrics.Bytes; ValidationBaseline=$baseline; ValidationManifest=$manifest; ValidationConsistency=$consistency; ExtrasManifest=$extrasManifest;
-        ProfileScope=$scopeProof }
+        ProfileScope=$scopeProof; PersonalFiles=$personalFiles }
     $meta | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $archive 'metadata.json') -Encoding UTF8
     Advance-OperationStage 'Созданы метаданные и манифест Extras'
     Write-OperationReport 'УСПЕХ' ('Метаданные архива записаны. Браузерных файлов сохранено: ' + $browserCount)
     Write-OperationReport 'ЖУРНАЛ USMT' ('Технические файлы: ' + $exportLogs)
     # ZIP создаётся рядом с рабочим каталогом, затем передаётся в целевую
     # папку под временным именем. Только после проверки SHA-256 переименовываем.
-    $partialName = ($folderName + '.zip.partial_' + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $partialName = ($folderName + $extension + '.partial_' + [guid]::NewGuid().ToString('N').Substring(0,8))
     $localZip = Join-Path $staging $partialName
     $publishedPartial = Join-Path $root $partialName
     try {
         Write-Host 'Упаковка экспортированного профиля в один ZIP...' -ForegroundColor Cyan
         Update-TrackedState 'Упаковка ZIP'
-        Compress-ProfileArchive $archive $localZip
+        if ($ArchivePassword) {
+            $plain = Join-Path $staging 'profile.zip'
+            try {
+                Compress-ProfileArchive $archive $plain
+                Convert-WpmArchive $plain $localZip $ArchivePassword
+            } finally { [IO.File]::Delete($plain) }
+        } else { Compress-ProfileArchive $archive $localZip }
         Advance-OperationStage 'ZIP упакован и проверен'
         Update-TrackedState 'Публикация ZIP' @{NetworkPartialPath=$publishedPartial}
         Ensure-PathAvailable $root 'Папка назначения'
@@ -420,4 +436,5 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
         Write-Host 'Для импорта запустите этот же Start.cmd на другом устройстве (или скопируйте весь комплект с Backups).'
     }
     return $archive
+    } finally { if ($ownedPassword -and $ArchivePassword) { $ArchivePassword.Dispose() } }
 }

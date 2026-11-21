@@ -251,7 +251,7 @@ function Clear-TrackedStaging([hashtable]$State,[bool]$Ask = $false) {
 function Assert-RegularNetworkPartial([string]$Path) {
     $file = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     if ($file -isnot [IO.FileInfo] -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-        throw 'Незавершённый ZIP должен быть обычным файлом. Очистка запрещена.'
+        throw 'Незавершённый архив должен быть обычным файлом. Очистка запрещена.'
     }
 }
 
@@ -264,10 +264,12 @@ function Clear-NetworkPartial([hashtable]$State,[bool]$Ask = $true) {
     $parent=[IO.Path]::GetDirectoryName($final)
     $finalName = [IO.Path]::GetFileName($final)
     $partialPattern = '^' + [regex]::Escape($finalName) + '\.partial_[a-f0-9]{8}$'
-    if ([IO.Path]::GetExtension($finalName) -ine '.zip' -or
+    $knownArchive = $finalName.EndsWith('.zip', [StringComparison]::OrdinalIgnoreCase) -or
+        $finalName.EndsWith('.wpm.pgp', [StringComparison]::OrdinalIgnoreCase)
+    if (-not $knownArchive -or
         [IO.Path]::GetDirectoryName($temp) -ine $parent -or
         [IO.Path]::GetFileName($temp) -notmatch $partialPattern) {
-        throw 'Подозрительное имя незавершённого ZIP. Очистка запрещена.'
+        throw 'Подозрительное имя незавершённого архива. Очистка запрещена.'
     }
     Assert-WpmDirectoryChain $parent
     if (Test-Path -LiteralPath $temp -ErrorAction Stop) {
@@ -285,8 +287,9 @@ function Clear-NetworkPartial([hashtable]$State,[bool]$Ask = $true) {
     Write-Host 'Незавершённая копия удалена.' -ForegroundColor Green
     return $true
 }
-function Show-RecoveryMenu {
-    Title 'СОСТОЯНИЕ ОПЕРАЦИЙ И УПРАВЛЯЕМАЯ ОЧИСТКА'
+
+# Показываем операции, чтобы пользователь выбрал одну запись или вернулся назад.
+function Select-RecoveryRecord {
     $items = @(
         foreach ($record in @(Get-TrackedStates)) { [pscustomobject]@{State=$record;Legacy=$false} }
         foreach ($record in @(Get-TrackedStates -Legacy)) { [pscustomobject]@{State=$record;Legacy=$true} }
@@ -304,32 +307,34 @@ function Show-RecoveryMenu {
     Write-Host '0. Назад'
     $index=Choice 'Номер операции' $items.Count
     if ($index -eq 0) { return }
-    $selection = $items[$index-1]
-    $state = $selection.State
-    Title ('ОПЕРАЦИЯ ' + $state.Id)
-    if ($selection.Legacy) {
-        foreach ($field in @('Kind','Status','LastUpdated','SourceArchive','TargetAccount','StagingPath','NetworkPartialPath','DesktopBackup','LastError')) {
-            if ($state.PSObject.Properties[$field] -and $state.$field) {
-                Write-Host ($field + ': ' + ([string]$state.$field -replace '[\x00-\x1F\x7F-\x9F]', '?'))
-            }
+    return $items[$index-1]
+}
+
+# Записи старого формата разрешено открывать только для просмотра.
+function Show-LegacyRecoveryRecord($State) {
+    foreach ($field in @('Kind','Status','LastUpdated','SourceArchive','TargetAccount','StagingPath','NetworkPartialPath','DesktopBackup','LastError')) {
+        if ($State.PSObject.Properties[$field] -and $State.$field) {
+            Write-Host ($field + ': ' + ([string]$State.$field -replace '[\x00-\x1F\x7F-\x9F]', '?'))
         }
-        Write-Host 'Старая запись доступна для просмотра. Проверьте перечисленные данные средствами Windows.'
-        return
     }
-    Write-Host ('Результат: ' + $state.Status)
-    Write-Host ('Исходный архив: ' + $state.SourceArchive)
-    Write-Host ('Целевая учётная запись: ' + $state.TargetAccount)
-    Write-Host ('Профиль: ' + $state.TargetProfile)
-    Write-Host ('Создана программой: ' + $state.CreatedByTool)
-    Write-Host ('Временная копия: ' + $state.StagingPath)
-    Write-Host ('Незавершённая публикация архива: ' + $state.NetworkPartialPath)
-    Write-Host ('Резерв значков: ' + $state.DesktopBackup)
+    Write-Host 'Старая запись доступна для просмотра. Проверьте перечисленные данные средствами Windows.'
+}
+
+function Read-RecoveryAction($State) {
+    Write-Host ('Результат: ' + $State.Status)
+    Write-Host ('Исходный архив: ' + $State.SourceArchive)
+    Write-Host ('Целевая учётная запись: ' + $State.TargetAccount)
+    Write-Host ('Профиль: ' + $State.TargetProfile)
+    Write-Host ('Создана программой: ' + $State.CreatedByTool)
+    Write-Host ('Временная копия: ' + $State.StagingPath)
+    Write-Host ('Незавершённая публикация архива: ' + $State.NetworkPartialPath)
+    Write-Host ('Резерв значков: ' + $State.DesktopBackup)
     foreach ($entry in @(@('BrowserBackupPath','Резерв браузеров'),@('ConfigBackupPath','Резерв настроек'))) {
-        if ($state.PSObject.Properties[$entry[0]] -and $state.($entry[0])) {
-            Write-Host ($entry[1] + ': ' + $state.($entry[0]))
+        if ($State.PSObject.Properties[$entry[0]] -and $State.($entry[0])) {
+            Write-Host ($entry[1] + ': ' + $State.($entry[0]))
         }
     }
-    if ($state.LastError) { Write-Host ('Ошибка: ' + $state.LastError) -ForegroundColor Yellow }
+    if ($State.LastError) { Write-Host ('Ошибка: ' + $State.LastError) -ForegroundColor Yellow }
     Write-Host 'Перед повторным импортом проверьте, что учётная запись назначения и её каталог не содержат данных.'
     Write-Host '1. Удалить зарегистрированную временную копию'
     Write-Host '2. Удалить только созданную программой локальную учётную запись без профиля'
@@ -337,84 +342,84 @@ function Show-RecoveryMenu {
     Write-Host '4. Удалить незавершённую копию архива'
     Write-Host '5. Подтвердить возможность повторного импорта'
     Write-Host '0. Назад'
-    $action = Choice 'Выберите действие' 5
-    if ($action -eq 0) { return }
-    $id = $state.Id
+    return (Choice 'Выберите действие' 5)
+}
+
+# Повторно проверяем SID и отсутствие профиля прямо перед удалением пустой учётной записи.
+function Remove-RecoveryAccount($State, [hashtable]$Changes) {
+    if ($State.Kind -ne 'Импорт' -or -not $State.CreatedByTool -or -not $State.CreatedAccount -or
+        -not $State.CreatedSid -or $State.USMTStarted) {
+        throw 'Допускается удаление только подтверждённой учётной записи до запуска LoadState.'
+    }
+    $computer,$name = [string]$State.CreatedAccount -split '\\',2
+    if ($computer -ine $env:COMPUTERNAME -or -not $name) { throw 'Учётная запись не локальная.' }
+    $account = Get-ImportLocalUser $name
+    if (-not $account -or $account.SID.Value -ne [string]$State.CreatedSid) {
+        throw 'Локальный пользователь отсутствует или его SID уже отличается от зарегистрированного.'
+    }
+    Assert-ImportProfileUnused $account.SID.Value $account.Name
+    if (-not (Confirm ('Удалить только пустую учётную запись ' + $State.CreatedAccount + ' ?'))) { return $false }
+    if (-not (Confirm 'Повторное подтверждение удаления учётной записи')) { return $false }
+    $account = Get-ImportLocalUser $name
+    if (-not $account -or $account.SID.Value -ne [string]$State.CreatedSid) {
+        throw 'Учётная запись изменилась после подтверждения.'
+    }
+    Assert-ImportProfileUnused $account.SID.Value $account.Name
+    Remove-LocalUser -SID $account.SID -ErrorAction Stop
+    $Changes.Status = 'Пустая учётная запись удалена по подтверждению'
+    $Changes.CreatedByTool = $false
+    Save-TrackedState $Changes
+    Write-Host 'Пустая учётная запись удалена.' -ForegroundColor Green
+    return $true
+}
+
+# Сверяем идентификатор учётной записи с тем, который был сохранён при импорте.
+function Resolve-RecoveryTarget($State) {
+    $recordedSid = if ($State.PSObject.Properties['TargetSid']) { [string]$State.TargetSid } else { [string]$State.CreatedSid }
+    $identity = [pscustomobject]@{SourceAccount=$State.TargetAccount;SourceSid=$recordedSid;AccountType='Domain'}
+    $target = Resolve-ImportTarget $identity $State.TargetAccount
+    if ($recordedSid -and $target.Sid -and $recordedSid -ne $target.Sid) {
+        throw 'SID назначения отличается от сохранённого. Проверьте учётную запись вручную.'
+    }
+    return $target
+}
+
+# Пользователь сверяет профиль и подтверждает повторную попытку. Запоминаем только подтверждённый выбор.
+function Confirm-ImportRetry($State, [hashtable]$Changes) {
+    $pending = $State.PSObject.Properties['AccountCreationPending'] -and $State.AccountCreationPending -eq $true
+    if ($State.Kind -ne 'Импорт' -or -not $State.TargetAccount -or (-not $State.USMTStarted -and -not $pending)) {
+        throw 'Нет незавершённой записи, требующей проверки перед повторным импортом.'
+    }
+    if ($State.PSObject.Properties['RecoveryReviewed'] -and $State.RecoveryReviewed -eq $true) {
+        Write-Host 'Возможность повторного импорта уже подтверждена.'
+        return $false
+    }
+    $target = Resolve-RecoveryTarget $State
+    $possibleLocalName = if ($target.Local) { $target.Name } else { '' }
+    Assert-ImportProfileUnused $target.Sid $possibleLocalName
+    if (-not (Confirm ('Разрешить повторный импорт для ' + $State.TargetAccount + ' после ручной проверки?'))) { return $false }
+    Assert-ImportProfileUnused $target.Sid $possibleLocalName
+    $Changes.RecoveryReviewed = $true
+    Save-TrackedState $Changes
+    Write-Host 'Проверка записана. Импорт можно заново запустить через главное меню.' -ForegroundColor Green
+    return $true
+}
+
+# Сначала берём блокировку, затем заново читаем состояние. Другая операция могла изменить его, пока меню было открыто.
+function Invoke-TrackedRecovery([string]$Id, [int]$Action) {
     $lock = $null
     try {
         Start-OperationReport 'ВОССТАНОВЛЕНИЕ'
-        Write-OperationReport 'ДЕЙСТВИЕ' ('Операция ' + $id + ', пункт ' + $action)
+        Write-OperationReport 'ДЕЙСТВИЕ' ('Операция ' + $Id + ', пункт ' + $Action)
         $lock = Enter-ProfileMutationLock
-        $state = Get-TrackedStates -RequireReadable -Id $id
+        $state = Get-TrackedStates -RequireReadable -Id $Id
         if (-not $state) { throw 'Запись выбранной операции больше недоступна.' }
         Assert-TrackedOperationStopped $state
-        $hash = @{}
-        foreach ($property in $state.PSObject.Properties) { $hash[$property.Name] = $property.Value }
-        switch ($action) {
-            1 {
-                if (-not $state.StagingPath -or $state.CleanupDone) { Write-Host 'Временной копии нет.'; return }
-                if (-not (Clear-TrackedStaging $hash $true)) { return }
-            }
-            2 {
-                if ($state.Kind -ne 'Импорт' -or -not $state.CreatedByTool -or -not $state.CreatedAccount -or
-                    -not $state.CreatedSid -or $state.USMTStarted) {
-                    throw 'Допускается удаление только подтверждённой учётной записи до запуска LoadState.'
-                }
-                $computer,$name = [string]$state.CreatedAccount -split '\\',2
-                if ($computer -ine $env:COMPUTERNAME -or -not $name) { throw 'Учётная запись не локальная.' }
-                $account = Get-ImportLocalUser $name
-                if (-not $account -or $account.SID.Value -ne [string]$state.CreatedSid) {
-                    throw 'Локальный пользователь отсутствует или его SID уже отличается от зарегистрированного.'
-                }
-                Assert-ImportProfileUnused $account.SID.Value $account.Name
-                if (-not (Confirm ('Удалить только пустую учётную запись ' + $state.CreatedAccount + ' ?'))) { return }
-                if (-not (Confirm 'Повторное подтверждение удаления учётной записи')) { return }
-                $account = Get-ImportLocalUser $name
-                if (-not $account -or $account.SID.Value -ne [string]$state.CreatedSid) {
-                    throw 'Учётная запись изменилась после подтверждения.'
-                }
-                Assert-ImportProfileUnused $account.SID.Value $account.Name
-                Remove-LocalUser -SID $account.SID -ErrorAction Stop
-                $hash.Status = 'Пустая учётная запись удалена по подтверждению'
-                $hash.CreatedByTool = $false
-                Save-TrackedState $hash
-                Write-Host 'Пустая учётная запись удалена.' -ForegroundColor Green
-            }
-            3 {
-                if (-not $state.DesktopBackup) { Write-Host 'Резервной копии значков нет.'; return }
-                if (-not $state.PSObject.Properties['DesktopBackupSha256'] -or -not $state.DesktopBackupSha256) {
-                    throw 'Для резервной копии отсутствует зарегистрированная контрольная сумма.'
-                }
-                if (-not (Restore-PreviousDesktopLayout ([string]$state.DesktopBackup) ([string]$state.DesktopBackupSha256))) { return }
-            }
-            4 {
-                if (-not $state.NetworkPartialPath) { Write-Host 'Незавершённой копии нет.'; return }
-                if (-not (Clear-NetworkPartial $hash)) { return }
-            }
-            5 {
-                $pending = $state.PSObject.Properties['AccountCreationPending'] -and $state.AccountCreationPending -eq $true
-                if ($state.Kind -ne 'Импорт' -or -not $state.TargetAccount -or (-not $state.USMTStarted -and -not $pending)) {
-                    throw 'Нет незавершённой записи, требующей проверки перед повторным импортом.'
-                }
-                if ($state.PSObject.Properties['RecoveryReviewed'] -and $state.RecoveryReviewed -eq $true) {
-                    Write-Host 'Возможность повторного импорта уже подтверждена.'; return
-                }
-                $recordedSid = if ($state.PSObject.Properties['TargetSid']) { [string]$state.TargetSid } else { [string]$state.CreatedSid }
-                $identity = [pscustomobject]@{SourceAccount=$state.TargetAccount;SourceSid=$recordedSid;AccountType='Domain'}
-                $target = Resolve-ImportTarget $identity $state.TargetAccount
-                if ($recordedSid -and $target.Sid -and $recordedSid -ne $target.Sid) {
-                    throw 'SID назначения отличается от сохранённого. Проверьте учётную запись вручную.'
-                }
-                $possibleLocalName = if ($target.Local) { $target.Name } else { '' }
-                Assert-ImportProfileUnused $target.Sid $possibleLocalName
-                if (-not (Confirm ('Разрешить повторный импорт для ' + $state.TargetAccount + ' после ручной проверки?'))) { return }
-                Assert-ImportProfileUnused $target.Sid $possibleLocalName
-                $hash.RecoveryReviewed = $true
-                Save-TrackedState $hash
-                Write-Host 'Проверка записана. Импорт можно заново запустить через главное меню.' -ForegroundColor Green
-            }
+        $changes = @{}
+        foreach ($property in $state.PSObject.Properties) { $changes[$property.Name] = $property.Value }
+        if (Invoke-RecoveryAction $Action $state $changes) {
+            Finish-OperationReport 'УСПЕШНО'
         }
-        Finish-OperationReport 'УСПЕШНО'
     } catch {
         $Script:HadFailures = $true
         Write-OperationReport 'ОШИБКА' $_.Exception.Message
@@ -425,4 +430,40 @@ function Show-RecoveryMenu {
         if ($null -ne $lock) { $lock.Dispose() }
         if ($Script:ReportPath) { Finish-OperationReport 'ОТМЕНЕНО / НЕ ЗАВЕРШЕНО' }
     }
+}
+
+function Invoke-RecoveryAction([int]$Action, $State, [hashtable]$Changes) {
+    switch ($Action) {
+        1 {
+            if (-not $State.StagingPath -or $State.CleanupDone) { Write-Host 'Временной копии нет.'; return $false }
+            return (Clear-TrackedStaging $Changes $true)
+        }
+        2 { return (Remove-RecoveryAccount $State $Changes) }
+        3 {
+            if (-not $State.DesktopBackup) { Write-Host 'Резервной копии значков нет.'; return $false }
+            if (-not $State.PSObject.Properties['DesktopBackupSha256'] -or -not $State.DesktopBackupSha256) {
+                throw 'Для резервной копии отсутствует зарегистрированная контрольная сумма.'
+            }
+            return (Restore-PreviousDesktopLayout ([string]$State.DesktopBackup) ([string]$State.DesktopBackupSha256))
+        }
+        4 {
+            if (-not $State.NetworkPartialPath) { Write-Host 'Незавершённой копии нет.'; return $false }
+            return (Clear-NetworkPartial $Changes)
+        }
+        5 { return (Confirm-ImportRetry $State $Changes) }
+    }
+}
+
+function Show-RecoveryMenu {
+    Title 'СОСТОЯНИЕ ОПЕРАЦИЙ И УПРАВЛЯЕМАЯ ОЧИСТКА'
+    $selection = Select-RecoveryRecord
+    if (-not $selection) { return }
+    $state = $selection.State
+    Title ('ОПЕРАЦИЯ ' + $state.Id)
+    if ($selection.Legacy) {
+        Show-LegacyRecoveryRecord $state
+        return
+    }
+    $action = Read-RecoveryAction $state
+    if ($action -ne 0) { Invoke-TrackedRecovery $state.Id $action }
 }

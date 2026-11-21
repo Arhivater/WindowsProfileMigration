@@ -7,7 +7,8 @@
 param(
     [string]$ToolRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$RemoteImportArchive = '',
-    [string]$RemoteTargetAccount = ''
+    [string]$RemoteTargetAccount = '',
+    [switch]$RemotePasswordFromInput
 )
 
 Set-StrictMode -Version Latest
@@ -38,7 +39,7 @@ $Script:WpmStagingRoot = Join-Path $Script:WpmWorkRoot 'Staging'
 $Script:LegacyOpStateRoot = Join-Path $env:ProgramData 'WindowsProfileMigration\Operations'
 
 # Загружаем только перечисленные части программы из папки рядом с этим файлом.
-$runtimeFiles = @(
+$Script:WpmRuntimeFiles = @(
     'Reporting.ps1'
     'Recovery.ps1'
     'Console.ps1'
@@ -54,9 +55,11 @@ $runtimeFiles = @(
     'ArchiveSelection.ps1'
     'Import.ps1'
     'Network.ps1'
+    'Encryption.ps1'
+    'UserFiles.ps1'
     'MainMenu.ps1'
 )
-foreach ($file in $runtimeFiles) {
+foreach ($file in $Script:WpmRuntimeFiles) {
     . (Join-Path $PSScriptRoot $file)
 }
 

@@ -12,21 +12,29 @@ try {
     }
     # Этот режим вызывается только из предварительно подтверждённой сессии
     # удалённого развертывания. Ни одного интерактивного запроса в этой ветке.
-    if ($RemoteImportArchive -or $RemoteTargetAccount) {
+    if ($RemoteImportArchive -or $RemoteTargetAccount -or $RemotePasswordFromInput) {
         if (-not $RemoteImportArchive -or -not $RemoteTargetAccount) { throw 'Параметры удалённого импорта неполные.' }
+        $isProtected = Test-WpmProtectedArchive $RemoteImportArchive
         if (-not (Test-Path -LiteralPath $RemoteImportArchive -PathType Leaf) -or
-            [IO.Path]::GetExtension($RemoteImportArchive) -ine '.zip') { throw 'Не найден локальный ZIP удалённого переноса.' }
+            (-not $isProtected -and [IO.Path]::GetExtension($RemoteImportArchive) -ine '.zip')) {
+            throw 'Не найден локальный архив удалённого переноса.'
+        }
+        if ($isProtected -ne [bool]$RemotePasswordFromInput) { throw 'Режим передачи пароля не соответствует архиву.' }
         $remoteUsmt = Get-UsmtPath
         if (-not $remoteUsmt) { throw 'На целевом компьютере USMT отсутствует. Требуется установка или передача комплекта.' }
         Start-OperationReport 'ИМПОРТ'
+        $remotePassword = $null
         try {
-            $importCompleted = Do-Import $remoteUsmt $false $RemoteImportArchive $RemoteTargetAccount $true
+            if ($isProtected) { $remotePassword = Read-RemoteArchivePassword }
+            $importCompleted = Do-Import $remoteUsmt $false $RemoteImportArchive $RemoteTargetAccount $true -ArchivePassword $remotePassword
             if ($importCompleted -ne $true) { throw 'Удалённый импорт завершился без подтверждения результата.' }
             exit 0
         } catch {
             Write-DiagnosticFailure $_ 'Удалённый автоматический импорт'
             Finish-OperationReport 'СБОЙ УДАЛЁННОГО ИМПОРТА'
             throw
+        } finally {
+            if ($remotePassword) { $remotePassword.Dispose() }
         }
     }
     Invoke-InteractiveMenu

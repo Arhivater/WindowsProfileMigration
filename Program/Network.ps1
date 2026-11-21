@@ -34,23 +34,30 @@ function Select-DirectTransferArchive {
     foreach ($root in $roots) {
         if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
         Assert-WpmDirectoryChain $root
-        foreach ($file in @(Get-ChildItem -LiteralPath $root -File -Filter '*.zip' -ErrorAction Stop | Sort-Object LastWriteTime -Descending)) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $root -File -ErrorAction Stop | Where-Object {
+            $_.Extension -ieq '.zip' -or (Test-WpmProtectedArchive $_.Name)
+        } | Sort-Object LastWriteTime -Descending)) {
             try {
-                $info = Get-ProfileZipInfo $file.FullName
-                Assert-ArchiveMetadata $info.Metadata $true
+                if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                $account = 'Защищённый архив'
+                if ($file.Extension -ieq '.zip') {
+                    $info = Get-ProfileZipInfo $file.FullName
+                    Assert-ArchiveMetadata $info.Metadata $true
+                    $account = [string]$info.Metadata.SourceAccount
+                }
                 $files += [pscustomobject]@{Path=$file.FullName;Name=$file.Name;
-                    User=[string]$info.Metadata.SourceAccount;Size=$file.Length;Date=$file.LastWriteTime}
+                    User=$account;Size=$file.Length;Date=$file.LastWriteTime}
             } catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Неполный/повреждённый ZIP пропущен: ' + $file.Name + ': ' + $_.Exception.Message) }
         }
     }
     Title 'ПОВТОР ПРЕРВАННОГО СЕТЕВОГО ПЕРЕНОСА'
-    if ($files.Count -eq 0) { Write-Host 'Готовых ZIP для продолжения нет.' -ForegroundColor Yellow; return $null }
+    if ($files.Count -eq 0) { Write-Host 'Готовых архивов для продолжения нет.' -ForegroundColor Yellow; return $null }
     for ($i=0;$i -lt $files.Count;$i++) {
         Write-Host ('{0}. {1} | {2} | {3} | {4:dd.MM.yyyy HH:mm}' -f ($i+1),$files[$i].User,$files[$i].Name,
             (Format-ByteSize ([UInt64]$files[$i].Size)),$files[$i].Date)
     }
     Write-Host '0. Назад'
-    $choice = Choice 'Выберите готовый ZIP' $files.Count
+    $choice = Choice 'Выберите готовый архив' $files.Count
     if ($choice -eq 0) { return $null }
     return $files[$choice-1].Path
 }
@@ -338,9 +345,94 @@ function Enter-RemoteMigration([object]$Session,[string]$Root,[string]$Hash,[str
     }
 }
 
-function Invoke-RemoteProfileImport([object]$Session,[string]$Root,[string]$Archive,[string]$Account,[string]$Hash) {
-    Invoke-Command -Session $Session -ArgumentList $Root,$Archive,$Account,$Hash -ErrorAction Stop -ScriptBlock {
-        param($root,$zip,$account,$hash)
+# На получатель уходит только запускаемый комплект. Отчёты и бэкапы соседних операций остаются на источнике.
+function Copy-RemoteMigrationProgram([object]$Session, [string]$RemoteRoot) {
+    $paths = @('start.cmd', 'Program\Bootstrap.ps1', 'Program\ProfileMigration.ps1',
+        'Program\OpenPgpArchive.cs', 'Program\Vendor\BouncyCastle.Cryptography.dll', 'Program\Vendor\BouncyCastle-LICENSE.md')
+    $paths += @($Script:WpmRuntimeFiles | ForEach-Object { 'Program\' + $_ })
+    $files = foreach ($relative in $paths) {
+        $source = Join-Path $Script:ToolRoot $relative
+        Assert-WpmDirectoryChain ([IO.Path]::GetDirectoryName($source))
+        $item = Get-Item -LiteralPath $source -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw ('Файл программы подменён каталогом или ссылкой: ' + $relative)
+        }
+        [pscustomobject]@{ Relative=$relative; Hash=(Get-FileHash -LiteralPath $source -Algorithm SHA256 -ErrorAction Stop).Hash }
+    }
+
+    # Доступ к папке уже ограничен, а import.lock исключает второй сеанс во время замены программы.
+    Invoke-Command -Session $Session -ArgumentList $RemoteRoot,$files -ErrorAction Stop -ScriptBlock {
+        param($root,$manifest)
+        foreach ($subdir in @('Program','Program\Vendor')) {
+            $path = Join-Path $root $subdir
+            [void][IO.Directory]::CreateDirectory($path)
+            $dir = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+            if (-not $dir.PSIsContainer -or ($dir.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw ('Неожиданный каталог комплекта на получателе: ' + $subdir)
+            }
+        }
+        foreach ($file in $manifest) {
+            $ready = Join-Path $root $file.Relative
+            $pending = $ready + '.incoming'
+            foreach ($path in @($ready,$pending)) {
+                if (Test-Path -LiteralPath $path) {
+                    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+                    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                        throw ('Неожиданный объект в папке программы на получателе: ' + $file.Relative)
+                    }
+                }
+            }
+            [IO.File]::Delete($pending)
+        }
+    }
+    foreach ($file in $files) {
+        $source = Join-Path $Script:ToolRoot $file.Relative
+        $pending = [IO.Path]::Combine($RemoteRoot, $file.Relative + '.incoming')
+        Copy-Item -LiteralPath $source -Destination $pending -ToSession $Session -ErrorAction Stop
+    }
+    Invoke-Command -Session $Session -ArgumentList $RemoteRoot,$files -ErrorAction Stop -ScriptBlock {
+        param($root,$manifest)
+        # Сначала проверяем весь комплект, затем публикуем каждый файл атомарной заменой.
+        foreach ($file in $manifest) {
+            $pending = (Join-Path $root $file.Relative) + '.incoming'
+            if ((Get-FileHash -LiteralPath $pending -Algorithm SHA256 -ErrorAction Stop).Hash -ne $file.Hash) {
+                throw ('SHA-256 переданного файла не совпал: ' + $file.Relative)
+            }
+        }
+        foreach ($file in $manifest) {
+            $ready = Join-Path $root $file.Relative
+            $pending = $ready + '.incoming'
+            if ([IO.File]::Exists($ready)) { [IO.File]::Replace($pending,$ready,[NullString]::Value) }
+            else { [IO.File]::Move($pending,$ready) }
+        }
+    }
+}
+
+# Пароль поступает только по анонимному каналу от родительского процесса на этой же машине.
+function Read-RemoteArchivePassword {
+    if (-not [Console]::IsInputRedirected) { throw 'Закрытый канал пароля недоступен.' }
+    $reader = [IO.BinaryReader]::new([Console]::OpenStandardInput())
+    $secret = [Security.SecureString]::new()
+    try {
+        $length = $reader.ReadInt32()
+        if ($length -le 0 -or $length -gt 65536) { throw 'Не удалось получить пароль архива.' }
+        for ($index = 0; $index -lt $length; $index++) { $secret.AppendChar([char]$reader.ReadUInt16()) }
+        $secret.MakeReadOnly()
+        return $secret
+    } catch {
+        $secret.Dispose()
+        throw
+    } finally { $reader.Dispose() }
+}
+
+function Invoke-RemoteProfileImport([object]$Session,[string]$Root,[string]$Archive,[string]$Account,
+    [string]$Hash,[Security.SecureString]$ArchivePassword) {
+    $scriptPath = [IO.Path]::Combine($Root,'Program','ProfileMigration.ps1')
+    $arguments = @('-File',$scriptPath,'-ToolRoot',$Root,'-RemoteImportArchive',$Archive,
+        '-RemoteTargetAccount',$Account,'-RemotePasswordFromInput')
+    $childArguments = ($arguments | ForEach-Object { Quote-WindowsArgument $_ }) -join ' '
+    Invoke-Command -Session $Session -ArgumentList $Root,$Archive,$Account,$Hash,$ArchivePassword,$childArguments,$Script:WpmRuntimeFiles -ErrorAction Stop -ScriptBlock {
+        param($root,$zip,$account,$hash,[Security.SecureString]$password,$childArguments,$modules)
         function Get-MigrationLaunchOptions([string]$Script) {
             $policy = Get-ExecutionPolicy -ErrorAction Stop
             $options = @('-NoProfile','-NonInteractive')
@@ -372,6 +464,37 @@ function Invoke-RemoteProfileImport([object]$Session,[string]$Root,[string]$Arch
             }
             return $options
         }
+        function Invoke-PasswordImportProcess([string]$Binary,[string[]]$Options,[string]$Arguments,[Security.SecureString]$Secret) {
+            $start = [Diagnostics.ProcessStartInfo]::new()
+            $start.FileName = $Binary
+            $start.Arguments = ($Options -join ' ') + ' ' + $Arguments
+            $start.UseShellExecute = $false
+            $start.CreateNoWindow = $true
+            $start.RedirectStandardInput = $true
+            $start.RedirectStandardOutput = $true
+            $start.RedirectStandardError = $true
+            $child = [Diagnostics.Process]::Start($start)
+            try {
+                # Основной скрипт сохраняет подробный отчёт на получателе. Читаем оба потока, чтобы они не заблокировали импорт.
+                $output = $child.StandardOutput.BaseStream.CopyToAsync([IO.Stream]::Null)
+                $errors = $child.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
+                $pipe = [IO.BinaryWriter]::new($child.StandardInput.BaseStream)
+                try {
+                    $address = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secret)
+                    try {
+                        $pipe.Write([int]$Secret.Length)
+                        for ($i = 0; $i -lt $Secret.Length; $i++) {
+                            $unit = [Runtime.InteropServices.Marshal]::ReadInt16($address, $i * 2)
+                            $pipe.Write([uint16]([int]$unit -band 0xffff))
+                        }
+                    } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($address) }
+                } finally { $pipe.Dispose() }
+                $child.WaitForExit()
+                [void]$output.GetAwaiter().GetResult()
+                [void]$errors.GetAwaiter().GetResult()
+                return $child.ExitCode
+            } finally { $child.Dispose() }
+        }
         function Write-ImportMarker([string]$Path,[string]$Text) {
             $buffer = [Text.Encoding]::UTF8.GetBytes($Text)
             $file = [IO.File]::Open($Path,'CreateNew','Write','None')
@@ -383,7 +506,8 @@ function Invoke-RemoteProfileImport([object]$Session,[string]$Root,[string]$Arch
         # Запись о начале сохраняется до запуска дочернего процесса. После
         # потери питания или связи она запрещает автоматическое повторение.
         $tag = $hash + ' ' + $account
-        $script = Join-Path $root 'ProfileMigration.ps1'
+        $program = Join-Path $root 'Program'
+        $script = Join-Path $program 'ProfileMigration.ps1'
         $binary = Join-Path $PSHOME 'powershell.exe'
         $started = Join-Path $root 'import-started.txt'
         $done = Join-Path $root 'import-completed.txt'
@@ -391,17 +515,26 @@ function Invoke-RemoteProfileImport([object]$Session,[string]$Root,[string]$Arch
             throw 'Отсутствует удалённый сценарий импорта или Windows PowerShell.'
         }
         $launchOptions = @(Get-MigrationLaunchOptions $script)
+        foreach ($module in $modules) { [void](Get-MigrationLaunchOptions (Join-Path $program $module)) }
         $lockedZip = [IO.File]::Open($zip,'Open','Read','Read')
         try {
             if ((Get-FileHash -InputStream $lockedZip -Algorithm SHA256 -ErrorAction Stop).Hash -ne $hash) {
                 throw 'SHA-256 ZIP изменился до запуска импорта.'
             }
             Write-ImportMarker $started $tag
-            & $binary @launchOptions -File $script -ToolRoot $root -RemoteImportArchive $zip -RemoteTargetAccount $account
-            if ($LASTEXITCODE -ne 0) { throw ('На целевом ПК импорт завершился кодом ' + $LASTEXITCODE + '.') }
+            if ($password) {
+                $code = Invoke-PasswordImportProcess $binary $launchOptions $childArguments $password
+            } else {
+                & $binary @launchOptions -File $script -ToolRoot $root -RemoteImportArchive $zip -RemoteTargetAccount $account
+                $code = $LASTEXITCODE
+            }
+            if ($code -ne 0) { throw ('На целевом ПК импорт завершился кодом ' + $code + '.') }
             Write-ImportMarker $done $tag
             'WPM_REMOTE_SUCCESS'
-        } finally { $lockedZip.Dispose() }
+        } finally {
+            $lockedZip.Dispose()
+            if ($password) { $password.Dispose() }
+        }
     }
 }
 
@@ -414,11 +547,17 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
     $remoteArchive = $null
     $zipStream = $null
     $releaseDeploymentLock = $false
+    $archivePassword = $null
     try {
         if ($ResumeZip) {
             if (-not (Test-Path -LiteralPath $ResumeZip -PathType Leaf)) { throw 'ZIP возобновления не найден.' }
             $zipStream = [IO.File]::Open($ResumeZip,'Open','Read','Read')
-            $resumeInfo = Get-ProfileZipInfo $ResumeZip
+            if ([IO.Path]::GetExtension($ResumeZip) -ieq '.zip') {
+                $resumeInfo = Get-ProfileZipInfo $ResumeZip
+            } elseif (Test-WpmProtectedArchive $ResumeZip) {
+                $archivePassword = Read-WpmArchivePassword
+                $resumeInfo = Get-WpmTransferArchiveInfo $ResumeZip $archivePassword
+            } else { throw 'Для возобновления выберите ZIP или защищённый архив программы.' }
             Assert-ArchiveMetadata $resumeInfo.Metadata $true
             $sourceProfile = [pscustomobject]@{Account=[string]$resumeInfo.Metadata.SourceAccount;
                 Type=[string]$resumeInfo.Metadata.AccountType;Loaded=$false;Path='(готовый ZIP)' }
@@ -558,13 +697,14 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
         if (-not $zipPath) {
             $localRoot = Join-Path $Script:WpmWorkRoot 'DirectTransfers'
             Initialize-WpmWorkDirectory $localRoot
-            $zipPath = [string](Do-Export $Usmt $sourceProfile $localRoot $true $true)
+            $archivePassword = Read-WpmExportPassword
+            $zipPath = [string](Do-Export $Usmt $sourceProfile $localRoot $true $true -ArchivePassword $archivePassword)
         }
         if (-not $zipPath -or -not (Test-Path -LiteralPath $zipPath -PathType Leaf)) { throw 'Экспорт не создал ZIP. Развёртывание остановлено.' }
         try { $session = Connect-RemoteMigration $connection $remote }
         catch { throw ('ZIP готов, но подключение к прежнему получателю не установлено. Архив сохранён: ' + $zipPath + '. При восстановлении связи выберите пункт 7. Ошибка: ' + $_.Exception.Message) }
         if (-not $zipStream) { $zipStream = [IO.File]::Open($zipPath,'Open','Read','Read') }
-        $zipInfo = Get-ProfileZipInfo $zipPath
+        $zipInfo = if ($ResumeZip) { $resumeInfo } else { Get-WpmTransferArchiveInfo $zipPath $archivePassword }
         $localHash = (Get-FileHash -InputStream $zipStream -Algorithm SHA256 -ErrorAction Stop).Hash
         Write-OperationReport 'ЭКСПОРТ' ('Готов ZIP: ' + $zipPath)
         Advance-OperationStage 'ZIP одного профиля подготовлен для отправки'
@@ -572,9 +712,11 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
         $transferId = 'WPM_' + $localHash.Substring(0,24)
         $remoteRoot = Initialize-RemoteMigrationDirectory $session $transferId
         # Путь относится к диску получателя и не обязан существовать на источнике.
-        $remoteArchive = [IO.Path]::Combine($remoteRoot,'Backups','Profile.zip')
+        $fileName = if ($archivePassword) { 'Profile.wpm.pgp' } else { 'Profile.zip' }
+        $remoteArchive = [IO.Path]::Combine($remoteRoot,'Backups',$fileName)
         Write-OperationReport 'ПЕРЕДАЧА' ('ZIP получателя: ' + $remoteArchive + '; размер: ' + $zipStream.Length + ' байт')
         $reserve = [long]([decimal]$zipInfo.ExpandedBytes + [decimal]$zipInfo.Metadata.EstimatedProfileBytes + [decimal]2GB)
+        if ($archivePassword) { $reserve += $zipStream.Length }
         Send-RemoteArchive ([ref]$session) $connection $remote $zipStream $remoteArchive $localHash $reserve
         Advance-OperationStage 'ZIP передан и проверен по SHA-256'
         Write-OperationReport 'ПРОВЕРКА' ('ZIP передан без изменений, SHA-256: ' + $localHash)
@@ -595,17 +737,7 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
             throw 'Целевой профиль уже существует, а подтверждение предыдущего импорта отсутствует. Проверьте состояние на получателе.'
         }
 
-        foreach ($filename in @('ProfileMigration.ps1','Bootstrap.ps1','Start.cmd')) {
-            $sourceFile = Join-Path $Script:ToolRoot $filename
-            $remoteFile = [IO.Path]::Combine($remoteRoot,$filename)
-            $scriptHash = (Get-FileHash -LiteralPath $sourceFile -Algorithm SHA256 -ErrorAction Stop).Hash
-            Copy-Item -LiteralPath $sourceFile -Destination $remoteFile -ToSession $session -Force -ErrorAction Stop
-            $remoteScriptHash = Invoke-Command -Session $session -ArgumentList $remoteFile -ErrorAction Stop -ScriptBlock {
-                param($path)
-                (Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash
-            }
-            if ($remoteScriptHash -ne $scriptHash) { throw ('SHA-256 переданного файла не совпал: ' + $filename) }
-        }
+        Copy-RemoteMigrationProgram $session $remoteRoot
         Advance-OperationStage 'Скрипты на целевом ПК сверены по SHA-256'
 
         $targetArch = ([string]$remote.Architecture).ToLowerInvariant()
@@ -654,7 +786,7 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
         }
         Write-Host 'Автоматический запуск LoadState на целевом компьютере...' -ForegroundColor Cyan
         $remoteSucceeded = $false
-        Invoke-RemoteProfileImport $session $remoteRoot $remoteArchive $targetAccount $localHash | ForEach-Object {
+        Invoke-RemoteProfileImport $session $remoteRoot $remoteArchive $targetAccount $localHash $archivePassword | ForEach-Object {
             if ([string]$_ -eq 'WPM_REMOTE_SUCCESS') { $remoteSucceeded = $true }
             else { Write-Host ([string]$_) }
         }
@@ -680,6 +812,7 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
         if ($remoteArchive) { Write-OperationReport 'ВОССТАНОВЛЕНИЕ' ('ZIP назначения (если уже передан): ' + $remoteArchive) }
         throw
     } finally {
+        if ($archivePassword) { $archivePassword.Dispose() }
         if ($zipStream) { $zipStream.Dispose() }
         if ($session) {
             if ($releaseDeploymentLock -and $session.State -eq 'Opened') {

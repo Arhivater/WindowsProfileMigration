@@ -156,6 +156,9 @@ function New-ExtrasManifest([string]$Archive) {
                     $writer.WriteLine(([ordered]@{ RelativePath=$rel; Length=[long]$file.Length; SHA256=$sha } | ConvertTo-Json -Compress))
                     $count++
                 } catch {
+                    if ($rel.StartsWith('UserFiles\',[StringComparison]::OrdinalIgnoreCase)) {
+                        throw ('Не удалось проверить сохранённый личный файл: ' + $rel)
+                    }
                     $skipped++
                     Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Extras: файл не прошёл хеширование ' + $rel + ': ' + $_.Exception.Message)
                 }
