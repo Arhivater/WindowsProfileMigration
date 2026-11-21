@@ -1,0 +1,45 @@
+name: USMT export lab
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/usmt-lab.yml'
+      - 'tests/Invoke-UsmtExportLab.ps1'
+
+permissions:
+  contents: read
+
+jobs:
+  export-and-verify:
+    runs-on: windows-11-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Microsoft USMT on the disposable Windows 11 VM
+        shell: powershell
+        timeout-minutes: 12
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'adksetup.exe'
+          $release = Get-ItemPropertyValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name DisplayVersion
+          $url = switch ($release) {
+              '25H2' { 'https://go.microsoft.com/fwlink/?linkid=2289980' }
+              '26H1' { 'https://go.microsoft.com/fwlink/?linkid=2337875' }
+              default { throw "Unverified ADK version for Windows $release." }
+          }
+          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing -TimeoutSec 120
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch '(^|,)\s*O=Microsoft Corporation(,|$)') {
+              throw 'The ADK installer signature is invalid.'
+          }
+          $install = Start-Process -FilePath $installer -ArgumentList '/quiet /norestart /ceip off /features OptionId.UserStateMigrationTool' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "ADK setup returned $($install.ExitCode)." }
+
+      - name: Export one test profile and verify its ZIP with USMT
+        shell: powershell
+        run: .\tests\Invoke-UsmtExportLab.ps1
