@@ -45,26 +45,41 @@ function Read-WpmExportPassword {
     }
 }
 
+# OpenPGP содержит несжатый ZIP, поэтому его размер служит верхней границей для временной копии.
+function Assert-WpmDecryptionSpace([long]$ArchiveLength, [string]$Destination) {
+    $volume = [IO.Path]::GetPathRoot($Destination)
+    $free = Get-PathFreeBytes $volume
+    $needed = [decimal]$ArchiveLength + 1GB
+    if ($free -lt $needed) {
+        throw ('Недостаточно места для расшифровки архива на ' + $volume + '. Нужно не менее ' +
+            (Format-ByteSize ([UInt64]$needed)) + ', доступно ' + (Format-ByteSize $free) + '.')
+    }
+}
+
 # Читаем исходник без разрешения на запись. При ошибке удаляем только созданную здесь копию.
 function Convert-WpmArchive([string]$Source, [string]$Destination, [Security.SecureString]$Password, [switch]$Decrypt) {
     Initialize-WpmEncryption
+    if ($Decrypt) { Assert-NoReparseAncestor $Source }
     $reader = [IO.File]::Open($Source,'Open','Read','Read')
     $created = $false
     $complete = $false
     try {
-        $writer = [IO.File]::Open($Destination,'CreateNew','Write','None')
-        $created = $true
+        if ($Decrypt) { Assert-WpmDecryptionSpace $reader.Length $Destination }
         try {
-            $cancel = [Func[bool]]{ Test-RunningProcessStopRequest 'обработку защищённого архива' 5 }
-            if ($Decrypt) { [WindowsProfileMigration.OpenPgpArchive]::Decrypt($reader,$writer,$Password,$cancel) }
-            else { [WindowsProfileMigration.OpenPgpArchive]::Encrypt($reader,$writer,$Password,$cancel) }
-            $writer.Flush($true)
-            $complete = $true
-        } finally { $writer.Dispose() }
-    } catch {
-        if ($_.Exception.GetBaseException() -is [OperationCanceledException]) { throw $_.Exception.GetBaseException() }
-        if ($Decrypt) { throw 'Не удалось открыть архив. Проверьте пароль, целостность файла и свободное место.' }
-        throw
+            $writer = [IO.File]::Open($Destination,'CreateNew','Write','None')
+            $created = $true
+            try {
+                $cancel = [Func[bool]]{ Test-RunningProcessStopRequest 'обработку защищённого архива' 5 }
+                if ($Decrypt) { [WindowsProfileMigration.OpenPgpArchive]::Decrypt($reader,$writer,$Password,$cancel) }
+                else { [WindowsProfileMigration.OpenPgpArchive]::Encrypt($reader,$writer,$Password,$cancel) }
+                $writer.Flush($true)
+                $complete = $true
+            } finally { $writer.Dispose() }
+        } catch {
+            if ($_.Exception.GetBaseException() -is [OperationCanceledException]) { throw $_.Exception.GetBaseException() }
+            if ($Decrypt) { throw 'Не удалось открыть архив. Проверьте пароль, целостность файла и свободное место.' }
+            throw
+        }
     } finally {
         $reader.Dispose()
         if ($created -and -not $complete) { [IO.File]::Delete($Destination) }
@@ -78,14 +93,21 @@ function Get-WpmTransferArchiveInfo([string]$Path, [Security.SecureString]$Passw
     Initialize-ZipSupport
     Initialize-WpmWorkDirectory $Script:WpmStagingRoot
     $temp = Join-Path $Script:WpmStagingRoot ([guid]::NewGuid().ToString('N') + '.tmp')
-    $cache = [IO.FileStream]::new($temp,'CreateNew','ReadWrite','None',65536,'DeleteOnClose')
+    Assert-NoReparseAncestor $Path
+    $inputFile = [IO.File]::Open($Path,'Open','Read','Read')
     try {
-        $inputFile = [IO.File]::Open($Path,'Open','Read','Read')
+        Assert-WpmDecryptionSpace $inputFile.Length $temp
+        $cache = [IO.FileStream]::new($temp,'CreateNew','ReadWrite','None',65536,'DeleteOnClose')
         try {
-            [WindowsProfileMigration.OpenPgpArchive]::Decrypt($inputFile,$cache,$Password,$null)
-        } finally { $inputFile.Dispose() }
-        $cache.Position = 0
-        $zip = [IO.Compression.ZipArchive]::new($cache,'Read',$true)
-        try { return Read-ProfileZipInfo $zip } finally { $zip.Dispose() }
-    } finally { $cache.Dispose() }
+            $cancel = [Func[bool]]{ Test-RunningProcessStopRequest 'расшифровку сетевого архива' 5 }
+            try { [WindowsProfileMigration.OpenPgpArchive]::Decrypt($inputFile,$cache,$Password,$cancel) }
+            catch {
+                if ($_.Exception.GetBaseException() -is [OperationCanceledException]) { throw $_.Exception.GetBaseException() }
+                throw 'Не удалось открыть архив. Проверьте пароль, целостность файла и свободное место.'
+            }
+            $cache.Position = 0
+            $zip = [IO.Compression.ZipArchive]::new($cache,'Read',$true)
+            try { return Read-ProfileZipInfo $zip } finally { $zip.Dispose() }
+        } finally { $cache.Dispose() }
+    } finally { $inputFile.Dispose() }
 }
