@@ -4,7 +4,7 @@
 
 ![Перенос с исходного ПК на новый через архив профиля](.github/media/profile-transfer.svg)
 
-**[⬇ Скачать комплект v1.11.0 (.zip)](https://raw.githubusercontent.com/Arhivater/WindowsProfileMigration/0b295a43517a48b6a24fc676fd1eb123e2c295f2/dist/WindowsProfileMigration_v1.11.0_Arhivater.zip)**　·　[Инструкция](README.txt)　·　[Блок-схема и устройство программы](TECHNICAL.md)
+**[⬇ Скачать комплект v1.11.0 (.zip)](https://raw.githubusercontent.com/Arhivater/WindowsProfileMigration/release/v1.11.0/dist/WindowsProfileMigration_v1.11.0_Arhivater.zip)**　·　[Инструкция](README.txt)　·　[Блок-схема и устройство программы](TECHNICAL.md)
 
 **Статус сборки.** Код и комплект опубликованы. Испытания v1.11.0 на Windows ещё не проводились. [Чек-лист](docs/RELEASE_CHECKLIST.md) · [Предыдущий релиз v1.10.1](https://github.com/Arhivater/WindowsProfileMigration/releases/tag/v1.10.1)
 
