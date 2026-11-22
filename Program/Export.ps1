@@ -271,7 +271,7 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
     $profileMetrics = Get-FolderMetrics $p.Path
     $estimatedBytes = [UInt64]$profileMetrics.Bytes
     $personalFolders = Get-PersonalFolders $p.SID $p.Path $includeDocuments
-    $personalBytes = Measure-PersonalFiles $personalFolders $p.Path
+    $personalBytes = Measure-PersonalFiles $personalFolders
     $packageInputBytes = [UInt64]($estimatedBytes + $personalBytes)
     $baseline = Get-ProfileValidationBaseline $p.Path
     Advance-OperationStage 'Подсчитан размер исходного профиля'

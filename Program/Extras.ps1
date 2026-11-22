@@ -73,15 +73,34 @@ function Assert-ProfileExtraPath([string]$Path,[string]$Root,[bool]$AllowMissing
     }
 }
 
-function Get-ExtraStreamSha256([IO.Stream]$Stream) {
+# Один проход одновременно считает SHA-256 и, если нужен выходной поток, копирует файл.
+function Get-ExtraStreamSha256([IO.Stream]$Stream, [IO.Stream]$Destination = $null, [string]$Activity = '') {
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
         $Stream.Position = 0
-        return [BitConverter]::ToString($sha.ComputeHash($Stream)).Replace('-','')
+        if (-not $Destination -and -not $Activity) {
+            return [BitConverter]::ToString($sha.ComputeHash($Stream)).Replace('-','')
+        }
+        $buffer = [byte[]]::new(1MB)
+        while (($count = $Stream.Read($buffer,0,$buffer.Length)) -gt 0) {
+            if ($Activity -and (Test-RunningProcessStopRequest $Activity 3)) {
+                throw [OperationCanceledException]::new('Операция с личным файлом отменена.')
+            }
+            if ($Destination) { $Destination.Write($buffer,0,$count) }
+            [void]$sha.TransformBlock($buffer,0,$count,$null,0)
+        }
+        [void]$sha.TransformFinalBlock([byte[]]@(),0,0)
+        return [BitConverter]::ToString($sha.Hash).Replace('-','')
     } finally {
         $Stream.Position = 0
         $sha.Dispose()
     }
+}
+
+function Get-ExtraFileSha256([string]$Path, [string]$Activity) {
+    $stream = [IO.File]::Open($Path,'Open','Read','Read')
+    try { return Get-ExtraStreamSha256 $stream -Activity $Activity }
+    finally { $stream.Dispose() }
 }
 
 # Копируем с открытым источником, чтобы другой процесс не изменил его между
@@ -92,7 +111,8 @@ function Copy-RequiredFile(
     [string]$AllowedSourceRoot = '',
     [string]$AllowedDestinationRoot = '',
     [string]$Backup = '',
-    [string]$ExpectedHash = ''
+    [string]$ExpectedHash = '',
+    [switch]$AllowCancel
 ) {
     if ($AllowedSourceRoot) { Assert-ProfileExtraPath $From $AllowedSourceRoot $true }
     if (-not [IO.File]::Exists($From)) { return $false }
@@ -102,15 +122,15 @@ function Copy-RequiredFile(
     if ($AllowedDestinationRoot) { Assert-ProfileExtraPath $To $AllowedDestinationRoot $true }
     $temporary = Join-Path $parent ('.WPM_' + [guid]::NewGuid().ToString('N') + '.tmp')
     $source = [IO.File]::Open($From,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    $activity = if ($AllowCancel) { 'копирование личного файла' } else { '' }
     try {
         $output = [IO.File]::Open($temporary,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
         try {
-            $source.CopyTo($output)
+            $sourceHash = Get-ExtraStreamSha256 $source $output $activity
             $output.Flush($true)
         } finally { $output.Dispose() }
-        $sourceHash = Get-ExtraStreamSha256 $source
         if (($ExpectedHash -and $sourceHash -ne $ExpectedHash) -or
-            $sourceHash -ne (Get-ExactFileSha256 $temporary)) {
+            $sourceHash -ne (Get-ExtraFileSha256 $temporary $activity)) {
             throw ('SHA-256 скопированного файла отличается: ' + $From)
         }
         if ($AllowedDestinationRoot) { Assert-ProfileExtraPath $To $AllowedDestinationRoot $true }

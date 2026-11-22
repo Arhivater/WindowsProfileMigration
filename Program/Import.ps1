@@ -187,13 +187,13 @@ function New-ImportLocalAccount([string]$LocalName, [string]$Target, [bool]$Unat
     return $targetSid
 }
 
-function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOverride = '',[string]$TargetOverride = '',[bool]$Unattended = $false, [Security.SecureString]$ArchivePassword = $null) {
+function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOverride = '',[string]$TargetOverride = '',[bool]$Unattended = $false, [Security.SecureString]$ArchivePassword = $null, $PersonalRetry = $null) {
     $archive = if ($ArchiveOverride) { $ArchiveOverride } else { Select-Archive }
     if (-not $archive) { Write-OperationReport 'ОТМЕНА' 'Выбор архива отменён.'; return }
     $isZip = ([IO.Path]::GetExtension($archive) -ieq '.zip')
     $archive = [IO.Path]::GetFullPath($archive)
     $selectedArchive = $archive
-    $operationKind = if ($JustVerify) { 'Проверка архива' } else { 'Импорт' }
+    $operationKind = if ($PersonalRetry) { 'Повтор личных файлов' } elseif ($JustVerify) { 'Проверка архива' } else { 'Импорт' }
     Start-TrackedState $operationKind $selectedArchive
     $stagedArchive = $null
     $mutationLock = $null
@@ -283,10 +283,11 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     Assert-ArchiveMetadata $meta (-not $JustVerify)
     Advance-OperationStage 'Проверены метаданные архива'
     $store = Join-Path $archive 'Store'
-    if (-not $JustVerify) {
+    if (-not $JustVerify -and -not $PersonalRetry) {
         $requiredImportBytes = if ($meta.PSObject.Properties.Name -contains 'EstimatedProfileBytes' -and $meta.EstimatedProfileBytes) { [UInt64]$meta.EstimatedProfileBytes } else { [UInt64](Get-FolderMetrics $store).Bytes }
         Test-TargetFreeSpace $requiredImportBytes
     }
+    if ($PersonalRetry) { return (Restore-TrackedPersonalFiles $archive $meta $PersonalRetry) }
     $logBase = Join-Path $Script:WpmWorkRoot 'Logs'
     Initialize-WpmWorkDirectory $logBase
     $logRoot = Join-Path $logBase ($(if ($JustVerify) { 'Check_' } else { 'Import_' }) + (Get-Date -Format 'yyyyMMdd_HHmmss_fff') + '_' + [guid]::NewGuid().ToString('N').Substring(0,8))
@@ -374,12 +375,26 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     }
     Assert-ImportProfileUnused $targetSid
     $log = Join-Path $logRoot ('loadstate_'+(Get-Date -Format 'yyyyMMdd_HHmmss_fff')+'_'+[guid]::NewGuid().ToString('N').Substring(0,8)+'.log')
+    if ($meta.PSObject.Properties['PersonalFiles'] -and @($approvedExtras.Keys -like 'UserFiles\*').Count) {
+        Update-TrackedState '' @{
+            PersonalFilesPending = $true
+            PersonalMetadataHash = Get-ExactFileSha256 (Join-Path $archive 'metadata.json')
+            PersonalManifestHash = Get-ExactFileSha256 (Join-Path $archive 'Validation\extras.jsonl')
+        }
+    }
     Invoke-ProfileLoad $Usmt $store $archive $map $logRoot $log
     $targetProfile = Get-TargetUserProfile $target
     if ($targetProfile.Sid -ne $targetSid) { throw 'SID восстановленного профиля отличается от подтверждённой учётной записи.' }
-    Restore-PersonalFiles $archive $targetProfile $meta $approvedExtras
     Advance-OperationStage 'Целевой профиль обнаружен'
     Update-TrackedState 'Профиль найден, выполняется проверка' @{TargetProfile=$targetProfile.Path}
+    $personalFilesComplete = Restore-PersonalFiles $archive $targetProfile $meta $approvedExtras
+    if ($personalFilesComplete) {
+        Update-TrackedState '' @{PersonalFilesPending=$false}
+    } else {
+        $retryHint = 'Часть личных файлов осталось восстановить. Откройте пункт 4 и выберите «Повторить восстановление личных файлов».'
+        Write-Host $retryHint -ForegroundColor Yellow
+        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' $retryHint
+    }
     $validation = Validate-RestoredProfile $meta $targetProfile
     $validationStatus = 'ОГРАНИЧЕННАЯ ПРОВЕРКА - ДЛЯ СТАРОГО ФОРМАТА НЕТ ПОЛНОГО РЕЕСТРА'
     $fileCheck = $null
@@ -446,12 +461,14 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     Write-OperationReport 'ПРОВЕРИТЬ' 'Рекомендуется войти под целевым пользователем и проверить документы, историю браузеров, приложения и значки рабочего стола.'
     Write-OperationReport 'ПРИЁМКА' 'Не выполнена. Для подтверждения доступа, настроек и программ пользователь должен войти под своей учётной записью.'
     Write-OperationReport 'USMT' ('Технический импорт выполнен для: '+$target)
-    Update-TrackedState 'Технически завершено, ожидает приёмки' @{ImportCompleted=$true}
+    $personalStatus = if ($personalFilesComplete) { '' } else { '; ЛИЧНЫЕ ФАЙЛЫ ВОССТАНОВЛЕНЫ НЕ ПОЛНОСТЬЮ' }
+    $trackedStatus = if ($personalFilesComplete) { 'Технически завершено, ожидает приёмки' } else { 'USMT завершён, личные файлы требуют повтора' }
+    Update-TrackedState $trackedStatus @{ImportCompleted=$true}
     Advance-OperationStage 'Результаты восстановления записаны в отчёт'
     if (Clear-TrackedStaging $Script:ActiveOpState $false) {
         Advance-OperationStage 'Временные файлы очищены'
     }
-    Finish-OperationReport ('ТЕХНИЧЕСКИ ЗАВЕРШЕНО; '+$validationStatus+'; ОЖИДАЕТ ПРИЁМКИ')
+    Finish-OperationReport ('ТЕХНИЧЕСКИ ЗАВЕРШЕНО; '+$validationStatus+$personalStatus+'; ОЖИДАЕТ ПРИЁМКИ')
     Write-Host 'Не удаляйте источник и архив до проверки всех данных.' -ForegroundColor Yellow
     return $true
     } finally {

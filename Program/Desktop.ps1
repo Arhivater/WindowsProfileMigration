@@ -212,5 +212,5 @@ function Get-TargetUserProfile([string]$Account) {
         -not (Test-Path -LiteralPath $profile[0].LocalPath -PathType Container)) {
         throw ('Профиль назначения после USMT не обнаружен для ' + $Account + '. Дополнительные данные сохранены в архиве, но не восстановлены.')
     }
-    return [pscustomobject]@{Sid=$sid; Path=[string]$profile[0].LocalPath}
+    return [pscustomobject]@{Sid=$sid; Path=[string]$profile[0].LocalPath; Loaded=[bool]$profile[0].Loaded}
 }

@@ -91,7 +91,7 @@ function Save-CanceledOperationState([hashtable]$State) {
         if ($State.Status -eq 'Публикация отменена - локальная копия сохранена') {
             Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Временные данные сохранены. Просмотреть и очистить их можно через меню 4.'
         } else {
-            Update-TrackedState 'Отменено пользователем во время USMT'
+            Update-TrackedState 'Экспорт отменён пользователем'
             # Убираем только свою временную экспортную копию.
             # Опубликованный архив и исходный профиль не затрагиваются.
             if ($State.StagingPath -and -not $State.CleanupDone) {

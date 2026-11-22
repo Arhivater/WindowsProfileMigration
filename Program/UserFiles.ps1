@@ -42,11 +42,33 @@ function Get-PersonalFolderSettings([string]$Sid, [string]$ProfileRoot) {
     }
 }
 
-# Доверяем только подкаталогам этого профиля. Запись в реестре пользователя не даёт программе права читать чужие файлы.
-function Resolve-PersonalFolder([string]$Group, [string]$ProfileRoot, [hashtable]$Settings) {
+# Для папки вне профиля запись реестра сама по себе не подтверждает право доступа.
+# Принимаем только отдельный существующий каталог, владельцем которого является выбранный пользователь.
+function Get-OwnedRedirectedFolder([string]$Path, [string]$Sid) {
+    if ($Path -notmatch '^[a-zA-Z]:\\' -and -not (Test-NetworkDriveRemotePath $Path)) {
+        throw 'Нужен полный путь к папке на диске или сетевом ресурсе.'
+    }
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    if ($full -eq [IO.Path]::GetPathRoot($Path).TrimEnd('\')) {
+        throw 'Корень диска или сетевого ресурса не подходит.'
+    }
+    Assert-NoReparseAncestor $full
+    $directory = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+    if (-not $directory.PSIsContainer -or -not (Test-PersonalFileLocal $directory)) {
+        throw 'Папка должна быть доступна без перехода по ссылке или загрузки из облака.'
+    }
+    $acl = Get-Acl -LiteralPath $full -ErrorAction Stop
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $Sid) {
+        throw 'Владелец перенаправленной папки отличается от выбранного пользователя.'
+    }
+    return $full
+}
+
+function Resolve-PersonalFolder([string]$Group, [string]$Sid, [string]$ProfileRoot, [hashtable]$Settings) {
     $default = Join-Path $ProfileRoot $Group
+    $local = [pscustomobject]@{Path=$default; Root=$ProfileRoot; Redirected=$false; Fallback=$false}
     $value = [string]$Settings[$Group]
-    if (-not $value) { return $default }
+    if (-not $value) { return $local }
     foreach ($name in @('OneDrive','OneDriveConsumer','OneDriveCommercial','USERPROFILE')) {
         $replacement = if ($name -eq 'USERPROFILE') { $ProfileRoot } else { [string]$Settings[$name] }
         if ($replacement -and $value.StartsWith("%$name%\", [StringComparison]::OrdinalIgnoreCase)) {
@@ -54,14 +76,33 @@ function Resolve-PersonalFolder([string]$Group, [string]$ProfileRoot, [hashtable
         }
     }
     $prefix = [IO.Path]::GetFullPath($ProfileRoot).TrimEnd('\') + '\'
-    if ($value.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
-        $parts = @(Get-WindowsRelativePathParts $value.Substring($prefix.Length))
-        if ($parts[0] -notin @('AppData','Application Data','Start Menu')) {
-            return Join-Path $ProfileRoot ($parts -join '\')
+    try {
+        if ($value -notmatch '^[a-zA-Z]:\\' -and -not (Test-NetworkDriveRemotePath $value)) {
+            throw 'Не удалось определить полный путь перенаправленной папки.'
         }
+        $value = [IO.Path]::GetFullPath($value).TrimEnd('\')
+        if ($value.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            $parts = @(Get-WindowsRelativePathParts $value.Substring($prefix.Length))
+            if ($parts[0] -in @('AppData','Application Data','Start Menu')) {
+                throw 'Служебная папка не подходит для личных файлов.'
+            }
+            $local.Path = Join-Path $ProfileRoot ($parts -join '\')
+            Assert-ProfileExtraPath $local.Path $ProfileRoot $true
+            return $local
+        }
+        if ($prefix.StartsWith(($value + '\'), [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Нельзя использовать весь профиль или его родительскую папку.'
+        }
+        $external = Get-OwnedRedirectedFolder $value $Sid
+        return [pscustomobject]@{Path=$external; Root=$external; Redirected=$true; Fallback=$false}
+    } catch {
+        $message = 'Папка {0} перенаправлена. Используется {1}. Причина: {2}' -f $Group,$default,$_.Exception.Message
+        Write-Host $message -ForegroundColor Yellow
+        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' $message
+        $local.Path = $default
+        $local.Fallback = $true
+        return $local
     }
-    Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ("Для $Group задан путь вне доступных папок профиля. Используется локальная папка $default.")
-    return $default
 }
 
 function Get-PersonalFolders([string]$Sid, [string]$ProfileRoot, [bool]$IncludeDocuments) {
@@ -70,7 +111,7 @@ function Get-PersonalFolders([string]$Sid, [string]$ProfileRoot, [bool]$IncludeD
     $groups = @('Desktop')
     if ($IncludeDocuments) { $groups += @('Documents','Downloads') }
     $folders = [ordered]@{}
-    foreach ($group in $groups) { $folders[$group] = Resolve-PersonalFolder $group $ProfileRoot $settings }
+    foreach ($group in $groups) { $folders[$group] = Resolve-PersonalFolder $group $Sid $ProfileRoot $settings }
     return $folders
 }
 
@@ -81,13 +122,15 @@ function Test-PersonalFileLocal([IO.FileSystemInfo]$Item) {
 }
 
 function Get-PersonalSourceFiles([string]$Folder, [string]$ProfileRoot, [bool]$ShortcutsOnly) {
-    Assert-ProfileExtraPath $Folder $ProfileRoot $true
+    if ($Folder -ieq $ProfileRoot) { Assert-NoReparseAncestor $Folder }
+    else { Assert-ProfileExtraPath $Folder $ProfileRoot $true }
     if (-not [IO.Directory]::Exists($Folder)) { return }
     $pending = [Collections.Generic.Stack[string]]::new()
     $pending.Push($Folder)
     while ($pending.Count) {
         $current = $pending.Pop()
-        Assert-ProfileExtraPath $current $ProfileRoot
+        if ($current -ieq $ProfileRoot) { Assert-NoReparseAncestor $current }
+        else { Assert-ProfileExtraPath $current $ProfileRoot }
         foreach ($item in (Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop)) {
             if (-not (Test-PersonalFileLocal $item)) {
                 Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Пропущена ссылка или облачный объект: ' + $item.FullName)
@@ -100,15 +143,17 @@ function Get-PersonalSourceFiles([string]$Folder, [string]$ProfileRoot, [bool]$S
 }
 
 function Export-PersonalFiles($Profile, [string]$Archive, [bool]$IncludeDocuments, $Folders) {
+    Write-Host 'Копирование личных файлов. Для отмены нажмите 0 без Enter.'
     $counts = @{ Desktop = 0L; Documents = 0L; Downloads = 0L }
     foreach ($group in $Folders.Keys) {
         $folder = $Folders[$group]
-        $prefix = $folder.TrimEnd('\') + '\'
+        if ($folder.Redirected) { [void](Get-OwnedRedirectedFolder $folder.Path $Profile.SID) }
+        $prefix = $folder.Path.TrimEnd('\') + '\'
         $store = Join-Path $Archive ("Extras\UserFiles\$group")
-        foreach ($file in (Get-PersonalSourceFiles $folder $Profile.Path ($group -eq 'Desktop'))) {
+        foreach ($file in (Get-PersonalSourceFiles $folder.Path $folder.Root ($group -eq 'Desktop'))) {
             $relative = $file.FullName.Substring($prefix.Length)
             $destination = Join-Path $store $relative
-            if (-not (Copy-RequiredFile $file.FullName $destination $Profile.Path $Archive)) {
+            if (-not (Copy-RequiredFile $file.FullName $destination $folder.Root $Archive -AllowCancel)) {
                 throw ('Во время экспорта исчез файл: ' + $file.FullName)
             }
             $counts[$group]++
@@ -149,7 +194,7 @@ function Get-PersonalDestination([string]$Path, [string]$Root, [string]$Hash) {
         Assert-ProfileExtraPath $candidate $Root $true
         if (-not (Test-Path -LiteralPath $candidate)) { return $candidate }
         $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
-        if (-not $item.PSIsContainer -and (Test-PersonalFileLocal $item) -and (Get-ExactFileSha256 $candidate) -eq $Hash) { return }
+        if (-not $item.PSIsContainer -and (Test-PersonalFileLocal $item) -and (Get-ExtraFileSha256 $candidate 'сверку существующего личного файла') -eq $Hash) { return }
         $attempt++
         $extension = [IO.Path]::GetExtension($Path)
         $suffix = ' (перенос-' + $Hash.Substring(0,8) + '-' + $attempt + ')'
@@ -166,30 +211,71 @@ function Get-PersonalDestination([string]$Path, [string]$Root, [string]$Hash) {
     }
 }
 
+# Ошибка одного файла не прерывает остальные. При повторе файлы с тем же SHA-256 пропускаются.
 function Restore-PersonalFiles([string]$Archive, $Target, $Metadata, [hashtable]$Approved) {
-    if (-not $Metadata.PSObject.Properties['PersonalFiles']) { return }
-    $folders = Get-PersonalFolders $Target.Sid $Target.Path $Metadata.PersonalFiles.IncludeDocuments
-    $extras = Join-Path $Archive 'Extras'
-    foreach ($key in $Approved.Keys) {
-        if (-not $key.StartsWith('UserFiles\',[StringComparison]::OrdinalIgnoreCase)) { continue }
-        $parts = $key -split '\\',3
-        $desired = Join-Path $folders[$parts[1]] $parts[2]
-        $destination = Get-PersonalDestination $desired $Target.Path $Approved[$key]
-        if (-not $destination) { continue }
-        $source = Join-Path $extras $key
-        if (-not (Copy-RequiredFile $source $destination $Archive $Target.Path '' $Approved[$key])) {
-            throw ('В архиве отсутствует личный файл: ' + $key)
-        }
-        if ($destination -ine $desired) { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Файл с таким именем уже был. Копия из архива: ' + $destination) }
+    if (-not $Metadata.PSObject.Properties['PersonalFiles']) { return $true }
+    $keys = @($Approved.Keys | Where-Object { $_.StartsWith('UserFiles\',[StringComparison]::OrdinalIgnoreCase) } | Sort-Object)
+    if (-not $keys.Count) { return $true }
+    if ($Target.Loaded) {
+        $message = 'Выйдите из целевой учётной записи Windows и повторите восстановление личных файлов.'
+        Write-Host $message -ForegroundColor Yellow
+        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' $message
+        return $false
     }
-    Write-OperationReport 'ФАЙЛЫ' 'Копирование документов, загрузок и ярлыков по выбранному составу завершено.'
+    Write-Host 'Восстановление личных файлов. Для отмены нажмите 0 без Enter.'
+    $restored = 0
+    $matched = 0
+    $fallback = 0
+    try {
+        $folders = Get-PersonalFolders $Target.Sid $Target.Path $Metadata.PersonalFiles.IncludeDocuments
+    } catch {
+        Write-Host ('Личные файлы пока не восстановлены: ' + $_.Exception.Message) -ForegroundColor Yellow
+        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалось определить папки личных файлов: ' + $_.Exception.Message)
+        return $false
+    }
+    $extras = Join-Path $Archive 'Extras'
+    foreach ($key in $keys) {
+        try {
+            $parts = $key -split '\\',3
+            $folder = $folders[$parts[1]]
+            if ($folder.Redirected) { [void](Get-OwnedRedirectedFolder $folder.Path $Target.Sid) }
+            $desired = Join-Path $folder.Path $parts[2]
+            $destination = Get-PersonalDestination $desired $folder.Root $Approved[$key]
+            if (-not $destination) {
+                $matched++
+                if ($folder.Fallback) { $fallback++ }
+                continue
+            }
+            $source = Join-Path $extras $key
+            if (-not (Copy-RequiredFile $source $destination $Archive $folder.Root '' $Approved[$key] -AllowCancel)) {
+                throw 'Файл исчез из рабочей копии архива.'
+            }
+            $restored++
+            if ($folder.Fallback) { $fallback++ }
+            if ($destination -ine $desired) {
+                Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Имя занято. Копия из архива: ' + $destination)
+            }
+        } catch [OperationCanceledException] {
+            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Копирование личных файлов остановлено. Готовые копии сохранены.'
+            break
+        } catch {
+            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Личный файл ' + $key + ': ' + $_.Exception.Message)
+        }
+    }
+    $remaining = $keys.Count - $restored - $matched
+    Write-OperationReport 'ФАЙЛЫ' ('Личные файлы: скопировано {0}, уже совпали {1}, осталось {2}.' -f $restored,$matched,$remaining)
+    if ($fallback) {
+        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Файлов в резервных локальных папках: ' + $fallback + '. Повтор доступен после подключения перенаправленной папки.')
+    }
+    return $remaining -eq 0 -and $fallback -eq 0
 }
 
 # Оцениваем размер дополнительных копий до выбора места для архива.
-function Measure-PersonalFiles($Folders, [string]$ProfileRoot) {
+function Measure-PersonalFiles($Folders) {
     [UInt64]$bytes = 0
     foreach ($group in $Folders.Keys) {
-        Get-PersonalSourceFiles $Folders[$group] $ProfileRoot ($group -eq 'Desktop') | ForEach-Object {
+        $folder = $Folders[$group]
+        Get-PersonalSourceFiles $folder.Path $folder.Root ($group -eq 'Desktop') | ForEach-Object {
             $bytes += [UInt64]$_.Length
         }
     }

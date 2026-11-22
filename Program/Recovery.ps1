@@ -341,8 +341,13 @@ function Read-RecoveryAction($State) {
     Write-Host '3. Восстановить прежние параметры значков'
     Write-Host '4. Удалить незавершённую копию архива'
     Write-Host '5. Подтвердить возможность повторного импорта'
+    $canRetryPersonalFiles = Test-PersonalFilesRetryAvailable $State
+    if ($canRetryPersonalFiles) {
+        Write-Host '6. Повторить восстановление личных файлов'
+    }
     Write-Host '0. Назад'
-    return (Choice 'Выберите действие' 5)
+    $maximum = if ($canRetryPersonalFiles) { 6 } else { 5 }
+    return (Choice 'Выберите действие' $maximum)
 }
 
 # Повторно проверяем SID и отсутствие профиля прямо перед удалением пустой учётной записи.
@@ -405,6 +410,49 @@ function Confirm-ImportRetry($State, [hashtable]$Changes) {
     return $true
 }
 
+function Test-PersonalFilesRetryAvailable($State) {
+    return ($State.Kind -eq 'Импорт' -and $State.USMTFinished -and
+        $State.PSObject.Properties['PersonalFilesPending'] -and $State.PersonalFilesPending)
+}
+
+# Используем те же границы архива, что при импорте, и привязываем его к прежнему SID.
+function Restore-TrackedPersonalFiles([string]$Archive, $Metadata, $State) {
+    if ($State.PersonalMetadataHash -ne (Get-ExactFileSha256 (Join-Path $Archive 'metadata.json')) -or
+        $State.PersonalManifestHash -ne (Get-ExactFileSha256 (Join-Path $Archive 'Validation\extras.jsonl'))) {
+        throw 'Выбранный архив отличается от архива исходного импорта.'
+    }
+    $approved = Test-ExtrasManifest $Archive $Metadata
+    Assert-PersonalFilesInventory $Metadata $approved
+    $target = Get-TargetUserProfile $State.TargetAccount
+    if ($target.Sid -ne $State.TargetSid -or ($State.TargetProfile -and $target.Path -ine $State.TargetProfile)) {
+        throw 'Профиль назначения изменился после импорта.'
+    }
+    return (Restore-PersonalFiles $Archive $target $Metadata $approved)
+}
+
+function Invoke-PersonalFilesRetry($State, [hashtable]$Changes) {
+    if (-not (Test-PersonalFilesRetryAvailable $State)) { return $false }
+    if (-not (Confirm ('Восстановить личные файлы для ' + $State.TargetAccount + '?'))) { return $false }
+    $archive = [string]$State.SourceArchive
+    if (-not (Test-Path -LiteralPath $archive)) {
+        Write-Host 'Исходный архив не найден. Выберите его из другой папки.'
+        $archive = Select-Archive
+        if (-not $archive) { return $false }
+    }
+    # Внутренний импорт готовит архив в собственном временном каталоге.
+    try { $complete = Do-Import -ArchiveOverride $archive -PersonalRetry $State }
+    finally { $Script:ActiveOpState = $null }
+    if (-not $complete) {
+        Write-Host 'Остались невосстановленные личные файлы. Причины указаны в отчёте.' -ForegroundColor Yellow
+        Finish-OperationReport 'ЛИЧНЫЕ ФАЙЛЫ ВОССТАНОВЛЕНЫ НЕ ПОЛНОСТЬЮ'
+        return $false
+    }
+    $Changes.PersonalFilesPending = $false
+    $Changes.Status = 'Личные файлы восстановлены, ожидает приёмки'
+    Save-TrackedState $Changes
+    return $true
+}
+
 # Сначала берём блокировку, затем заново читаем состояние. Другая операция могла изменить его, пока меню было открыто.
 function Invoke-TrackedRecovery([string]$Id, [int]$Action) {
     $lock = $null
@@ -420,6 +468,9 @@ function Invoke-TrackedRecovery([string]$Id, [int]$Action) {
         if (Invoke-RecoveryAction $Action $state $changes) {
             Finish-OperationReport 'УСПЕШНО'
         }
+    } catch [OperationCanceledException] {
+        Write-OperationReport 'ОТМЕНА' $_.Exception.Message
+        Finish-OperationReport 'ОТМЕНЕНО'
     } catch {
         $Script:HadFailures = $true
         Write-OperationReport 'ОШИБКА' $_.Exception.Message
@@ -451,6 +502,7 @@ function Invoke-RecoveryAction([int]$Action, $State, [hashtable]$Changes) {
             return (Clear-NetworkPartial $Changes)
         }
         5 { return (Confirm-ImportRetry $State $Changes) }
+        6 { return (Invoke-PersonalFilesRetry $State $Changes) }
     }
 }
 
