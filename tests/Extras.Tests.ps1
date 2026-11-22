@@ -1,5 +1,5 @@
 ﻿. (Get-WpmFunctionDefinitions -Name @(
-    'Test-ExtraPathComponent','Assert-ProfileExtraPath','Copy-RequiredFile','Get-ExactFileSha256','Get-ExtraStreamSha256',
+    'Test-ExtraPathComponent','Assert-ProfileExtraPath','Copy-RequiredFile','Get-ExactFileSha256','Get-ExtraStreamSha256','Get-ExtraFileSha256',
     'Read-ExtraJson','New-ExtrasManifest','Test-ExtrasManifest','Is-AllowedExtra',
     'Browser-Definitions','Get-BrowserExtraFileNames','Test-BrowserExtraRelativePath','Restore-BrowserExtras',
     'Test-NetworkDriveRemotePath','Get-DesktopRegistryValueNames','Convert-DesktopRegistryValues',

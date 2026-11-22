@@ -235,7 +235,7 @@ Invoke-WpmTest 'Cleanup accepts only the direct owned staging directory' {
 
 function Invoke-ImportFixture([object]$Metadata,[int]$StagedSchema,[uint64]$Available,[scriptblock]$Verify) {
     . (Get-WpmFunctionDefinitions -ScriptName 'ProfileMigration.ps1' -Name @(
-        'Do-Import','Read-ArchiveMetadataFile','Read-BoundedArchiveMetadata','Assert-NoReparseAncestor'))
+        'Do-Import','Test-WpmProtectedArchive','Read-ArchiveMetadataFile','Read-BoundedArchiveMetadata','Assert-NoReparseAncestor'))
     $archive = Join-Path $WpmTestRoot 'backup.zip'
     [IO.File]::WriteAllBytes($archive,[byte[]]@(1,2,3))
     Set-ImportTestDirectories $WpmTestRoot
