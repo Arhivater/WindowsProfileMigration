@@ -25,7 +25,7 @@
 
 В релизной ветке можно защитить архив паролем, добавить отдельную копию локальных «Документов» и «Загрузок» и восстановить ярлыки рабочего стола. Ярлык на сетевой файл, сайт или RDP-подключение сохраняется вместе с адресом, даже когда ресурс недоступен.
 
-**v1.11.0 собрана и ожидает испытаний на Windows.** [Скачать сборку v1.11.0](https://raw.githubusercontent.com/Arhivater/WindowsProfileMigration/0b295a43517a48b6a24fc676fd1eb123e2c295f2/dist/WindowsProfileMigration_v1.11.0_Arhivater.zip) · [Схема программы](https://github.com/Arhivater/WindowsProfileMigration/blob/release/v1.11.0/TECHNICAL.md) · [Чек-лист ветки](https://github.com/Arhivater/WindowsProfileMigration/blob/release/v1.11.0/docs/RELEASE_CHECKLIST.md)
+**v1.11.0 собрана и ожидает испытаний на Windows.** [Скачать сборку v1.11.0](https://raw.githubusercontent.com/Arhivater/WindowsProfileMigration/release/v1.11.0/dist/WindowsProfileMigration_v1.11.0_Arhivater.zip) · [Схема программы](https://github.com/Arhivater/WindowsProfileMigration/blob/release/v1.11.0/TECHNICAL.md) · [Чек-лист ветки](https://github.com/Arhivater/WindowsProfileMigration/blob/release/v1.11.0/docs/RELEASE_CHECKLIST.md)
 
 <details>
 <summary><strong>Что проверено в опубликованной v1.10.1?</strong></summary>
