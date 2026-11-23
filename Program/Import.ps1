@@ -316,6 +316,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     $sourcePersonalFilesComplete = $true
     if ($meta.PSObject.Properties['PersonalFiles']) {
         $sourcePersonalFilesComplete = Write-PersonalFilesCoverage $meta.PersonalFiles
+        if (-not $JustVerify) { $additionalBytes = Measure-ArchivedPersonalFiles $archive $approvedExtras }
     }
     if ($JustVerify) {
         if ([int]$meta.SchemaVersion -ge 5 -and $approvedExtras.Count -ne [int]$meta.ExtrasManifest.Files) {
@@ -368,6 +369,11 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         throw 'Учётная запись назначения изменилась после проверки.'
     }
     Assert-ImportProfileUnused $confirmed.Sid $possibleProfileName
+    # До LoadState назначения ещё нет. Резервируем место на томе профилей,
+    # а перенаправленные папки проверяем по фактическому пути перед записью.
+    if ($meta.PSObject.Properties['PersonalFiles'] -and $additionalBytes -gt 0) {
+        Test-TargetFreeSpace ([UInt64]($requiredImportBytes + $additionalBytes))
+    }
     $targetSid = $confirmed.Sid
     if ($createLocal) {
         $targetSid = New-ImportLocalAccount $localName $target $Unattended

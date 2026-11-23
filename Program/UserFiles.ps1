@@ -258,6 +258,28 @@ function Write-PersonalFilesCoverage($Inventory) {
     return $complete
 }
 
+function Measure-ArchivedPersonalFiles([string]$Archive, [hashtable]$Approved) {
+    [UInt64]$bytes = 0
+    foreach ($key in $Approved.Keys) {
+        if ($key.StartsWith('UserFiles\',[StringComparison]::OrdinalIgnoreCase)) {
+            $bytes += [UInt64](Get-Item -LiteralPath (Join-Path $Archive ("Extras\" + $key)) -Force -ErrorAction Stop).Length
+        }
+    }
+    return $bytes
+}
+
+# Проверяем ближайшую существующую папку, чтобы учесть сетевой ресурс и его квоту.
+function Assert-PersonalDestinationSpace([string]$Destination, [UInt64]$Bytes) {
+    $parent = [IO.Path]::GetDirectoryName($Destination)
+    while ($parent -and -not [IO.Directory]::Exists($parent)) {
+        $parent = [IO.Path]::GetDirectoryName($parent)
+    }
+    if (-not $parent) { throw 'Не удалось определить папку назначения для проверки свободного места.' }
+    if ((Get-PathFreeBytes $parent) -lt $Bytes) {
+        throw ('Недостаточно места для личного файла в ' + $parent + '. Нужно ' + (Format-ByteSize $Bytes) + '.')
+    }
+}
+
 # Если USMT уже восстановил тот же файл, используем его. Другой файл с тем же именем сохраняем рядом с оригиналом.
 function Get-PersonalDestination([string]$Path, [string]$Root, [string]$Hash) {
     $candidate = $Path
@@ -319,6 +341,7 @@ function Restore-PersonalFiles([string]$Archive, $Target, $Metadata, [hashtable]
                 continue
             }
             $source = Join-Path $extras $key
+            Assert-PersonalDestinationSpace $destination (Get-Item -LiteralPath $source -Force -ErrorAction Stop).Length
             if (-not (Copy-RequiredFile $source $destination $Archive $folder.Root '' $Approved[$key] -AllowCancel)) {
                 throw 'Файл исчез из рабочей копии архива.'
             }
