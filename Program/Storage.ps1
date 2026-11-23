@@ -84,8 +84,8 @@ function Get-ProfileStoreRoot {
     if (-not $raw) { return ($env:SystemDrive + '\\Users') }
     return [Environment]::ExpandEnvironmentVariables([string]$raw)
 }
-# Перед импортом проверяет место на разделе профилей с дополнительным резервом.
-function Test-TargetFreeSpace([UInt64]$RequiredBytes) {
+# Блокирует импорт при нехватке места для самого профиля и предупреждает о возможном расходе на личные копии.
+function Test-TargetFreeSpace([UInt64]$RequiredBytes, [UInt64]$AdditionalBytes = 0) {
     $root = Get-ProfileStoreRoot
     $driveRoot = [IO.Path]::GetPathRoot($root)
     $free = Get-PathFreeBytes $driveRoot
@@ -96,6 +96,12 @@ function Test-TargetFreeSpace([UInt64]$RequiredBytes) {
     }
     Write-Host ('Свободное место на диске профилей: ' + (Format-ByteSize $free) + '; требуется не менее ' + (Format-ByteSize $needed)) -ForegroundColor Green
     Write-OperationReport 'ПРОВЕРКА' ('Свободное место на диске профилей: ' + (Format-ByteSize $free) + '; требуется не менее ' + (Format-ByteSize $needed))
+    if ($AdditionalBytes -gt ($free - $needed)) {
+        # Часть файлов может уже быть в профиле после LoadState или восстановиться на другом диске.
+        $message = ('На диске профилей может не хватить места для всех дополнительных личных копий ({0}). Фактическое место проверяется перед записью каждого файла.' -f (Format-ByteSize $AdditionalBytes))
+        Write-Host $message -ForegroundColor Yellow
+        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' $message
+    }
 }
 # После LoadState сверяет наличие профиля, основных папок и выборки файлов. Это не полная побайтовая сверка.
 function Validate-RestoredProfile([object]$Meta,[object]$TargetProfile) {

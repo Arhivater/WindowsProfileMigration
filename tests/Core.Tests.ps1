@@ -173,6 +173,14 @@ Invoke-WpmTest 'USMT consumes native exit 0 and propagates nonzero or missing co
     Assert-WpmEqual (Get-Location).Path $currentDirectory
 }
 
+Invoke-WpmTest 'Missing USMT executable does not leave a pending process record' {
+    . (Get-WpmFunctionDefinitions -Name Quote-WindowsArgument,Invoke-USMT)
+    function Update-TrackedState { throw 'Missing executable wrote a launch record' }
+    function Start-Process { throw 'Missing executable reached process launch' }
+    $missing = Join-Path $WpmTestRoot 'LoadState.exe'
+    Assert-WpmThrows { Invoke-USMT $missing @('unused') $WpmTestRoot -TrackProcess } 'Не найден исполняемый файл USMT'
+}
+
 Invoke-WpmTest 'USMT confirmed cancellation terminates only the started child' {
     . (Get-WpmFunctionDefinitions -Name Quote-WindowsArgument,Invoke-USMT)
     $state = @{ Kill = 0; Wait = 0; Disposed = 0; ProgressClosed = $false; CancelTimeout = 0 }
@@ -238,6 +246,22 @@ Invoke-WpmTest 'Insufficient synthetic profile volume space stops import preflig
     function Write-OperationReport {}
     function Write-Host {}
     Assert-WpmThrows { Test-TargetFreeSpace 1GB } 'Недостаточно места'
+}
+
+Invoke-WpmTest 'Space for additional personal copies is advisory before LoadState' {
+    . (Get-WpmFunctionDefinitions -Name Test-TargetFreeSpace,Format-ByteSize)
+    $observed = @{ Free = [UInt64](3GB + 8); Warnings = 0 }
+    function Get-ProfileStoreRoot { return $WpmTestRoot }
+    function Get-PathFreeBytes { return $observed.Free }
+    function Write-OperationReport($Category,$Message) {
+        if ($Category -eq 'ПРЕДУПРЕЖДЕНИЕ') { $observed.Warnings++ }
+    }
+    function Write-Host {}
+    Test-TargetFreeSpace 2GB -AdditionalBytes 16
+    Assert-WpmEqual $observed.Warnings 1
+    $observed.Free = [UInt64](3GB + 16)
+    Test-TargetFreeSpace 2GB -AdditionalBytes 16
+    Assert-WpmEqual $observed.Warnings 1
 }
 
 Invoke-WpmTest 'Unsupported Windows version is rejected before privileged work' {

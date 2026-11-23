@@ -181,6 +181,38 @@ Invoke-WpmTest 'Account creation without a saved SID requires review after inter
     } finally { $script:ActiveOpState = $null }
 }
 
+Invoke-WpmTest 'Successful personal-file retry retains an unfinished import error' {
+    . (Get-WpmFunctionDefinitions -Name Invoke-PersonalFilesRetry,Test-PersonalFilesRetryAvailable)
+    $changes = New-ImportTestState
+    $changes.USMTStarted = $true
+    $changes.USMTFinished = $true
+    $changes.ImportCompleted = $false
+    $changes.PersonalFilesPending = $true
+    $changes.Status = 'Сбой - импорт не завершён'
+    $changes.LastError = 'Ошибка сверки контрольных сумм'
+    $changes.SourceArchive = Join-Path $WpmTestRoot 'original.zip'
+    $archiveCopy = Join-Path $WpmTestRoot 'copy.zip'
+    [IO.File]::WriteAllText($changes.SourceArchive,'original')
+    [IO.File]::WriteAllText($archiveCopy,'validated copy')
+    $state = [pscustomobject]$changes
+    function Confirm { return $true }
+    function Choice { return 2 }
+    function Select-Archive { return $archiveCopy }
+    function Save-TrackedState([hashtable]$State) {}
+    function Do-Import([string]$ArchiveOverride, $PersonalRetry) {
+        Assert-WpmEqual $ArchiveOverride $archiveCopy
+        Assert-WpmEqual $PersonalRetry.Id $state.Id
+        return $true
+    }
+
+    Assert-WpmEqual (Invoke-PersonalFilesRetry $state $changes) $true
+    Assert-WpmEqual $changes.SourceArchive $archiveCopy
+    Assert-WpmEqual $changes.PersonalFilesPending $false
+    Assert-WpmEqual $changes.ImportCompleted $false
+    Assert-WpmEqual $changes.Status 'Сбой - импорт не завершён'
+    Assert-WpmEqual $changes.LastError 'Ошибка сверки контрольных сумм'
+}
+
 Invoke-WpmTest 'Account mapping substitutes only the destination computer and retains Unicode' {
     $savedComputer = $env:COMPUTERNAME
     $env:COMPUTERNAME = 'TARGET'
