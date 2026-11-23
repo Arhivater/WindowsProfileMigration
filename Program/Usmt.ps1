@@ -189,6 +189,10 @@ function Invoke-USMT([string]$File,[string[]]$Options,[string]$WorkingPath,[stri
     $proc = $null
     $code = $null
     if ($TrackProcess) {
+        # При отсутствующем файле процесса точно не будет. Запись о запуске не нужна.
+        if (-not (Test-Path -LiteralPath $File -PathType Leaf -ErrorAction Stop)) {
+            throw ('Не найден исполняемый файл USMT: ' + $File)
+        }
         # Сначала записываем имя. Если PowerShell завершится в момент запуска,
         # меню восстановления проверит это имя, даже когда PID ещё неизвестен.
         Update-TrackedState '' @{UsmtProcessName=[IO.Path]::GetFileNameWithoutExtension($File); UsmtProcessId=0; UsmtProcessStartTicks=0}
