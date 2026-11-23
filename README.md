@@ -4,7 +4,7 @@ WindowsProfileMigration переносит файлы и настройки од
 
 ![Перенос профиля с исходного ПК через архив](.github/media/profile-transfer.svg)
 
-**[Скачать сборку WindowsProfileMigration v1.11.1](https://raw.githubusercontent.com/Arhivater/WindowsProfileMigration/release/v1.11.1/dist/WindowsProfileMigration_v1.11.1.zip)** · [Пошаговая инструкция](README.txt) · [Устройство программы](TECHNICAL.md)
+**[Скачать сборку WindowsProfileMigration v1.11.1](https://raw.githubusercontent.com/Arhivater/WindowsProfileMigration/release/v1.11.1/dist/WindowsProfileMigration_v1.11.1.zip)** · [Пошаговая инструкция](README.txt) · [Полная блок-схема](TECHNICAL.md#откуда-и-куда-идут-данные)
 
 ## Возможности
 
