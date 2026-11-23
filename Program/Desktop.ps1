@@ -82,11 +82,19 @@ function Set-DesktopRegistryValues([object]$Hive,[string]$Path,[hashtable]$Value
 
 # Сохраняет последнее расположение, записанное Explorer.
 function Export-DesktopLayout([object]$Profile,[string]$Archive) {
-    $values = Invoke-ProfileHive $Profile.SID $Profile.Path {
-        param($hku,$mount)
-        Get-DesktopRegistryValues $hku ($mount + '\Software\Microsoft\Windows\Shell\Bags\1\Desktop')
+    $activity = 'Сохранение расположения значков'
+    Write-OperationReport 'НАСТРОЙКИ' 'Начато чтение расположения значков из реестра профиля.'
+    Write-Progress -Id 9 -Activity $activity -Status 'Чтение реестра профиля' -PercentComplete -1
+    try {
+        $values = Invoke-ProfileHive $Profile.SID $Profile.Path {
+            param($hku,$mount)
+            Get-DesktopRegistryValues $hku ($mount + '\Software\Microsoft\Windows\Shell\Bags\1\Desktop')
+        }
+    } finally { Write-Progress -Id 9 -Activity $activity -Completed }
+    if ($null -eq $values['IconLayouts']) {
+        Write-OperationReport 'НАСТРОЙКИ' 'Windows ещё не записала расположение значков в реестр профиля.'
+        return $false
     }
-    if ($null -eq $values['IconLayouts']) { return $false }
     $items = @{}
     foreach ($name in $values.Keys) {
         if ($null -eq $values[$name]) { continue }
@@ -106,6 +114,7 @@ function Export-DesktopLayout([object]$Profile,[string]$Archive) {
     Assert-ProfileExtraPath $layoutFile $Archive $true
     [void][IO.Directory]::CreateDirectory((Split-Path -Parent $layoutFile))
     $data | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $layoutFile -Encoding UTF8 -ErrorAction Stop
+    Write-OperationReport 'НАСТРОЙКИ' ('Расположение значков сохранено. Параметров: ' + $items.Count)
     Write-Host 'Последнее сохранённое Windows расположение ярлыков записано.' -ForegroundColor Green
     return $true
 }
@@ -130,6 +139,7 @@ function Restore-DesktopLayout(
             if ($screen.Width -ne $data.PrimaryWidth -or $screen.Height -ne $data.PrimaryHeight -or
                 @([System.Windows.Forms.Screen]::AllScreens).Count -ne $data.DisplayCount) {
                 Write-Host 'Конфигурация мониторов отличается. Проверьте расположение после входа.' -ForegroundColor Yellow
+                Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Мониторы источника и назначения отличаются. Проверьте значки при входе в целевой профиль.'
             }
         } catch { }
     }
@@ -137,7 +147,7 @@ function Restore-DesktopLayout(
         Write-OperationReport 'ОТМЕНА' 'Позиции значков не применялись по выбору пользователя.'
         return
     }
-    Invoke-ProfileHive $Sid $TargetPath {
+    $applyLayout = {
         param($hku,$mount)
         $keyPath = $mount + '\Software\Microsoft\Windows\Shell\Bags\1\Desktop'
         $previous = Get-DesktopRegistryValues $hku $keyPath
@@ -165,9 +175,14 @@ function Restore-DesktopLayout(
         Update-TrackedState '' @{DesktopBackup=$backupPath;DesktopBackupSha256=$snapshotHash}
         Write-OperationReport 'РЕЗЕРВ' ('Прежние значения рабочего стола сохранены: ' + $backupPath)
         Set-DesktopRegistryValues $hku $keyPath $values $previous
-    } $true
+    }
+    $activity = 'Восстановление расположения значков'
+    Write-OperationReport 'НАСТРОЙКИ' ('Начато восстановление расположения значков. Параметров в архиве: ' + $values.Count)
+    Write-Progress -Id 9 -Activity $activity -Status 'Сохранение прежних значений и запись в реестр' -PercentComplete -1
+    try { Invoke-ProfileHive $Sid $TargetPath $applyLayout $true }
+    finally { Write-Progress -Id 9 -Activity $activity -Completed }
     Write-Host 'Расположение записано. Windows попробует применить его при входе пользователя.' -ForegroundColor Green
-    Write-OperationReport 'НАСТРОЙКИ' 'Позиции значков записаны в реестр. Проверьте их при входе под целевым пользователем.'
+    Write-OperationReport 'НАСТРОЙКИ' ('Позиции значков записаны в реестр. Параметров: ' + $values.Count + '. Проверьте значки при входе под целевым пользователем.')
 }
 
 # Восстанавливает только локальную резервную копию для зарегистрированного SID и пути.

@@ -56,6 +56,33 @@ Invoke-WpmTest 'Extras copies verified data, preserves old bytes on mismatch, an
     } finally { $env:ProgramData = $programData }
 }
 
+Invoke-WpmTest 'Extras measures byte progress and closes the copy bar after cancellation' {
+    $observed = @{ Percent = [Collections.Generic.List[int]]::new(); Closed = 0; Stop = $false }
+    function Write-Progress($Id,$ParentId,$Activity,$Status,$PercentComplete,[switch]$Completed) {
+        Assert-WpmEqual $Id 3
+        Assert-WpmEqual $ParentId 8
+        if ($Completed) { $observed.Closed++ }
+        else { $observed.Percent.Add($PercentComplete) }
+    }
+    function Test-RunningProcessStopRequest { return $observed.Stop }
+    $source = [IO.MemoryStream]::new([byte[]]::new(2MB))
+    $copy = [IO.MemoryStream]::new()
+    try {
+        $null = Get-ExtraStreamSha256 $source $copy 'копирование'
+        Assert-WpmEqual ($observed.Percent.ToArray()) @(0,50,100)
+        Assert-WpmEqual $copy.Length 2MB
+        Assert-WpmEqual $observed.Closed 1
+        $observed.Stop = $true
+        $observed.Percent.Clear()
+        Assert-WpmThrows { Get-ExtraStreamSha256 $source $copy 'копирование' } 'отменена'
+        Assert-WpmEqual ($observed.Percent.ToArray()) @(0)
+        Assert-WpmEqual $observed.Closed 2
+    } finally {
+        $copy.Dispose()
+        $source.Dispose()
+    }
+}
+
 Invoke-WpmTest 'Extras rejects out-of-profile paths and existing redirecting directories' {
     $profile = Join-Path $WpmTestRoot 'Profile'
     $outside = Join-Path $WpmTestRoot 'Outside'

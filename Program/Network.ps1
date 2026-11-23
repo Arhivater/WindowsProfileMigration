@@ -12,10 +12,24 @@ function Prepare-RemoteReceiver {
         Write-OperationReport 'ОТМЕНА' 'Подготовка WinRM отклонена.'
         return
     }
-    Enable-PSRemoting -Force -ErrorAction Stop
-    Advance-OperationStage 'WinRM настроен по правилам Windows'
-    $listeners = @(Get-ChildItem WSMan:\localhost\Listener -ErrorAction SilentlyContinue)
-    Write-OperationReport 'СЕТЬ' ('Слушателей WinRM: ' + $listeners.Count)
+    $activity = 'Подготовка приёма по WinRM'
+    Write-OperationReport 'СЕТЬ' 'Пользователь подтвердил включение PowerShell Remoting на этом ПК.'
+    try {
+        Write-Progress -Id 4 -Activity $activity -Status 'Windows настраивает службу и правила брандмауэра' -PercentComplete -1
+        Enable-PSRemoting -Force -ErrorAction Stop
+        Advance-OperationStage 'WinRM настроен по правилам Windows'
+        Write-Progress -Id 4 -Activity $activity -Status 'Проверка слушателей WinRM' -PercentComplete -1
+        try {
+            $listeners = @(Get-ChildItem WSMan:\localhost\Listener -ErrorAction Stop)
+            Write-OperationReport 'СЕТЬ' ('Слушателей WinRM: ' + $listeners.Count)
+            if ($listeners.Count -eq 0) {
+                Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Windows не вернула ни одного слушателя WinRM.'
+            }
+        } catch {
+            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Список слушателей WinRM недоступен после настройки.'
+            Write-DiagnosticFailure $_ 'Подготовка получателя: слушатели WinRM'
+        }
+    } finally { Write-Progress -Id 4 -Activity $activity -Completed }
     Write-Host 'Приём сетевого переноса включён. На исходном ПК выберите пункт 5.' -ForegroundColor Green
     Write-Host ('Имя этого ПК: ' + $env:COMPUTERNAME)
     Write-Host 'Для другого домена или IP используйте сертификат WinRM HTTPS либо согласованную администраторами настройку доверия к конкретному узлу.'
@@ -65,7 +79,7 @@ function Select-DirectTransferArchive {
 # Объединяет диагностику обоих ПК в один TXT источника. На целевом остаётся
 # независимый TXT для аварийного случая, когда сеть оборвалась во время импорта.
 function Include-RemoteReport([object]$Session,[string]$RemoteRoot) {
-    if (-not $Session -or -not $RemoteRoot) { return }
+    if (-not $Session -or -not $RemoteRoot) { return $false }
     $path = Invoke-Command -Session $Session -ArgumentList $RemoteRoot -ErrorAction Stop -ScriptBlock {
         param($root)
         $folder = Join-Path $root 'Reports'
@@ -73,13 +87,18 @@ function Include-RemoteReport([object]$Session,[string]$RemoteRoot) {
         Get-ChildItem -LiteralPath $folder -Filter 'Итог_работы_*.txt' -File |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
     }
-    if (-not $path) { return }
+    if (-not $path) {
+        Write-OperationReport 'ДИАГНОСТИКА' ('В каталоге переноса получателя пока нет отчёта: ' + $RemoteRoot)
+        return $false
+    }
     Write-OperationReport 'УДАЛЁННЫЙ ОТЧЁТ' ('Полный TXT на получателе: ' + $path)
-    $lines = Invoke-Command -Session $Session -ArgumentList $path -ErrorAction Stop -ScriptBlock {
+    $lines = @(Invoke-Command -Session $Session -ArgumentList $path -ErrorAction Stop -ScriptBlock {
         param($report)
         Get-Content -LiteralPath $report -Encoding UTF8 -ErrorAction Stop
-    }
-    foreach ($line in @($lines)) { Write-OperationReport 'ОТЧЁТ ЦЕЛЕВОГО ПК' ([string]$line) }
+    })
+    foreach ($line in $lines) { Write-OperationReport 'ОТЧЁТ ЦЕЛЕВОГО ПК' ([string]$line) }
+    Write-OperationReport 'УДАЛЁННЫЙ ОТЧЁТ' ('Скопировано строк отчёта: ' + $lines.Count)
+    return $true
 }
 
 # На каждом сеансе проверяем получателя после смены DNS или долгого экспорта.
@@ -161,20 +180,32 @@ function Read-RemoteTransferBlock([IO.Stream]$Source,[byte[]]$Buffer,[int]$Count
     }
 }
 
-function Get-RemoteTransferPrefixHash([IO.Stream]$Source,[long]$Length,[byte[]]$Buffer) {
+function Get-RemoteTransferPrefixHash([IO.Stream]$Source,[long]$Length,[byte[]]$Buffer,[string]$Activity = '') {
     $remaining = $Length
     $Source.Position = 0
     $hash = [Security.Cryptography.SHA256]::Create()
+    $lastPercent = -1
     try {
         while ($remaining -gt 0) {
             $count = [int][Math]::Min([long]$Buffer.Length,$remaining)
             Read-RemoteTransferBlock $Source $Buffer $count
             [void]$hash.TransformBlock($Buffer,0,$count,$Buffer,0)
             $remaining -= $count
+            if ($Activity) {
+                $checked = $Length - $remaining
+                $percent = [int][Math]::Floor(100.0 * $checked / $Length)
+                if ($percent -ne $lastPercent) {
+                    Write-Progress -Id 5 -Activity $Activity -Status ("Сверено байт: {0} из {1}" -f $checked,$Length) -PercentComplete $percent
+                    $lastPercent = $percent
+                }
+            }
         }
         [void]$hash.TransformFinalBlock([byte[]]@(),0,0)
         return [BitConverter]::ToString($hash.Hash).Replace('-','')
-    } finally { $hash.Dispose() }
+    } finally {
+        $hash.Dispose()
+        if ($Activity) { Write-Progress -Id 5 -Activity $Activity -Completed }
+    }
 }
 
 function Get-RemoteArchiveReceiver {
@@ -259,30 +290,42 @@ function Send-RemoteArchive([ref]$Session,[hashtable]$Connection,[object]$Expect
     try {
         # Повторно вычисляем SHA-256 принятого префикса после потери связи.
         for ($attempt=1; $attempt -le 3; $attempt++) {
+            $offset = 0L
+            $transferStep = 'проверка состояния получателя'
+            Write-OperationReport 'ПЕРЕДАЧА' ("Попытка {0} из 3, размер архива {1} байт." -f $attempt,$length)
             try {
                 if ($attempt -gt 1) {
+                    $transferStep = 'повторное подключение'
+                    Write-Progress -Id 4 -Activity $activity -Status 'Восстановление подключения WinRM' -PercentComplete -1
                     if ($Session.Value) { Remove-PSSession -Session $Session.Value -ErrorAction SilentlyContinue }
                     $Session.Value = $null
                     Start-Sleep -Seconds 3
                     $Session.Value = Connect-RemoteMigration $Connection $ExpectedComputer
                 }
                 $rpc = @{Session=$Session.Value; ScriptBlock=$receiver; ErrorAction='Stop'}
+                $transferStep = 'проверка полученного файла'
+                Write-Progress -Id 4 -Activity $activity -Status 'Получатель проверяет сохранённую копию' -PercentComplete -1
                 $state = Invoke-Command @rpc -ArgumentList 'state',$Destination,$length,$ExpectedHash
-                [long]$offset = $state.Offset
+                $offset = [long]$state.Offset
                 if ($offset -lt 0 -or $offset -gt $length) { throw 'Получатель вернул недопустимую позицию передачи.' }
                 if ($state.Complete) {
+                    Write-Progress -Id 4 -Activity $activity -Status 'Полный архив уже подтверждён получателем' -PercentComplete 100
                     Write-OperationReport 'ВОЗОБНОВЛЕНИЕ' 'Полный ZIP с тем же SHA-256 уже сохранён на получателе.'
                     return
                 }
-                if ($state.Free -lt ($length - $offset + $ReserveBytes)) {
+                $needed = $length - $offset + $ReserveBytes
+                Write-OperationReport 'ПЕРЕДАЧА' ("Сохранено {0} байт. Доступно на получателе {1} байт, требуется {2}." -f $offset,$state.Free,$needed)
+                if ($state.Free -lt $needed) {
                     throw ('Недостаточно места для ZIP и развёртывания. Доступно: ' + (Format-ByteSize $state.Free))
                 }
                 if ($offset -gt 0) {
-                    if ((Get-RemoteTransferPrefixHash $Source $offset $buffer) -ne $state.Hash) {
+                    $transferStep = 'сверка сохранённой части'
+                    if ((Get-RemoteTransferPrefixHash $Source $offset $buffer 'Сверка сохранённой части архива') -ne $state.Hash) {
                         throw ('Полученный префикс ZIP не совпадает с источником. Промежуточный файл сохранён для проверки: ' + $Destination + '.partial')
                     }
                     Write-OperationReport 'ВОЗОБНОВЛЕНИЕ' ('Проверено и повторно используется байт: ' + $offset)
                 }
+                $transferStep = 'передача блоков'
                 $Source.Position = $offset
                 while ($offset -lt $length) {
                     $status = (Format-ByteSize $offset) + ' из ' + (Format-ByteSize $length)
@@ -299,13 +342,20 @@ function Send-RemoteArchive([ref]$Session,[hashtable]$Connection,[object]$Expect
                     if ($newOffset -ne ($offset+$count)) { throw 'Получатель не подтвердил длину переданного блока.' }
                     $offset = $newOffset
                 }
+                Write-Progress -Id 4 -Activity $activity -Status 'Получатель подтвердил все байты архива' -PercentComplete 100
                 if (Test-RunningProcessStopRequest $activity 4) {
                     throw [OperationCanceledException]::new('Сетевая передача отменена. Подтверждённая часть ZIP сохранена.')
                 }
+                $transferStep = 'итоговая проверка SHA-256'
+                Write-Progress -Id 4 -Activity $activity -Status 'Получатель сверяет SHA-256 всего архива' -PercentComplete -1
                 Invoke-Command @rpc -ArgumentList 'finish',$Destination,$length,$ExpectedHash
+                Write-OperationReport 'ПЕРЕДАЧА' ("Получатель подтвердил {0} байт и итоговый SHA-256." -f $offset)
                 return
-            } catch [OperationCanceledException] { throw }
-            catch {
+            } catch [OperationCanceledException] {
+                Write-OperationReport 'ОТМЕНА' ("Подтверждено получателем {0} из {1} байт." -f $offset,$length)
+                throw
+            } catch {
+                Write-OperationReport 'ДИАГНОСТИКА' ("Этап передачи: {0}. Последняя позиция, подтверждённая получателем: {1} из {2} байт." -f $transferStep,$offset,$length)
                 # Повторяем только при потере транспорта. Ошибки места,
                 # хешей и прав требуют диагностики.
                 $connectionFailure = $_.Exception -is [System.Management.Automation.Remoting.PSRemotingTransportException] -or
@@ -354,62 +404,83 @@ function Copy-RemoteMigrationProgram([object]$Session, [string]$RemoteRoot) {
     $paths = @('start.cmd', 'Program\Bootstrap.ps1', 'Program\ProfileMigration.ps1',
         'Program\OpenPgpArchive.cs', 'Program\Vendor\BouncyCastle.Cryptography.dll', 'Program\Vendor\BouncyCastle-LICENSE.md')
     $paths += @($Script:WpmRuntimeFiles | ForEach-Object { 'Program\' + $_ })
-    $files = foreach ($relative in $paths) {
-        $source = Join-Path $Script:ToolRoot $relative
-        Assert-WpmDirectoryChain ([IO.Path]::GetDirectoryName($source))
-        $item = Get-Item -LiteralPath $source -Force -ErrorAction Stop
-        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-            throw ('Файл программы подменён каталогом или ссылкой: ' + $relative)
-        }
-        [pscustomobject]@{ Relative=$relative; Hash=(Get-FileHash -LiteralPath $source -Algorithm SHA256 -ErrorAction Stop).Hash }
-    }
-
-    # Доступ к папке уже ограничен, а import.lock исключает второй сеанс во время замены программы.
-    Invoke-Command -Session $Session -ArgumentList $RemoteRoot,$files -ErrorAction Stop -ScriptBlock {
-        param($root,$manifest)
-        foreach ($subdir in @('Program','Program\Vendor')) {
-            $path = Join-Path $root $subdir
-            [void][IO.Directory]::CreateDirectory($path)
-            $dir = Get-Item -LiteralPath $path -Force -ErrorAction Stop
-            if (-not $dir.PSIsContainer -or ($dir.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-                throw ('Неожиданный каталог комплекта на получателе: ' + $subdir)
+    $activity = 'Подготовка программы на целевом ПК'
+    $checked = 0
+    Write-OperationReport 'ПЕРЕДАЧА' ('Файлов программы к передаче: ' + $paths.Count)
+    try {
+        Write-Progress -Id 4 -Activity $activity -Status ('Проверка исходных файлов: 0 из ' + $paths.Count) -PercentComplete 0
+        $files = foreach ($relative in $paths) {
+            $source = Join-Path $Script:ToolRoot $relative
+            Assert-WpmDirectoryChain ([IO.Path]::GetDirectoryName($source))
+            $item = Get-Item -LiteralPath $source -Force -ErrorAction Stop
+            if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw ('Файл программы подменён каталогом или ссылкой: ' + $relative)
             }
+            [pscustomobject]@{ Relative=$relative; Hash=(Get-FileHash -LiteralPath $source -Algorithm SHA256 -ErrorAction Stop).Hash }
+            $checked++
+            $percent = [int][Math]::Floor(100.0 * $checked / $paths.Count)
+            Write-Progress -Id 4 -Activity $activity -Status ("Проверено исходных файлов: {0} из {1}" -f $checked,$paths.Count) -PercentComplete $percent
         }
-        foreach ($file in $manifest) {
-            $ready = Join-Path $root $file.Relative
-            $pending = $ready + '.incoming'
-            foreach ($path in @($ready,$pending)) {
-                if (Test-Path -LiteralPath $path) {
-                    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
-                    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-                        throw ('Неожиданный объект в папке программы на получателе: ' + $file.Relative)
-                    }
+
+        Write-Progress -Id 4 -Activity $activity -Status 'Получатель готовит папки комплекта' -PercentComplete -1
+        # Доступ к папке уже ограничен, а import.lock исключает второй сеанс во время замены программы.
+        Invoke-Command -Session $Session -ArgumentList $RemoteRoot,$files -ErrorAction Stop -ScriptBlock {
+            param($root,$manifest)
+            foreach ($subdir in @('Program','Program\Vendor')) {
+                $path = Join-Path $root $subdir
+                [void][IO.Directory]::CreateDirectory($path)
+                $dir = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+                if (-not $dir.PSIsContainer -or ($dir.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    throw ('Неожиданный каталог комплекта на получателе: ' + $subdir)
                 }
             }
-            [IO.File]::Delete($pending)
-        }
-    }
-    foreach ($file in $files) {
-        $source = Join-Path $Script:ToolRoot $file.Relative
-        $pending = [IO.Path]::Combine($RemoteRoot, $file.Relative + '.incoming')
-        Copy-Item -LiteralPath $source -Destination $pending -ToSession $Session -ErrorAction Stop
-    }
-    Invoke-Command -Session $Session -ArgumentList $RemoteRoot,$files -ErrorAction Stop -ScriptBlock {
-        param($root,$manifest)
-        # Сначала проверяем весь комплект, затем публикуем каждый файл атомарной заменой.
-        foreach ($file in $manifest) {
-            $pending = (Join-Path $root $file.Relative) + '.incoming'
-            if ((Get-FileHash -LiteralPath $pending -Algorithm SHA256 -ErrorAction Stop).Hash -ne $file.Hash) {
-                throw ('SHA-256 переданного файла не совпал: ' + $file.Relative)
+            foreach ($file in $manifest) {
+                $ready = Join-Path $root $file.Relative
+                $pending = $ready + '.incoming'
+                foreach ($path in @($ready,$pending)) {
+                    if (Test-Path -LiteralPath $path) {
+                        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+                        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                            throw ('Неожиданный объект в папке программы на получателе: ' + $file.Relative)
+                        }
+                    }
+                }
+                [IO.File]::Delete($pending)
             }
         }
-        foreach ($file in $manifest) {
-            $ready = Join-Path $root $file.Relative
-            $pending = $ready + '.incoming'
-            if ([IO.File]::Exists($ready)) { [IO.File]::Replace($pending,$ready,[NullString]::Value) }
-            else { [IO.File]::Move($pending,$ready) }
+        $copied = 0
+        Write-Progress -Id 4 -Activity $activity -Status ('Скопировано файлов: 0 из ' + $paths.Count) -PercentComplete 0
+        foreach ($file in $files) {
+            $source = Join-Path $Script:ToolRoot $file.Relative
+            $pending = [IO.Path]::Combine($RemoteRoot, $file.Relative + '.incoming')
+            try { Copy-Item -LiteralPath $source -Destination $pending -ToSession $Session -ErrorAction Stop }
+            catch {
+                Write-OperationReport 'ДИАГНОСТИКА' ("Передача файла {0} остановлена. Скопировано {1} из {2}." -f $file.Relative,$copied,$paths.Count)
+                throw
+            }
+            $copied++
+            $percent = [int][Math]::Floor(100.0 * $copied / $paths.Count)
+            Write-Progress -Id 4 -Activity $activity -Status ("Скопировано файлов: {0} из {1}" -f $copied,$paths.Count) -PercentComplete $percent
         }
-    }
+        Write-Progress -Id 4 -Activity $activity -Status 'Получатель сверяет SHA-256 и размещает комплект' -PercentComplete -1
+        Invoke-Command -Session $Session -ArgumentList $RemoteRoot,$files -ErrorAction Stop -ScriptBlock {
+            param($root,$manifest)
+            # Сначала проверяем весь комплект, затем публикуем каждый файл атомарной заменой.
+            foreach ($file in $manifest) {
+                $pending = (Join-Path $root $file.Relative) + '.incoming'
+                if ((Get-FileHash -LiteralPath $pending -Algorithm SHA256 -ErrorAction Stop).Hash -ne $file.Hash) {
+                    throw ('SHA-256 переданного файла не совпал: ' + $file.Relative)
+                }
+            }
+            foreach ($file in $manifest) {
+                $ready = Join-Path $root $file.Relative
+                $pending = $ready + '.incoming'
+                if ([IO.File]::Exists($ready)) { [IO.File]::Replace($pending,$ready,[NullString]::Value) }
+                else { [IO.File]::Move($pending,$ready) }
+            }
+        }
+        Write-OperationReport 'ПЕРЕДАЧА' ('Файлы комплекта сверены и размещены на получателе. Количество: ' + $copied)
+    } finally { Write-Progress -Id 4 -Activity $activity -Completed }
 }
 
 # Пароль поступает только по анонимному каналу от родительского процесса на этой же машине.
@@ -582,6 +653,8 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
     $zipStream = $null
     $releaseDeploymentLock = $false
     $archivePassword = $null
+    $networkActivity = 'Прямой перенос по WinRM'
+    $networkStep = 'Подготовка исходного профиля или архива'
     try {
         if ($ResumeZip) {
             if (-not (Test-Path -LiteralPath $ResumeZip -PathType Leaf)) { throw 'ZIP возобновления не найден.' }
@@ -634,12 +707,16 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
         $connection = @{ComputerName=$targetHost; ConfigurationName='Microsoft.PowerShell'; Authentication='Negotiate'; ErrorAction='Stop'}
         if ($transport -eq 2) { $connection['UseSSL'] = $true }
         if ($remoteCredential) { $connection['Credential'] = $remoteCredential }
+        $networkStep = 'Подключение к целевому ПК'
+        Write-Progress -Id 4 -Activity $networkActivity -Status $networkStep -PercentComplete -1
         try { $session = New-PSSession @connection }
         catch {
             Write-DiagnosticFailure $_ 'WinRM: создание удалённой сессии'
             throw ('Подключение WinRM не установлено: ' + $_.Exception.Message + '. На целевом ПК запустите Start.cmd и пункт 6. Для IP/другого домена настройте WinRM HTTPS либо точечное доверие TrustedHosts по правилам вашей сети.')
         }
         Advance-OperationStage 'Соединение WinRM с целевым ПК открыто'
+        $networkStep = 'Проверка Windows и прав администратора получателя'
+        Write-Progress -Id 4 -Activity $networkActivity -Status $networkStep -PercentComplete -1
         $remote = Invoke-Command -Session $session -ErrorAction Stop -ScriptBlock {
             $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
             $admin = [Security.Principal.WindowsPrincipal]::new($identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -656,6 +733,8 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
                 ProgramData=$env:ProgramData
             }
         }
+        Write-OperationReport 'СЕТЬ' ("Получатель {0}, {1} ({2}), архитектура {3}, 64-битный процесс {4}, повышенные права {5}, свободно {6} байт." -f
+            $remote.Name,$remote.Windows,$remote.Version,$remote.Architecture,$remote.Is64Bit,$remote.IsAdmin,$remote.FreeBytes)
         if (-not $remote.IsAdmin) { throw 'Удалённый вход не имеет полного административного токена. Проверьте права назначения и политики удалённого UAC.' }
         if ([string]$remote.Version -notmatch '^10\.' -or $remote.ProductType -ne 1) { throw 'Целевой ПК должен работать под Windows 10 или Windows 11.' }
         if (-not $remote.Is64Bit -or $remote.Architecture -notin @('AMD64','ARM64')) { throw 'На целевом ПК требуется 64-разрядный Windows PowerShell для x64 или ARM64.' }
@@ -666,6 +745,8 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
         Write-Host ('Домен или рабочая группа: ' + $remote.Domain)
         Write-Host ('Доступно на целевом диске: ' + (Format-ByteSize ([UInt64]$remote.FreeBytes)))
 
+        Write-Progress -Id 4 -Activity $networkActivity -Completed
+        $networkStep = 'Выбор учётной записи назначения'
         $userName = ([string]$sourceProfile.Account -split '\\',2)[-1]
         $sameAccount = if ($sourceProfile.Type -eq 'Domain') { [string]$sourceProfile.Account }
             else { [string]$remote.Name + '\' + $userName }
@@ -689,6 +770,8 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
         if ($targetAccount -notmatch '^[^\\/:*?"<>|\x00-\x1F]{1,64}\\[^\\/:*?"<>|\x00-\x1F]{1,64}$') {
             throw 'Имя назначения должно иметь вид DOMAIN\user или COMPUTER\user.'
         }
+        $networkStep = 'Проверка учётной записи назначения'
+        Write-Progress -Id 4 -Activity $networkActivity -Status $networkStep -PercentComplete -1
         $targetCheck = Invoke-Command -Session $session -ArgumentList $targetAccount,([bool]$ResumeZip) -ScriptBlock {
             param($account,$checkingResume)
             $parts = $account -split '\\',2
@@ -712,6 +795,7 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
         } -ErrorAction Stop
         Write-OperationReport 'НАЗНАЧЕНИЕ' ('Выбрано: ' + $targetAccount + '; проверка: ' + $targetCheck)
         Advance-OperationStage 'Проверена учётная запись назначения'
+        Write-Progress -Id 4 -Activity $networkActivity -Completed
 
         Write-Host ''
         Write-Host ('Источник: ' + $env:COMPUTERNAME + ' | ' + $sourceProfile.Account) -ForegroundColor Cyan
@@ -728,6 +812,7 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
         # чтобы ограничение WinRM по времени простоя не сорвало отправку.
         if ($session) { Remove-PSSession -Session $session -ErrorAction SilentlyContinue; $session=$null }
         $zipPath = $ResumeZip
+        $networkStep = 'Подготовка исходного архива'
         if (-not $zipPath) {
             $localRoot = Join-Path $Script:WpmWorkRoot 'DirectTransfers'
             Initialize-WpmWorkDirectory $localRoot
@@ -735,31 +820,44 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
             $zipPath = [string](Do-Export $Usmt $sourceProfile $localRoot $true $true -ArchivePassword $archivePassword)
         }
         if (-not $zipPath -or -not (Test-Path -LiteralPath $zipPath -PathType Leaf)) { throw 'Экспорт не создал ZIP. Развёртывание остановлено.' }
+        $networkStep = 'Повторное подключение к выбранному получателю'
+        Write-Progress -Id 4 -Activity $networkActivity -Status $networkStep -PercentComplete -1
         try { $session = Connect-RemoteMigration $connection $remote }
         catch { throw ('ZIP готов, но подключение к прежнему получателю не установлено. Архив сохранён: ' + $zipPath + '. При восстановлении связи выберите пункт 7. Ошибка: ' + $_.Exception.Message) }
+        Write-OperationReport 'СЕТЬ' ('Повторная проверка получателя пройдена: ' + $remote.Name)
+        Write-Progress -Id 4 -Activity $networkActivity -Completed
+        $networkStep = 'Сверка исходного архива'
         if (-not $zipStream) { $zipStream = [IO.File]::Open($zipPath,'Open','Read','Read') }
         $zipInfo = if ($ResumeZip) { $resumeInfo } else { Get-WpmTransferArchiveInfo $zipPath $archivePassword }
-        $localHash = (Get-FileHash -InputStream $zipStream -Algorithm SHA256 -ErrorAction Stop).Hash
+        $localHash = Get-RemoteTransferPrefixHash $zipStream $zipStream.Length ([byte[]]::new(2MB)) 'Расчёт SHA-256 исходного архива'
         Write-OperationReport 'ЭКСПОРТ' ('Готов ZIP: ' + $zipPath)
         Advance-OperationStage 'ZIP одного профиля подготовлен для отправки'
 
         $transferId = 'WPM_' + $localHash.Substring(0,24)
+        $networkStep = 'Подготовка рабочего каталога получателя'
+        Write-OperationReport 'СЕТЬ' ('Идентификатор переноса: ' + $transferId)
+        Write-Progress -Id 4 -Activity $networkActivity -Status $networkStep -PercentComplete -1
         $remoteRoot = Initialize-RemoteMigrationDirectory $session $transferId
+        Write-OperationReport 'СЕТЬ' ('Каталог переноса на получателе: ' + $remoteRoot)
         # Путь относится к диску получателя и не обязан существовать на источнике.
         $fileName = if ($archivePassword) { 'Profile.wpm.pgp' } else { 'Profile.zip' }
         $remoteArchive = [IO.Path]::Combine($remoteRoot,'Backups',$fileName)
         Write-OperationReport 'ПЕРЕДАЧА' ('ZIP получателя: ' + $remoteArchive + '; размер: ' + $zipStream.Length + ' байт')
         $reserve = [long]([decimal]$zipInfo.ExpandedBytes + [decimal]$zipInfo.Metadata.EstimatedProfileBytes + [decimal]2GB)
         if ($archivePassword) { $reserve += $zipStream.Length }
+        $networkStep = 'Передача и сверка архива на получателе'
         Send-RemoteArchive ([ref]$session) $connection $remote $zipStream $remoteArchive $localHash $reserve
         Advance-OperationStage 'ZIP передан и проверен по SHA-256'
         Write-OperationReport 'ПРОВЕРКА' ('ZIP передан без изменений, SHA-256: ' + $localHash)
 
+        $networkStep = 'Чтение записей о предыдущем импорте'
+        Write-Progress -Id 4 -Activity $networkActivity -Status $networkStep -PercentComplete -1
         $releaseDeploymentLock = $true
         $deployment = Enter-RemoteMigration $session $remoteRoot $localHash $targetAccount
+        Write-OperationReport 'СЕТЬ' ('Состояние импорта на получателе: ' + $deployment)
         if ($deployment -ne 'Ready') {
             Write-OperationReport 'ВОЗОБНОВЛЕНИЕ' 'На получателе сохранён итог предыдущего импорта этого архива для выбранного пользователя.'
-            try { Include-RemoteReport $session $remoteRoot }
+            try { [void](Include-RemoteReport $session $remoteRoot) }
             catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалось прочитать удалённый отчёт: ' + $_.Exception.Message) }
             if ($deployment -eq 'Completed') {
                 Write-Host 'Этот архив уже применяли. Подробный статус проверьте на целевом ПК.' -ForegroundColor Yellow
@@ -775,11 +873,14 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
             throw 'Целевой профиль уже существует, а подтверждение предыдущего импорта отсутствует. Проверьте состояние на получателе.'
         }
 
+        $networkStep = 'Копирование комплекта программы'
         Copy-RemoteMigrationProgram $session $remoteRoot
         Advance-OperationStage 'Скрипты на целевом ПК сверены по SHA-256'
 
         $targetArch = ([string]$remote.Architecture).ToLowerInvariant()
         $targetUsmt = [IO.Path]::Combine($remoteRoot,'USMT',$targetArch)
+        $networkStep = 'Проверка USMT на получателе'
+        Write-Progress -Id 4 -Activity $networkActivity -Status $networkStep -PercentComplete -1
         $hasTargetUsmt = Invoke-Command -Session $session -ArgumentList $targetUsmt,$targetArch -ErrorAction Stop -ScriptBlock {
             param($bundled,$arch)
             $kit = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
@@ -794,7 +895,9 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
             return $false
         }
         if (-not $hasTargetUsmt) {
+            $networkStep = 'Подготовка передачи USMT'
             $sourceArch = ([string]$env:PROCESSOR_ARCHITECTURE).ToLowerInvariant()
+            Write-OperationReport 'СЕТЬ' ("USMT на получателе не найден. Архитектура источника {0}, получателя {1}." -f $sourceArch,$targetArch)
             if ($sourceArch -ne $targetArch) { throw 'Архитектуры ПК различаются. Установите USMT для архитектуры получателя через Start.cmd.' }
             $partialUsmt = $targetUsmt + '.partial'
             Invoke-Command -Session $session -ArgumentList $targetUsmt,$partialUsmt -ErrorAction Stop -ScriptBlock {
@@ -802,10 +905,25 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
                 if (Test-Path -LiteralPath $ready) { throw 'Каталог USMT получателя неполон. Проверьте его на целевом ПК.' }
                 [void][IO.Directory]::CreateDirectory($partial)
             }
+            $networkStep = 'Передача USMT'
             Write-Host 'Передача USMT на целевой ПК...' -ForegroundColor Cyan
-            foreach ($item in Get-ChildItem -LiteralPath $Usmt -Force -ErrorAction Stop) {
-                Copy-Item -LiteralPath $item.FullName -Destination $partialUsmt -Recurse -ToSession $session -Force -ErrorAction Stop
+            # Copy-Item передаёт папку одним вызовом. Считаем завершённые элементы верхнего уровня.
+            $items = @(Get-ChildItem -LiteralPath $Usmt -Force -ErrorAction Stop)
+            $copied = 0
+            Write-OperationReport 'ПЕРЕДАЧА' ('Элементов USMT верхнего уровня: ' + $items.Count)
+            Write-Progress -Id 4 -Activity $networkActivity -Status ('Скопировано элементов USMT: 0 из ' + $items.Count) -PercentComplete 0
+            foreach ($item in $items) {
+                try { Copy-Item -LiteralPath $item.FullName -Destination $partialUsmt -Recurse -ToSession $session -Force -ErrorAction Stop }
+                catch {
+                    Write-OperationReport 'ДИАГНОСТИКА' ("Передача USMT остановлена на {0}. Скопировано {1} из {2}." -f $item.Name,$copied,$items.Count)
+                    throw
+                }
+                $copied++
+                $percent = [int][Math]::Floor(100.0 * $copied / $items.Count)
+                Write-Progress -Id 4 -Activity $networkActivity -Status ("Скопировано элементов USMT: {0} из {1}" -f $copied,$items.Count) -PercentComplete $percent
             }
+            $networkStep = 'Проверка переданного USMT'
+            Write-Progress -Id 4 -Activity $networkActivity -Status $networkStep -PercentComplete -1
             Invoke-Command -Session $session -ArgumentList $partialUsmt,$targetUsmt -ErrorAction Stop -ScriptBlock {
                 param($partial,$ready)
                 foreach ($name in @('ScanState.exe','LoadState.exe','UsmtUtils.exe')) {
@@ -816,13 +934,18 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
                 [IO.Directory]::Move($partial,$ready)
             }
             Write-OperationReport 'ПРОВЕРКА' ('USMT передан в каталог получателя: ' + $targetUsmt)
+        } else {
+            Write-OperationReport 'СЕТЬ' ('Получатель использует найденный комплект USMT для ' + $targetArch)
         }
         Advance-OperationStage 'USMT доступен целевому компьютеру'
 
         if (Test-RunningProcessStopRequest 'Подготовка удалённого импорта' 4) {
             throw [OperationCanceledException]::new('Удалённый импорт отменён до запуска. Проверенный ZIP сохранён.')
         }
+        $networkStep = 'Импорт на целевом ПК'
         Write-Host 'Автоматический запуск LoadState на целевом компьютере...' -ForegroundColor Cyan
+        Write-Progress -Id 4 -Activity $networkActivity -Status 'Ожидаем итог импорта от получателя' -PercentComplete -1
+        Write-OperationReport 'СЕТЬ' ('Получателю отправлена команда запуска импорта. Каталог операции: ' + $remoteRoot)
         $remoteResult = $null
         Invoke-RemoteProfileImport $session $remoteRoot $remoteArchive $targetAccount $localHash $archivePassword | ForEach-Object {
             if ([string]$_ -cmatch '^WPM_REMOTE_RESULT=([0-9]|1[0-5])$') { $remoteResult = [int]$Matches[1] }
@@ -832,23 +955,30 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
             throw 'Удалённый процесс не подтвердил результат импорта.'
         }
         Advance-OperationStage 'LoadState выполнен на целевом ПК'
+        Write-OperationReport 'СЕТЬ' ('Получатель вернул код результата: ' + $remoteResult)
+        $networkStep = 'Чтение отчёта получателя'
+        Write-Progress -Id 4 -Activity $networkActivity -Status $networkStep -PercentComplete -1
         try {
-            Include-RemoteReport $session $remoteRoot
-            Advance-OperationStage 'Проверен отчёт получателя'
+            if (Include-RemoteReport $session $remoteRoot) {
+                Advance-OperationStage 'Получен отчёт целевого ПК'
+            }
         } catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Импорт подтверждён. Отчёт сохранён на получателе: ' + $_.Exception.Message) }
         Write-OperationReport 'ИТОГ' ('Прямой перенос: ' + $sourceProfile.Account + ' → ' + $targetAccount + '; получатель=' + $remote.Name + '; ZIP=' + $remoteArchive)
         Advance-OperationStage 'Прямой перенос завершён'
         Complete-RemoteMigration $remoteResult $targetAccount
     } catch {
+        $sessionState = if ($session) { [string]$session.State } else { 'нет сеанса' }
+        Write-OperationReport 'ДИАГНОСТИКА' ("Сетевой этап: {0}. Состояние WinRM: {1}." -f $networkStep,$sessionState)
         Write-DiagnosticFailure $_ 'Прямой сетевой перенос'
         if ($session -and $remoteRoot) {
-            try { Include-RemoteReport $session $remoteRoot }
+            try { [void](Include-RemoteReport $session $remoteRoot) }
             catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Удалённый отчёт сейчас недоступен: ' + $_.Exception.Message) }
         }
         if ($remoteRoot) { Write-OperationReport 'ВОССТАНОВЛЕНИЕ' ('Каталог целевого ПК оставлен для повторной проверки: ' + $remoteRoot) }
         if ($remoteArchive) { Write-OperationReport 'ВОССТАНОВЛЕНИЕ' ('ZIP назначения (если уже передан): ' + $remoteArchive) }
         throw
     } finally {
+        Write-Progress -Id 4 -Activity $networkActivity -Completed
         if ($archivePassword) { $archivePassword.Dispose() }
         if ($zipStream) { $zipStream.Dispose() }
         if ($session) {

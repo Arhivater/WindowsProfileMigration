@@ -1,6 +1,7 @@
 ﻿# Главное меню связывает выбор пользователя с нужным действием.
 
 function Invoke-WpmMainMenu {
+$remoteReportStarted = $false
 try {
     Ensure-Admin
     if (-not (Test-Path -LiteralPath (Join-Path $Script:ToolRoot 'Start.cmd') -PathType Leaf)) {
@@ -13,19 +14,24 @@ try {
     # Этот режим вызывается только из предварительно подтверждённой сессии
     # удалённого развертывания. Ни одного интерактивного запроса в этой ветке.
     if ($RemoteImportArchive -or $RemoteTargetAccount -or $RemotePasswordFromInput) {
-        if (-not $RemoteImportArchive -or -not $RemoteTargetAccount) { throw 'Параметры удалённого импорта неполные.' }
-        $isProtected = Test-WpmProtectedArchive $RemoteImportArchive
-        if (-not (Test-Path -LiteralPath $RemoteImportArchive -PathType Leaf) -or
-            (-not $isProtected -and [IO.Path]::GetExtension($RemoteImportArchive) -ine '.zip')) {
-            throw 'Не найден локальный архив удалённого переноса.'
-        }
-        if ($isProtected -ne [bool]$RemotePasswordFromInput) { throw 'Режим передачи пароля не соответствует архиву.' }
-        $remoteUsmt = Get-UsmtPath
-        if (-not $remoteUsmt) { throw 'На целевом компьютере USMT отсутствует. Требуется установка или передача комплекта.' }
         Start-OperationReport 'ИМПОРТ'
+        $remoteReportStarted = $true
         $remotePassword = $null
         try {
-            if ($isProtected) { $remotePassword = Read-RemoteArchivePassword }
+            Advance-OperationStage 'Подготовка удалённого импорта' -Starting
+            if (-not $RemoteImportArchive -or -not $RemoteTargetAccount) { throw 'Параметры удалённого импорта неполные.' }
+            $isProtected = Test-WpmProtectedArchive $RemoteImportArchive
+            if (-not (Test-Path -LiteralPath $RemoteImportArchive -PathType Leaf) -or
+                (-not $isProtected -and [IO.Path]::GetExtension($RemoteImportArchive) -ine '.zip')) {
+                throw 'Не найден локальный архив удалённого переноса.'
+            }
+            if ($isProtected -ne [bool]$RemotePasswordFromInput) { throw 'Режим передачи пароля не соответствует архиву.' }
+            $remoteUsmt = Get-UsmtPath
+            if (-not $remoteUsmt) { throw 'На целевом компьютере USMT отсутствует. Требуется установка или передача комплекта.' }
+            if ($isProtected) {
+                Advance-OperationStage 'Получение пароля архива по закрытому каналу' -Starting
+                $remotePassword = Read-RemoteArchivePassword
+            }
             $outcome = Do-Import $remoteUsmt $false $RemoteImportArchive $RemoteTargetAccount $true -ArchivePassword $remotePassword
             if (-not $outcome -or -not $outcome.PSObject.Properties['Result']) {
                 throw 'Удалённый импорт завершился без подтверждения результата.'
@@ -34,6 +40,7 @@ try {
             if ($outcome.Result) { exit (10 + [int]$outcome.Result) }
             exit 0
         } catch {
+            Write-OperationReport 'ОШИБКА' $_.Exception.Message
             Write-DiagnosticFailure $_ 'Удалённый автоматический импорт'
             Finish-OperationReport 'СБОЙ УДАЛЁННОГО ИМПОРТА'
             throw
@@ -47,7 +54,16 @@ try {
     if ($Script:HadFailures) { exit 1 }
     exit 0
 } catch {
-    Write-Host ('ОШИБКА ЗАПУСКА: ' + $_.Exception.Message) -ForegroundColor Red
+    $failure = $_
+    if (-not $remoteReportStarted) {
+        try {
+            if (-not $Script:ReportPath) { Start-OperationReport 'ЗАПУСК' }
+            Write-OperationReport 'ОШИБКА' $failure.Exception.Message
+            Write-DiagnosticFailure $failure 'Запуск программы или главного меню'
+            Finish-OperationReport 'СБОЙ ЗАПУСКА'
+        } catch { Write-Host ('Отчёт о сбое запуска недоступен: ' + $_.Exception.Message) -ForegroundColor Yellow }
+    }
+    Write-Host ('ОШИБКА ЗАПУСКА: ' + $failure.Exception.Message) -ForegroundColor Red
     if (-not $RemoteImportArchive) { Pause-Menu }
     exit 1
 }
@@ -194,12 +210,14 @@ function Invoke-InteractiveMenu {
             Start-OperationReport $action
             Write-OperationReport 'НАЧАТО' ('Действие: ' + $action)
             if ($number -ne 6 -and -not $usmt) {
+                Advance-OperationStage 'Поиск установленного USMT' -Starting
                 $usmt = Require-USMT
                 if (-not $usmt) {
                     Write-OperationReport 'ПРОВЕРКА' 'USMT не готов. Миграция не запускалась.'
                     continue
                 }
             }
+            if ($number -ne 6) { Write-OperationReport 'USMT' ('Каталог USMT: ' + $usmt) }
             Invoke-MenuAction $number $usmt
         } catch [System.OperationCanceledException] {
             Write-CanceledOperation $_ $action

@@ -1,7 +1,5 @@
 ﻿# Здесь программа записывает ход операции и показывает, где искать причину сбоя.
 
-# One human-readable report per operation. The file name is never reused:
-# CreateNew protects against collisions even when operations start simultaneously.
 # Создаёт уникальный итоговый TXT-отчёт без перезаписи предыдущих результатов.
 function Start-OperationReport([string]$Operation) {
     if ($Script:ReportPath) { throw 'Предыдущий отчёт не завершён.' }
@@ -44,8 +42,13 @@ function Start-OperationReport([string]$Operation) {
                     $Script:ReportErrors = 0
                     Write-Host ('Итоговый отчёт: ' + $candidate) -ForegroundColor Cyan
                     Write-OperationReport 'ДИАГНОСТИКА' ('PowerShell ' + $PSVersionTable.PSVersion +
+                        '; Windows=' + [Environment]::OSVersion.Version + '; архитектура процесса=' + $env:PROCESSOR_ARCHITECTURE +
                         '; PID=' + $PID + '; 64-битный процесс=' + [Environment]::Is64BitProcess +
-                        '; операция=' + $Operation + '; версия инструмента=' + $Script:WpmVersion)
+                        '; часовой пояс=' + [TimeZoneInfo]::Local.Id)
+                    Write-OperationReport 'ДИАГНОСТИКА' ('Идентификатор отчёта: ' + [IO.Path]::GetFileNameWithoutExtension($filename))
+                    if ($root -eq $protectedReports -and $lastError) {
+                        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Основную папку отчётов открыть не удалось: ' + $lastError.Message)
+                    }
                     return
                 } catch [System.IO.IOException] {
                     # On collision try another name. For a read-only drive, fall back
@@ -65,7 +68,9 @@ function Write-OperationReport([string]$Category,[string]$Message) {
     if (-not $Script:ReportPath) { return }
     if ($Category -eq 'ПРЕДУПРЕЖДЕНИЕ') { $Script:ReportWarnings++ }
     if ($Category -eq 'ОШИБКА') { $Script:ReportErrors++ }
-    $line = '[{0}] [{1}] [Этап: {2}] {3}' -f (Get-Date -Format 'HH:mm:ss.fff'),$Category,$Script:ReportPhase,$Message
+    # Исключение или внешний журнал не должны превращаться в поддельные строки отчёта.
+    $messageLine = $Message -replace '[\x00-\x1F\x7F]', ' '
+    $line = '[{0}] [{1}] [Этап: {2}] {3}' -f (Get-Date -Format 'HH:mm:ss.fff'),$Category,$Script:ReportPhase,$messageLine
     try {
         $Script:ReportWriter.WriteLine($line)
     } catch {
@@ -94,15 +99,16 @@ function Finish-OperationReport([string]$Status) {
     try { $Script:ReportWriter.Dispose() }
     catch { Write-Host ('Не удалось закрыть отчёт: ' + $_.Exception.Message) -ForegroundColor Yellow }
     finally { $Script:ReportWriter = $null }
-    foreach ($progressId in 0..6) {
+    foreach ($progressId in 0..15) {
         Write-Progress -Id $progressId -Activity 'Выполнение операции' -Completed
     }
     Write-Host ('Один итоговый отчёт по операции: ' + $completed) -ForegroundColor Cyan
 }
 
-# Состав этапов зависит от сценария. Считаем выполненные этапы, а проценты
-# показываем только для действий с известным объёмом работы.
-function Advance-OperationStage([string]$Stage) {
+# Отмечаем начало до долгой операции, чтобы после сбоя было видно, где она остановилась.
+# Общий процент считаем по заданным контрольным шагам, а не по прошедшему времени.
+function Advance-OperationStage([string]$Stage, [switch]$Starting, [string]$MilestoneActivity = '',
+    [int]$Milestone = 0, [int]$TotalMilestones = 0) {
     if (-not $Script:ReportPath) { return }
     if ($Script:ReportPhaseStart) {
         $seconds = [Math]::Round(((Get-Date) - $Script:ReportPhaseStart).TotalSeconds,1)
@@ -110,10 +116,20 @@ function Advance-OperationStage([string]$Stage) {
     }
     $Script:ReportPhase = $Stage
     $Script:ReportPhaseStart = Get-Date
-    $Script:ProgressStep++
-    Write-Progress -Id 0 -Activity 'Миграция профиля - выполненные этапы' -Status ($Stage +
-        ' | завершено этапов: ' + $Script:ProgressStep) -PercentComplete -1
-    Write-OperationReport 'ЭТАП' ($Stage + '; выполнено этапов: ' + $Script:ProgressStep)
+    if ($Starting) {
+        Write-Progress -Id 0 -Activity 'Текущее действие' -Status $Stage -PercentComplete -1
+        Write-OperationReport 'ЭТАП НАЧАТ' $Stage
+    } else {
+        $Script:ProgressStep++
+        Write-Progress -Id 0 -Activity 'Текущее действие' -Status $Stage -PercentComplete -1
+        Write-OperationReport 'ЭТАП' ($Stage + '; выполнено этапов: ' + $Script:ProgressStep)
+    }
+    if ($TotalMilestones -gt 0) {
+        $percent = [int][Math]::Floor(100.0 * $Milestone / $TotalMilestones)
+        $status = '{0}% по шагам ({1}/{2}) · {3}' -f $percent,$Milestone,$TotalMilestones,$Stage
+        Write-Progress -Id 7 -Activity $MilestoneActivity -Status $status -PercentComplete $percent
+        Write-OperationReport 'ХОД ОПЕРАЦИИ' ($MilestoneActivity + ' · ' + $status)
+    }
 }
 
 # Добавляет в тот же отчёт причину сбоя, тип исключения и точку в скрипте.
@@ -123,8 +139,13 @@ function Write-DiagnosticFailure([object]$ErrorRecord,[string]$Context) {
     try {
         $ex = $ErrorRecord.Exception
         Write-OperationReport 'ДИАГНОСТИКА' ('Контекст: ' + $Context + '; тип: ' + $ex.GetType().FullName + '; причина: ' + $ex.Message)
-        if ($ex.InnerException) {
-            Write-OperationReport 'ДИАГНОСТИКА' ('Внутренняя ошибка: ' + $ex.InnerException.GetType().FullName + ': ' + $ex.InnerException.Message)
+        $cause = $ex.GetBaseException()
+        Write-OperationReport 'ДИАГНОСТИКА' ('HRESULT: 0x{0:X8}' -f $ex.HResult)
+        if ($cause -ne $ex) {
+            Write-OperationReport 'ДИАГНОСТИКА' ('Первопричина: {0}, HRESULT 0x{1:X8}. {2}' -f $cause.GetType().FullName,$cause.HResult,$cause.Message)
+        }
+        if ($cause -is [ComponentModel.Win32Exception]) {
+            Write-OperationReport 'ДИАГНОСТИКА' ('Код Windows: ' + $cause.NativeErrorCode)
         }
         if ($ErrorRecord.FullyQualifiedErrorId) {
             Write-OperationReport 'ДИАГНОСТИКА' ('Код PowerShell: ' + $ErrorRecord.FullyQualifiedErrorId)

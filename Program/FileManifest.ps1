@@ -2,20 +2,40 @@
 
 # Обход без следования junction/symlink и без подавления ошибок доступа.
 function Get-ValidationSourceFiles([string]$ProfilePath) {
-    foreach ($rel in @(Get-ValidationSourceDirectories)) {
-        $dir = Get-ProfileDataItem $ProfilePath $rel
-        if (-not $dir -or -not $dir.PSIsContainer) { continue }
-        $pending = New-Object 'System.Collections.Generic.Stack[string]'
-        $pending.Push([string]$dir.FullName)
-        while ($pending.Count -gt 0) {
-            $current = $pending.Pop()
-            foreach ($child in @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop)) {
-                if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
-                if ($child.PSIsContainer) { $pending.Push([string]$child.FullName) }
-                else { $child }
+    $activity = 'Обход контрольных папок профиля'
+    $directories = @(Get-ValidationSourceDirectories)
+    $checked = 0
+    $files = 0L
+    $links = 0L
+    try {
+        foreach ($rel in $directories) {
+            $percent = [int][Math]::Floor(100.0 * $checked / $directories.Count)
+            Write-Progress -Id 14 -Activity $activity -Status ('Готовых папок {0} из {1}, найдено файлов {2}' -f $checked,$directories.Count,$files) -PercentComplete $percent
+            $checked++
+            $dir = Get-ProfileDataItem $ProfilePath $rel
+            if (-not $dir -or -not $dir.PSIsContainer) { continue }
+            $pending = New-Object 'System.Collections.Generic.Stack[string]'
+            $pending.Push([string]$dir.FullName)
+            while ($pending.Count -gt 0) {
+                $current = $pending.Pop()
+                foreach ($child in @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop)) {
+                    if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                        $links++
+                        continue
+                    }
+                    if ($child.PSIsContainer) { $pending.Push([string]$child.FullName) }
+                    else {
+                        $files++
+                        $child
+                    }
+                }
             }
         }
+        Write-Progress -Id 14 -Activity $activity -Status ('Обход завершён, найдено файлов {0}' -f $files) -PercentComplete 100
+    } finally {
+        Write-Progress -Id 14 -Activity $activity -Completed
     }
+    Write-OperationReport 'ПРОВЕРКА' ('Обход контрольных папок завершён. Файлов {0}, пропущено ссылок {1}.' -f $files,$links)
 }
 function Read-ValidationManifestRecord([string]$Line) {
     if (-not $Line.TrimStart().StartsWith('{')) { throw 'Недопустимая запись контрольного реестра.' }
@@ -34,6 +54,7 @@ function New-ValidationManifest([string]$ProfilePath,[string]$Archive) {
     $writer = [IO.StreamWriter]::new($filename,$false,[Text.UTF8Encoding]::new($false))
     [long]$count = 0
     [long]$bytes = 0
+    Write-OperationReport 'ПРОВЕРКА' 'Начато создание контрольного реестра файлов перед ScanState.'
     try {
         $root = [IO.Path]::GetFullPath($ProfilePath).TrimEnd([IO.Path]::DirectorySeparatorChar)
         Get-ValidationSourceFiles $ProfilePath | ForEach-Object {
@@ -52,9 +73,12 @@ function New-ValidationManifest([string]$ProfilePath,[string]$Archive) {
             $count++
             $bytes += $length
             if (($count % 100) -eq 0) {
-                Write-Progress -Id 2 -Activity 'SHA-256 перед ScanState' -Status ('Проверено файлов: ' + $count)
+                Write-Progress -Id 2 -Activity 'SHA-256 перед ScanState' -Status ('Сверено файлов {0}, байт {1}' -f $count,$bytes) -PercentComplete -1
             }
         }
+    } catch {
+        Write-OperationReport 'ДИАГНОСТИКА' ('Создание реестра прервано. Записей {0}, проверено {1} байт.' -f $count,$bytes)
+        throw
     } finally {
         $writer.Dispose()
         Write-Progress -Id 2 -Activity 'SHA-256 перед ScanState' -Completed
@@ -77,6 +101,9 @@ function Assert-ValidationSourceStable([string]$ProfilePath,[string]$Archive,[ob
     [long]$changed = 0
     $details = New-Object 'System.Collections.Generic.List[string]'
     $reader = [IO.StreamReader]::new($manifestPath,[Text.Encoding]::UTF8)
+    $activity = 'Сверка источника после ScanState'
+    Write-OperationReport 'ПРОВЕРКА' ('Начата повторная сверка источника после ScanState. Записей {0}.' -f $Manifest.Files)
+    Write-Progress -Id 2 -Activity $activity -Status 'Повторная сверка контрольных файлов' -PercentComplete 0
     try {
         while ($null -ne ($line = $reader.ReadLine())) {
             if (-not $line.Trim()) { continue }
@@ -97,13 +124,13 @@ function Assert-ValidationSourceStable([string]$ProfilePath,[string]$Archive,[ob
                 $changed++
                 if ($details.Count -lt 15) { $details.Add('Отсутствует или недоступен: ' + $rel) }
             }
-            if (($checked % 100) -eq 0) {
-                Write-Progress -Id 2 -Activity 'Сверка источника после ScanState' -Status ("Проверено {0}/{1}" -f $checked,$Manifest.Files) -PercentComplete ([int][Math]::Min(100,[Math]::Floor($checked * 100.0 / [Math]::Max(1,[long]$Manifest.Files))))
+            if (($checked % 100) -eq 0 -or $checked -eq $Manifest.Files) {
+                Write-Progress -Id 2 -Activity $activity -Status ("Проверено {0} из {1}, расхождений {2}" -f $checked,$Manifest.Files,$changed) -PercentComplete ([int][Math]::Min(100,[Math]::Floor($checked * 100.0 / [Math]::Max(1,[long]$Manifest.Files))))
             }
         }
     } finally {
         $reader.Dispose()
-        Write-Progress -Id 2 -Activity 'Сверка источника после ScanState' -Completed
+        Write-Progress -Id 2 -Activity $activity -Completed
     }
     if ($checked -ne [long]$Manifest.Files) { throw 'Изменилось число записей контрольного реестра.' }
     [long]$newFiles = 0
@@ -132,6 +159,7 @@ function Assert-ValidationManifestIntegrity([string]$Archive,[object]$Meta) {
     }
     $path = Join-Path $Archive 'Validation\files.jsonl'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'Отсутствует реестр файлов.' }
+    Write-OperationReport 'ПРОВЕРКА' 'Начата проверка SHA-256 и записей контрольного реестра.'
     $actual = Get-ExactFileSha256 $path
     if ($actual -ne [string]$Meta.ValidationManifest.SHA256) {
         throw 'SHA-256 контрольного реестра отличается от сохранённого в метаданных.'
@@ -143,6 +171,8 @@ function Assert-ValidationManifestIntegrity([string]$Archive,[object]$Meta) {
     $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     [decimal]$bytes = 0
     $reader = [IO.StreamReader]::new($path,[Text.Encoding]::UTF8,$true)
+    $activity = 'Проверка записей контрольного реестра'
+    Write-Progress -Id 14 -Activity $activity -Status 'Чтение записей' -PercentComplete 0
     try {
         while ($null -ne ($line = $reader.ReadLine())) {
             if (-not $line.Trim()) { continue }
@@ -152,12 +182,19 @@ function Assert-ValidationManifestIntegrity([string]$Archive,[object]$Meta) {
             if ($paths.Count -gt [long]$info.Files -or $bytes -gt [long]$info.Bytes) {
                 throw 'Контрольный реестр превышает количество файлов или суммарный размер в метаданных.'
             }
+            if ($paths.Count % 100 -eq 0 -or $paths.Count -eq $info.Files) {
+                $percent = [int][Math]::Floor(100.0 * $paths.Count / [long]$info.Files)
+                Write-Progress -Id 14 -Activity $activity -Status ('Проверено {0} из {1} записей' -f $paths.Count,$info.Files) -PercentComplete $percent
+            }
         }
-    } finally { $reader.Dispose() }
+    } finally {
+        $reader.Dispose()
+        Write-Progress -Id 14 -Activity $activity -Completed
+    }
     if ($paths.Count -ne [long]$info.Files -or $bytes -ne [long]$info.Bytes) {
         throw 'Количество файлов или суммарный размер контрольного реестра не совпадает с метаданными.'
     }
-    Write-OperationReport 'ПРОВЕРКА' 'Контрольный реестр файлов прошёл проверку SHA-256.'
+    Write-OperationReport 'ПРОВЕРКА' ('Контрольный реестр прошёл проверку SHA-256. Записей {0}, суммарный размер файлов {1} байт.' -f $paths.Count,$bytes)
 }
 # Сверяет каждый файл реестра по пути, размеру и SHA-256 после LoadState.
 # Несовпадения НЕ превращаем в успешный перенос, даже если код USMT равен 0.
@@ -174,6 +211,8 @@ function Test-ValidationManifest([string]$Archive,[string]$TargetPath,[object]$M
     [long]$modified=0
     $examples = New-Object 'System.Collections.Generic.List[string]'
     $sr=[IO.StreamReader]::new($path,[Text.Encoding]::UTF8)
+    Write-OperationReport 'ПРОВЕРКА' ('Начата сверка восстановленных файлов. Ожидается записей {0}.' -f $expected)
+    Write-Progress -Id 3 -Activity 'Проверка восстановленных данных' -Status 'Чтение записей' -PercentComplete 0
     try {
         while ($null -ne ($line=$sr.ReadLine())) {
             if (-not $line.Trim()) { continue }

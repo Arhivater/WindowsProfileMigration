@@ -190,11 +190,21 @@ function New-ImportLocalAccount([string]$LocalName, [string]$Target, [bool]$Unat
 }
 
 function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOverride = '',[string]$TargetOverride = '',[bool]$Unattended = $false, [Security.SecureString]$ArchivePassword = $null, $PersonalRetry = $null) {
+    $activity = if ($PersonalRetry) { 'Повтор личных файлов' } elseif ($JustVerify) { 'Проверка архива' } else { 'Импорт профиля' }
+    $milestones = if ($PersonalRetry) { 3 } elseif ($JustVerify) { 5 } else { 8 }
+    Advance-OperationStage 'Выбор архива' -Starting -MilestoneActivity $activity -Milestone 0 -TotalMilestones $milestones
     $archive = if ($ArchiveOverride) { $ArchiveOverride } else { Select-Archive }
-    if (-not $archive) { Write-OperationReport 'ОТМЕНА' 'Выбор архива отменён.'; return }
+    if (-not $archive) {
+        Write-OperationReport 'ОТМЕНА' 'Выбор архива отменён.'
+        Write-Progress -Id 7 -Activity $activity -Completed
+        return
+    }
     $isZip = ([IO.Path]::GetExtension($archive) -ieq '.zip')
     $archive = [IO.Path]::GetFullPath($archive)
     $selectedArchive = $archive
+    $isProtected = Test-WpmProtectedArchive $archive
+    $format = if ($isProtected) { 'OpenPGP' } elseif ($isZip) { 'ZIP' } else { 'Папка' }
+    Write-OperationReport 'АРХИВ' ('Формат=' + $format + '; сетевой путь=' + (Test-IsUncPath $archive) + '; автоматический режим=' + $Unattended)
     $operationKind = if ($PersonalRetry) { 'Повтор личных файлов' } elseif ($JustVerify) { 'Проверка архива' } else { 'Импорт' }
     Start-TrackedState $operationKind $selectedArchive
     $stagedArchive = $null
@@ -204,7 +214,8 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     $ownedPassword = $false
     try {
     Advance-OperationStage 'Архив выбран'
-    if (Test-WpmProtectedArchive $archive) {
+    if ($isProtected) {
+        Advance-OperationStage 'Расшифровка архива' -Starting
         if (-not $ArchivePassword) {
             if ($Unattended) { throw 'Для защищённого архива нужен пароль.' }
             $ArchivePassword = Read-WpmArchivePassword
@@ -220,6 +231,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     if ($isZip) {
         $isNetworkZip = Test-IsUncPath $archive
         if ($isNetworkZip) { Ensure-PathAvailable $archive 'Сетевой ZIP' }
+        Advance-OperationStage 'Чтение списка файлов ZIP и проверка места' -Starting
         $zipInfo = Get-ProfileZipInfo $archive
         Assert-ArchiveMetadata $zipInfo.Metadata (-not $JustVerify)
         $stagingRoot = $Script:WpmStagingRoot
@@ -229,6 +241,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         $copyBytes = if ($isNetworkZip) { [double]$zipBytes } else { [double]0 }
         $stagingNeeded = [UInt64]([double]$zipInfo.ExpandedBytes + $copyBytes +
             [Math]::Max([double]1GB,[double]$zipInfo.ExpandedBytes * 0.1))
+        Write-OperationReport 'МЕСТО' ('Распаковка ZIP. Нужно байт=' + $stagingNeeded + '; доступно=' + $stagingFree + '; распакованный объём=' + $zipInfo.ExpandedBytes)
         if ($stagingFree -lt $stagingNeeded) {
             throw ('Недостаточно места для распаковки ZIP на ' + $stagingDrive +
                 '. Нужно примерно ' + (Format-ByteSize $stagingNeeded) +
@@ -247,6 +260,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
             Write-OperationReport 'ПРОВЕРКА' ('Сетевой ZIP перенесён без изменений, SHA-256: ' + $localHash)
         }
         $extracted = Join-Path $stagedArchive 'Archive'
+        Advance-OperationStage 'Распаковка профиля' -Starting
         Write-Host 'Распаковка ZIP перед проверкой и импортом...' -ForegroundColor Cyan
         Expand-ProfileArchive $zipToExpand $extracted
         if ($plainFile) { [IO.File]::Delete($plainFile); $plainFile = $null }
@@ -255,6 +269,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         if (Test-IsUncPath $archive) { Ensure-PathAvailable $archive 'Выбранный сетевой архив' }
         $stagingRoot = $Script:WpmStagingRoot
         Assert-ArchiveCacheOutsideSource $archive $stagingRoot
+        Advance-OperationStage 'Подготовка локальной копии архива-папки' -Starting
         $metadataPath = Join-Path $archive 'metadata.json'
         $earlyMeta = Read-ArchiveMetadataFile $metadataPath
         Assert-ArchiveMetadata $earlyMeta (-not $JustVerify)
@@ -279,21 +294,24 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         $archive = $stagedArchive
     }
     Write-OperationReport 'АРХИВ' ('Выбран: ' + $selectedArchive)
-    Advance-OperationStage 'Архив подготовлен локально'
+    Advance-OperationStage 'Архив подготовлен локально' -MilestoneActivity $activity -Milestone 1 -TotalMilestones $milestones
     Update-TrackedState 'Архив подготовлен'
     $meta = Read-ArchiveMetadataFile (Join-Path $archive 'metadata.json')
     Assert-ArchiveMetadata $meta (-not $JustVerify)
-    Advance-OperationStage 'Проверены метаданные архива'
+    Write-OperationReport 'АРХИВ' ('Версия формата: ' + $meta.SchemaVersion)
+    Advance-OperationStage 'Проверены метаданные архива' -MilestoneActivity $activity -Milestone 2 -TotalMilestones $milestones
     $store = Join-Path $archive 'Store'
     if (-not $JustVerify -and -not $PersonalRetry) {
         $requiredImportBytes = if ($meta.PSObject.Properties.Name -contains 'EstimatedProfileBytes' -and $meta.EstimatedProfileBytes) { [UInt64]$meta.EstimatedProfileBytes } else { [UInt64](Get-FolderMetrics $store).Bytes }
         Test-TargetFreeSpace $requiredImportBytes
     }
     if ($PersonalRetry) {
+        Advance-OperationStage 'Сверка архива, назначения и повтор копирования' -Starting
         $complete = Restore-TrackedPersonalFiles $archive $meta $PersonalRetry
         $retryStatus = if ($complete) { 'Повтор завершён, личные файлы восстановлены' }
             else { 'Повтор завершён частично, остались личные файлы' }
         Update-TrackedState $retryStatus
+        Advance-OperationStage $retryStatus -MilestoneActivity $activity -Milestone 3 -TotalMilestones $milestones
         return $complete
     }
     $logBase = Join-Path $Script:WpmWorkRoot 'Logs'
@@ -304,13 +322,16 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     Write-Host ('Источник: ' + $meta.SourceMachine)
     Write-OperationReport 'ИСТОЧНИК' ('Учётная запись: ' + $meta.SourceAccount + '; компьютер: ' + $meta.SourceMachine)
     Write-OperationReport 'ЖУРНАЛ USMT' ('Проверка: ' + (Join-Path $logRoot 'verify.log'))
+    Advance-OperationStage 'Проверка манифестов и правил USMT' -Starting
     Assert-ValidationManifestIntegrity $archive $meta
     if ([int]$meta.SchemaVersion -ge 7) { Assert-ProfileOnlyArchive $archive $meta }
     elseif ($JustVerify) { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Архив старого формата не подтверждает ограничения одним пользователем и не допускается к импорту.' }
     Advance-OperationStage 'Проверены манифесты и ограничение профиля'
+    Advance-OperationStage 'Проверка хранилища USMT' -Starting
     Verify-Store $Usmt $store $logRoot
-    Advance-OperationStage 'USMT-архив проверен'
+    Advance-OperationStage 'USMT-архив проверен' -MilestoneActivity $activity -Milestone 3 -TotalMilestones $milestones
     Write-OperationReport 'АРХИВ' 'Целостность USMT проверена; это не доказывает полноту исходных данных.'
+    Advance-OperationStage 'Проверка дополнительных файлов' -Starting
     try {
         $approvedExtras = Test-ExtrasManifest $archive $meta
         Advance-OperationStage 'Проверены манифест и хеши дополнительных файлов'
@@ -327,6 +348,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         $sourcePersonalFilesComplete = Write-PersonalFilesCoverage $meta.PersonalFiles
         if (-not $JustVerify) { $additionalBytes = Measure-ArchivedPersonalFiles $archive $approvedExtras }
     }
+    Advance-OperationStage 'Проверка дополнительных файлов завершена' -MilestoneActivity $activity -Milestone 4 -TotalMilestones $milestones
     if ($JustVerify) {
         if ([int]$meta.SchemaVersion -ge 5 -and $approvedExtras.Count -ne [int]$meta.ExtrasManifest.Files) {
             throw 'Проверка USMT завершена, но один или несколько дополнительных файлов не прошли проверку.'
@@ -337,6 +359,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         if (Clear-TrackedStaging $Script:ActiveOpState $false) {
             Advance-OperationStage 'Временные файлы проверки очищены'
         }
+        Advance-OperationStage 'Проверка завершена, отчёт готов' -MilestoneActivity $activity -Milestone 5 -TotalMilestones $milestones
         Finish-OperationReport 'УСПЕШНО'
         return $true
     }
@@ -353,6 +376,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         if (-not $selection) { Write-OperationReport 'ОТМЕНА' 'Выбор назначения отменён.'; return }
         $TargetOverride = $selection.Override
     }
+    Advance-OperationStage 'Проверка учётной записи и свободного места назначения' -Starting
     $mutationLock = Enter-ProfileMutationLock
     $destination = Resolve-ImportTarget $meta $TargetOverride
     $target = $destination.Account
@@ -399,11 +423,13 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
             PersonalManifestHash = Get-ExactFileSha256 (Join-Path $archive 'Validation\extras.jsonl')
         }
     }
+    Advance-OperationStage 'Запуск восстановления через LoadState' -Starting -MilestoneActivity $activity -Milestone 5 -TotalMilestones $milestones
     Invoke-ProfileLoad $Usmt $store $archive $map $logRoot $log
     $targetProfile = Get-TargetUserProfile $target
     if ($targetProfile.Sid -ne $targetSid) { throw 'SID восстановленного профиля отличается от подтверждённой учётной записи.' }
-    Advance-OperationStage 'Целевой профиль обнаружен'
+    Advance-OperationStage 'Целевой профиль обнаружен' -MilestoneActivity $activity -Milestone 6 -TotalMilestones $milestones
     Update-TrackedState 'Профиль найден, выполняется проверка' @{TargetProfile=$targetProfile.Path}
+    Advance-OperationStage 'Восстановление личных файлов' -Starting
     $personalFilesComplete = Restore-PersonalFiles $archive $targetProfile $meta $approvedExtras
     if ($personalFilesComplete) {
         Update-TrackedState '' @{PersonalFilesPending=$false}
@@ -412,6 +438,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         Write-Host $retryHint -ForegroundColor Yellow
         Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' $retryHint
     }
+    Advance-OperationStage 'Сверка восстановленных папок и файлов' -Starting
     $validation = Validate-RestoredProfile $meta $targetProfile
     $validationStatus = 'ОГРАНИЧЕННАЯ ПРОВЕРКА - ДЛЯ СТАРОГО ФОРМАТА НЕТ ПОЛНОГО РЕЕСТРА'
     $fileCheck = $null
@@ -451,6 +478,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     foreach ($missingSample in @($validation.MissingSamples | Select-Object -First 5)) {
         Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не найден контрольный файл: ' + $missingSample)
     }
+    Advance-OperationStage 'Обработка настроек и дополнительных данных' -Starting -MilestoneActivity $activity -Milestone 7 -TotalMilestones $milestones
     if ((Test-Path -LiteralPath (Join-Path $archive 'Extras\Browsers')) -or
         (Test-Path -LiteralPath (Join-Path $archive 'Extras\DesktopLayout.json')) -or
         (Test-Path -LiteralPath (Join-Path $archive 'Extras\Explorer')) -or
@@ -491,6 +519,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     if (Clear-TrackedStaging $Script:ActiveOpState $false) {
         Advance-OperationStage 'Временные файлы очищены'
     }
+    Advance-OperationStage 'Импорт обработан, итог записан' -MilestoneActivity $activity -Milestone 8 -TotalMilestones $milestones
     Finish-OperationReport ('ТЕХНИЧЕСКИ ЗАВЕРШЕНО; '+$validationStatus+$personalStatus+'; ОЖИДАЕТ ПРИЁМКИ')
     Write-Host 'Не удаляйте источник и архив до проверки всех данных.' -ForegroundColor Yellow
     if ($Unattended) {
@@ -553,6 +582,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
             }
         } finally {
             if ($null -ne $mutationLock) { $mutationLock.Dispose() }
+            Write-Progress -Id 7 -Activity $activity -Completed
         }
     }
 }

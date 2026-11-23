@@ -106,13 +106,17 @@ function Resolve-PersonalFolder([string]$Group, [string]$Sid, [string]$ProfileRo
 }
 
 function Get-PersonalFolders([string]$Sid, [string]$ProfileRoot, [bool]$IncludeDocuments) {
-    Assert-NoReparseAncestor $ProfileRoot
-    $settings = Get-PersonalFolderSettings $Sid $ProfileRoot
-    $groups = @('Desktop')
-    if ($IncludeDocuments) { $groups += @('Documents','Downloads') }
-    $folders = [ordered]@{}
-    foreach ($group in $groups) { $folders[$group] = Resolve-PersonalFolder $group $Sid $ProfileRoot $settings }
-    return $folders
+    $activity = 'Поиск личных папок'
+    Write-Progress -Id 8 -Activity $activity -Status 'Чтение настроек профиля' -PercentComplete -1
+    try {
+        Assert-NoReparseAncestor $ProfileRoot
+        $settings = Get-PersonalFolderSettings $Sid $ProfileRoot
+        $groups = @('Desktop')
+        if ($IncludeDocuments) { $groups += @('Documents','Downloads') }
+        $folders = [ordered]@{}
+        foreach ($group in $groups) { $folders[$group] = Resolve-PersonalFolder $group $Sid $ProfileRoot $settings }
+        return $folders
+    } finally { Write-Progress -Id 8 -Activity $activity -Completed }
 }
 
 # Не открываем ссылки, точки подключения и файлы, содержимое которых Windows должна сначала загрузить из облака.
@@ -143,7 +147,9 @@ function Get-PersonalSourceFiles([string]$Folder, [string]$ProfileRoot, [bool]$S
             if (-not (Test-PersonalFileLocal $item)) {
                 if ($Outcome) {
                     $Outcome.Skipped++
-                    Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Пропущена ссылка или облачный объект: ' + $item.FullName)
+                    if ($Outcome.Skipped -le 5) {
+                        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Пропущена ссылка или облачный объект: ' + $item.Name + '. Для переноса нужна локальная копия.')
+                    }
                 }
                 continue
             }
@@ -157,35 +163,51 @@ function Export-PersonalFiles($Profile, [string]$Archive, [bool]$IncludeDocument
     Write-Host 'Копирование личных файлов. Для отмены нажмите 0 без Enter.'
     $counts = @{ Desktop = 0L; Documents = 0L; Downloads = 0L }
     $results = [ordered]@{}
-    foreach ($group in $Folders.Keys) {
-        $folder = $Folders[$group]
-        $result = @{Fallback=[bool]$folder.Fallback; Missing=$false; ReadFailed=$false; Skipped=0L}
-        $results[$group] = $result
-        $prefix = $folder.Path.TrimEnd('\') + '\'
-        $store = Join-Path $Archive ("Extras\UserFiles\$group")
-        try {
-            if ($folder.Redirected) { [void](Get-OwnedRedirectedFolder $folder.Path $Profile.SID) }
-            Get-PersonalSourceFiles $folder.Path $folder.Root ($group -eq 'Desktop') $result | ForEach-Object {
-                $file = $_
-                $destination = Join-Path $store $file.FullName.Substring($prefix.Length)
-                try {
-                    if (-not (Copy-RequiredFile $file.FullName $destination $folder.Root $Archive -AllowCancel)) {
-                        throw 'Файл исчез во время экспорта.'
+    $activity = 'Сохранение личных файлов'
+    $processed = 0
+    $total = $Folders.Count
+    Write-OperationReport 'ФАЙЛЫ' ('Начато копирование личных файлов. Групп: ' + $total)
+    try {
+        foreach ($group in $Folders.Keys) {
+            $percent = [int][Math]::Floor(100.0 * $processed / $total)
+            Write-Progress -Id 8 -Activity $activity -Status ("Групп обработано: {0} из {1}. Сейчас: {2}" -f $processed,$total,$group) -PercentComplete $percent
+            $folder = $Folders[$group]
+            $result = @{Fallback=[bool]$folder.Fallback; Missing=$false; ReadFailed=$false; Skipped=0L}
+            $results[$group] = $result
+            $prefix = $folder.Path.TrimEnd('\') + '\'
+            $store = Join-Path $Archive ("Extras\UserFiles\$group")
+            try {
+                if ($folder.Redirected) { [void](Get-OwnedRedirectedFolder $folder.Path $Profile.SID) }
+                Get-PersonalSourceFiles $folder.Path $folder.Root ($group -eq 'Desktop') $result | ForEach-Object {
+                    $file = $_
+                    $destination = Join-Path $store $file.FullName.Substring($prefix.Length)
+                    try {
+                        if (-not (Copy-RequiredFile $file.FullName $destination $folder.Root $Archive -AllowCancel)) {
+                            throw 'Файл исчез во время экспорта.'
+                        }
+                        $counts[$group]++
+                    } catch [OperationCanceledException] { throw }
+                    catch {
+                        $result.Skipped++
+                        if ($result.Skipped -le 5) {
+                            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалось сохранить файл из группы ' + $group + '. ' + $_.Exception.Message)
+                        }
                     }
-                    $counts[$group]++
-                } catch [OperationCanceledException] { throw }
-                catch {
-                    $result.Skipped++
-                    Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалось сохранить ' + $file.FullName + '. ' + $_.Exception.Message)
                 }
+            } catch [OperationCanceledException] { throw }
+            catch {
+                $result.ReadFailed = $true
+                Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалось полностью прочитать группу ' + $group + '. Проверьте доступ к папке. ' + $_.Exception.Message)
             }
-        } catch [OperationCanceledException] { throw }
-        catch {
-            $result.ReadFailed = $true
-            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалось полностью прочитать ' + $folder.Path + '. ' + $_.Exception.Message)
+            $processed++
         }
+        if ($total) {
+            Write-Progress -Id 8 -Activity $activity -Status ("Групп обработано: {0} из {1}" -f $processed,$total) -PercentComplete 100
+        }
+    } finally {
+        Write-Progress -Id 8 -Activity $activity -Completed
+        Write-OperationReport 'ФАЙЛЫ' ("Обработано групп: {0} из {1}. Сохранено ярлыков: {2}, документов: {3}, загрузок: {4}." -f $processed,$total,$counts.Desktop,$counts.Documents,$counts.Downloads)
     }
-    Write-OperationReport 'ФАЙЛЫ' ("Сохранено ярлыков: {0}, документов: {1}, загрузок: {2}." -f $counts.Desktop,$counts.Documents,$counts.Downloads)
     $inventory = [ordered]@{Version=2; SourceSid=$Profile.SID; IncludeDocuments=$IncludeDocuments; Counts=$counts; Folders=$results}
     [void](Write-PersonalFilesCoverage $inventory)
     return $inventory
@@ -314,6 +336,7 @@ function Restore-PersonalFiles([string]$Archive, $Target, $Metadata, [hashtable]
     if (-not $Metadata.PSObject.Properties['PersonalFiles']) { return $true }
     $keys = @($Approved.Keys | Where-Object { $_.StartsWith('UserFiles\',[StringComparison]::OrdinalIgnoreCase) } | Sort-Object)
     if (-not $keys.Count) { return $true }
+    Write-OperationReport 'ФАЙЛЫ' ('Начато восстановление личных файлов. Файлов в проверенном архиве: ' + $keys.Count)
     if ($Target.Loaded) {
         $message = 'Выйдите из целевой учётной записи Windows и повторите восстановление личных файлов.'
         Write-Host $message -ForegroundColor Yellow
@@ -332,37 +355,58 @@ function Restore-PersonalFiles([string]$Archive, $Target, $Metadata, [hashtable]
         return $false
     }
     $extras = Join-Path $Archive 'Extras'
-    foreach ($key in $keys) {
-        try {
-            $parts = $key -split '\\',3
-            $folder = $folders[$parts[1]]
-            if ($folder.Redirected) { [void](Get-OwnedRedirectedFolder $folder.Path $Target.Sid) }
-            $desired = Join-Path $folder.Path $parts[2]
-            $destination = Get-PersonalDestination $desired $folder.Root $Approved[$key]
-            if (-not $destination) {
-                $matched++
+    $activity = 'Восстановление личных файлов'
+    $processed = 0
+    $failed = 0
+    $conflicts = 0
+    $lastPercent = -1
+    try {
+        foreach ($key in $keys) {
+            $percent = [int][Math]::Floor(100.0 * $processed / $keys.Count)
+            if ($percent -ne $lastPercent) {
+                Write-Progress -Id 8 -Activity $activity -Status ("Файлов обработано: {0} из {1}" -f $processed,$keys.Count) -PercentComplete $percent
+                $lastPercent = $percent
+            }
+            try {
+                $parts = $key -split '\\',3
+                $folder = $folders[$parts[1]]
+                if ($folder.Redirected) { [void](Get-OwnedRedirectedFolder $folder.Path $Target.Sid) }
+                $desired = Join-Path $folder.Path $parts[2]
+                $destination = Get-PersonalDestination $desired $folder.Root $Approved[$key]
+                if (-not $destination) {
+                    $matched++
+                } else {
+                    $source = Join-Path $extras $key
+                    Assert-PersonalDestinationSpace $destination (Get-Item -LiteralPath $source -Force -ErrorAction Stop).Length
+                    if (-not (Copy-RequiredFile $source $destination $Archive $folder.Root '' $Approved[$key] -AllowCancel)) {
+                        throw 'Файл исчез из рабочей копии архива.'
+                    }
+                    $restored++
+                    if ($destination -ine $desired) {
+                        $conflicts++
+                        if ($conflicts -le 5) {
+                            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Имя занято. Копия из архива: ' + $destination)
+                        }
+                    }
+                }
                 if ($folder.Fallback) { $fallback++ }
-                continue
+            } catch [OperationCanceledException] {
+                Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Копирование личных файлов остановлено. Готовые копии сохранены. Для оставшихся файлов воспользуйтесь повтором восстановления.'
+                break
+            } catch {
+                $failed++
+                if ($failed -le 5) {
+                    Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Личный файл ' + $key + ': ' + $_.Exception.Message)
+                }
             }
-            $source = Join-Path $extras $key
-            Assert-PersonalDestinationSpace $destination (Get-Item -LiteralPath $source -Force -ErrorAction Stop).Length
-            if (-not (Copy-RequiredFile $source $destination $Archive $folder.Root '' $Approved[$key] -AllowCancel)) {
-                throw 'Файл исчез из рабочей копии архива.'
-            }
-            $restored++
-            if ($folder.Fallback) { $fallback++ }
-            if ($destination -ine $desired) {
-                Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Имя занято. Копия из архива: ' + $destination)
-            }
-        } catch [OperationCanceledException] {
-            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Копирование личных файлов остановлено. Готовые копии сохранены.'
-            break
-        } catch {
-            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Личный файл ' + $key + ': ' + $_.Exception.Message)
+            $processed++
         }
-    }
+        if ($processed -eq $keys.Count) {
+            Write-Progress -Id 8 -Activity $activity -Status ("Файлов обработано: {0} из {1}" -f $processed,$keys.Count) -PercentComplete 100
+        }
+    } finally { Write-Progress -Id 8 -Activity $activity -Completed }
     $remaining = $keys.Count - $restored - $matched
-    Write-OperationReport 'ФАЙЛЫ' ('Личные файлы: скопировано {0}, уже совпали {1}, осталось {2}.' -f $restored,$matched,$remaining)
+    Write-OperationReport 'ФАЙЛЫ' ('Личные файлы: скопировано {0}, уже совпали {1}, ошибок {2}, осталось {3}, сохранено под другим именем {4}.' -f $restored,$matched,$failed,$remaining,$conflicts)
     if ($fallback) {
         Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Файлов в резервных локальных папках: ' + $fallback + '. Повтор доступен после подключения перенаправленной папки.')
     }
@@ -372,15 +416,28 @@ function Restore-PersonalFiles([string]$Archive, $Target, $Metadata, [hashtable]
 # Оцениваем размер дополнительных копий до выбора места для архива.
 function Measure-PersonalFiles($Folders) {
     [UInt64]$bytes = 0
-    foreach ($group in $Folders.Keys) {
-        $folder = $Folders[$group]
-        try {
-            Get-PersonalSourceFiles $folder.Path $folder.Root ($group -eq 'Desktop') | ForEach-Object {
-                $bytes += [UInt64]$_.Length
+    $activity = 'Оценка объёма личных файлов'
+    $processed = 0
+    $total = $Folders.Count
+    Write-OperationReport 'ФАЙЛЫ' ('Начата оценка объёма. Групп: ' + $total)
+    try {
+        foreach ($group in $Folders.Keys) {
+            $folder = $Folders[$group]
+            $percent = [int][Math]::Floor(100.0 * $processed / $total)
+            Write-Progress -Id 8 -Activity $activity -Status ("Групп просмотрено: {0} из {1}. Сейчас: {2}" -f $processed,$total,$group) -PercentComplete $percent
+            try {
+                Get-PersonalSourceFiles $folder.Path $folder.Root ($group -eq 'Desktop') | ForEach-Object {
+                    $bytes += [UInt64]$_.Length
+                }
+            } catch {
+                Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Оценка объёма группы ' + $group + ' неполная. Проверьте доступ к папке. ' + $_.Exception.Message)
             }
-        } catch {
-            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Оценка объёма личной папки неполная: ' + $folder.Path)
+            $processed++
         }
-    }
+        if ($total) {
+            Write-Progress -Id 8 -Activity $activity -Status ("Групп просмотрено: {0} из {1}" -f $processed,$total) -PercentComplete 100
+        }
+    } finally { Write-Progress -Id 8 -Activity $activity -Completed }
+    Write-OperationReport 'ФАЙЛЫ' ('Оценка объёма личных файлов: ' + (Format-ByteSize $bytes))
     return $bytes
 }

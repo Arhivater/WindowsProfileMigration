@@ -51,6 +51,46 @@ function Test-OfficialInstaller([string]$Path) {
     return ($sig.Status -eq 'Valid' -and $null -ne $sig.SignerCertificate -and
         ([string]$sig.SignerCertificate.Subject -match '(^|,)\s*(O|CN)=Microsoft Corporation(,|$)'))
 }
+# Для ответа с Content-Length считаем долю скачанных байтов.
+# Если сервер не указал размер, показываем объём и время без процента.
+function Save-ADKInstaller([string]$Url,[string]$Path) {
+    $request = [Net.HttpWebRequest]::Create($Url)
+    $request.Timeout = 120000
+    $request.ReadWriteTimeout = 15000
+    $request.MaximumAutomaticRedirections = 10
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $response = $request.GetResponse()
+    try {
+        if ($response.ResponseUri.Scheme -ne 'https') { throw 'Загрузчик ADK должен быть получен по HTTPS.' }
+        $total = $response.ContentLength
+        [long]$downloaded = 0
+        $inputStream = $response.GetResponseStream()
+        try {
+            $outputStream = [IO.File]::Open($Path,'CreateNew','Write','None')
+            try {
+                $buffer = [byte[]]::new(128KB)
+                $nextUpdate = 0L
+                while (($read = $inputStream.Read($buffer,0,$buffer.Length)) -gt 0) {
+                    if ($clock.Elapsed.TotalSeconds -ge 120) { throw 'Истекло время загрузки установщика ADK.' }
+                    if (Test-RunningProcessStopRequest 'загрузку установщика ADK' 1) {
+                        throw [OperationCanceledException]::new('Загрузка установщика ADK отменена.')
+                    }
+                    $outputStream.Write($buffer,0,$read)
+                    $downloaded += $read
+                    if ($clock.ElapsedMilliseconds -lt $nextUpdate -and $downloaded -ne $total) { continue }
+                    $percent = if ($total -gt 0) { [int][Math]::Min(100,[Math]::Floor(100.0 * $downloaded / $total)) } else { -1 }
+                    $status = ('Получено {0} · {1:0.0} с' -f (Format-ByteSize $downloaded),$clock.Elapsed.TotalSeconds)
+                    if ($percent -ge 0) { $status = ('{0}% · {1} из {2}' -f $percent,$status,(Format-ByteSize $total)) }
+                    Write-Progress -Id 1 -Activity 'Загрузка установщика Windows ADK' -Status $status -PercentComplete $percent
+                    $nextUpdate = $clock.ElapsedMilliseconds + 250
+                }
+                if ($total -ge 0 -and $downloaded -ne $total) { throw 'Установщик ADK загружен не полностью.' }
+            } finally { $outputStream.Dispose() }
+        } finally { $inputStream.Dispose() }
+        Write-OperationReport 'ДИАГНОСТИКА' ('Загрузка установщика ADK завершена: {0} байт за {1:0.0} с' -f $downloaded,$clock.Elapsed.TotalSeconds)
+    } finally { $response.Dispose() }
+}
+
 # Скачивает ADK и с отдельного согласия устанавливает только компонент USMT.
 function Install-USMT {
     $item = Get-ADKDownload
@@ -67,33 +107,40 @@ function Install-USMT {
     try {
         [Net.ServicePointManager]::SecurityProtocol = $downloadProtocol -bor [Net.SecurityProtocolType]::Tls12
         Write-Progress -Id 1 -Activity 'Подготовка USMT' -Status 'Скачивание Windows ADK' -PercentComplete -1
-        Invoke-WebRequest -Uri $item.Url -OutFile $installer -UseBasicParsing -MaximumRedirection 10 -TimeoutSec 120
+        Advance-OperationStage 'Загрузка установщика Windows ADK' -Starting -MilestoneActivity 'Подготовка USMT' -Milestone 0 -TotalMilestones 3
+        Write-Host 'Во время загрузки нажмите 0 без Enter, чтобы запросить отмену.'
+        Save-ADKInstaller $item.Url $installer
+        Advance-OperationStage 'Установщик Windows ADK загружен' -MilestoneActivity 'Подготовка USMT' -Milestone 1 -TotalMilestones 3
+        Advance-OperationStage 'Проверка подписи установщика Windows ADK' -Starting
         # Пока проверяется подпись и работает процесс, файл открыт только для чтения.
         $verificationLock = [IO.File]::Open($installer,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
         if (-not (Test-OfficialInstaller $installer)) {
             throw 'Подпись установщика не прошла проверку. Установка остановлена.'
         }
-        Advance-OperationStage 'Подпись установщика Microsoft проверена'
+        Advance-OperationStage 'Подпись установщика Microsoft проверена' -MilestoneActivity 'Подготовка USMT' -Milestone 2 -TotalMilestones 3
         if (-not (Confirm 'Установить компонент USMT?')) { return }
         Write-Progress -Id 1 -Activity 'Подготовка USMT' -Status 'Установка компонента USMT' -PercentComplete -1
+        Advance-OperationStage 'Ожидание установщика USMT' -Starting
         $installerArguments = '/quiet /norestart /ceip off /features OptionId.UserStateMigrationTool'
         $proc = Start-Process -FilePath $installer -ArgumentList $installerArguments -PassThru -Wait -WorkingDirectory $folder -ErrorAction Stop
         $code = $proc.ExitCode
         Write-OperationReport 'ДИАГНОСТИКА' ('Код завершения установщика ADK: ' + $code)
         if ($null -eq $code -or $code -notin @(0,3010)) { throw ('Ошибка установщика ADK, код ' + $code) }
         if ($code -eq 3010) {
+            Advance-OperationStage 'ADK установлен, требуется перезагрузка' -MilestoneActivity 'Подготовка USMT' -Milestone 3 -TotalMilestones 3
             $Script:RestartRequired = $true
             Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Для работы USMT потребуется перезагрузка Windows.'
             Write-Host 'Для работы потребуется перезагрузка Windows.' -ForegroundColor Yellow
             return
         }
         if (-not (Get-UsmtPath)) { throw 'Установка завершилась, но USMT не обнаружен.' }
-        Advance-OperationStage 'Компонент USMT установлен'
+        Advance-OperationStage 'Компонент USMT установлен' -MilestoneActivity 'Подготовка USMT' -Milestone 3 -TotalMilestones 3
     } finally {
         [Net.ServicePointManager]::SecurityProtocol = $downloadProtocol
         if ($proc) { $proc.Dispose() }
         if ($verificationLock) { $verificationLock.Dispose() }
         Write-Progress -Id 1 -Activity 'Подготовка USMT' -Completed
+        Write-Progress -Id 7 -Activity 'Подготовка USMT' -Completed
         try {
             $itemFolder = Get-Item -LiteralPath $folder -Force -ErrorAction Stop
             if ($itemFolder.Attributes -band [IO.FileAttributes]::ReparsePoint) {
@@ -146,7 +193,7 @@ function Quote-WindowsArgument([string]$Value) {
 }
 # Считывает точные проценты только из журнала USMT totalPercentageCompleted.
 # Пока USMT не выдал число, показывает неопределённый ход без фиктивных процентов.
-function Show-UsmtProgress([string]$ProgressPath,[string]$Caption) {
+function Show-UsmtProgress([string]$ProgressPath,[string]$Caption,[double]$ElapsedSeconds = 0,[ref]$LastReported) {
     $last = $null
     if ($ProgressPath -and (Test-Path -LiteralPath $ProgressPath -PathType Leaf)) {
         try {
@@ -162,9 +209,14 @@ function Show-UsmtProgress([string]$ProgressPath,[string]$Caption) {
         } catch { }
     }
     if ($null -ne $last) {
-        Write-Progress -Id 1 -Activity $Caption -Status ('USMT: ' + $last + '%') -PercentComplete $last
+        Write-Progress -Id 1 -Activity $Caption -Status ('USMT: {0}% · {1:0.0} с' -f $last,$ElapsedSeconds) -PercentComplete $last
+        $milestone = [int]([Math]::Floor($last / 25.0)) * 25
+        if ($LastReported -and $milestone -gt $LastReported.Value) {
+            Write-OperationReport 'ХОД USMT' ('{0} · {1}% по журналу · {2:0.0} с' -f $Caption,$last,$ElapsedSeconds)
+            $LastReported.Value = $milestone
+        }
     } else {
-        Write-Progress -Id 1 -Activity $Caption -Status 'Работает USMT, ожидаем данные о прогрессе...'
+        Write-Progress -Id 1 -Activity $Caption -Status ('Ожидание данных USMT · {0:0.0} с' -f $ElapsedSeconds) -PercentComplete -1
     }
 }
 # Во время ScanState, LoadState и сетевого копирования можно запросить отмену.
@@ -188,6 +240,9 @@ function Invoke-USMT([string]$File,[string[]]$Options,[string]$WorkingPath,[stri
     $argLine = (@($Options | ForEach-Object { Quote-WindowsArgument ([string]$_) }) -join ' ')
     $proc = $null
     $code = $null
+    $lastReported = -1
+    $caption = 'Миграция: ' + [IO.Path]::GetFileNameWithoutExtension($File)
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     if ($TrackProcess) {
         # При отсутствующем файле процесса точно не будет. Запись о запуске не нужна.
         if (-not (Test-Path -LiteralPath $File -PathType Leaf -ErrorAction Stop)) {
@@ -196,6 +251,8 @@ function Invoke-USMT([string]$File,[string[]]$Options,[string]$WorkingPath,[stri
         # Сначала записываем имя. Если PowerShell завершится в момент запуска,
         # меню восстановления проверит это имя, даже когда PID ещё неизвестен.
         Update-TrackedState '' @{UsmtProcessName=[IO.Path]::GetFileNameWithoutExtension($File); UsmtProcessId=0; UsmtProcessStartTicks=0}
+        Write-OperationReport 'USMT' ('Запуск ' + [IO.Path]::GetFileName($File) + '; журнал прогресса=' + $ProgressPath)
+        Show-UsmtProgress $ProgressPath $caption 0 ([ref]$lastReported)
     }
     try {
         $proc = Start-Process -FilePath $File -WorkingDirectory $WorkingPath -ArgumentList $argLine -PassThru -NoNewWindow -ErrorAction Stop
@@ -210,11 +267,12 @@ function Invoke-USMT([string]$File,[string[]]$Options,[string]$WorkingPath,[stri
             }
             if ($startTicks) {
                 Update-TrackedState '' @{UsmtProcessId=$proc.Id; UsmtProcessStartTicks=$startTicks}
+                Write-OperationReport 'USMT' ('Дочерний процесс запущен. PID=' + $proc.Id)
             }
         }
         Write-Host 'Во время работы USMT нажмите клавишу 0 (без Enter), чтобы запросить отмену.' -ForegroundColor Yellow
         while (-not $proc.WaitForExit(950)) {
-            Show-UsmtProgress $ProgressPath ('Миграция: '+[IO.Path]::GetFileNameWithoutExtension($File))
+            Show-UsmtProgress $ProgressPath $caption $clock.Elapsed.TotalSeconds ([ref]$lastReported)
             if (Test-RunningProcessStopRequest 'USMT' 1) {
                 if ($proc.HasExited) { break }
                 # Останавливаем только дочерний процесс, запущенный этой операцией.
@@ -230,7 +288,7 @@ function Invoke-USMT([string]$File,[string[]]$Options,[string]$WorkingPath,[stri
                 throw [System.OperationCanceledException]::new(('USMT остановлен пользователем: ' + [IO.Path]::GetFileName($File)))
             }
         }
-        Show-UsmtProgress $ProgressPath ('Миграция: '+[IO.Path]::GetFileNameWithoutExtension($File))
+        Show-UsmtProgress $ProgressPath $caption $clock.Elapsed.TotalSeconds ([ref]$lastReported)
         $code = $proc.ExitCode
     } finally {
         try {
@@ -242,6 +300,7 @@ function Invoke-USMT([string]$File,[string[]]$Options,[string]$WorkingPath,[stri
             Write-Progress -Id 1 -Activity 'USMT' -Completed
         }
     }
+    if ($TrackProcess) { Write-OperationReport 'USMT' ('{0} · время процесса {1:0.0} с' -f $caption,$clock.Elapsed.TotalSeconds) }
     if ($null -eq $code) {
         throw 'Не удалось прочитать код завершения USMT. Проверьте журнал запуска; успех не подтверждён.'
     }

@@ -226,7 +226,7 @@ Invoke-WpmTest 'USMT progress uses valid measured percentages and ignores malfor
         '01 Nov 2026, 10:12:00, totalPercentageCompleted, 100.1'
     ))
     Show-UsmtProgress $log 'ScanState'
-    Assert-WpmEqual $observed.Percent $null
+    Assert-WpmEqual $observed.Percent -1
     Assert-WpmEqual $observed.Activity 'ScanState'
     [IO.File]::AppendAllLines($log, [string[]]@(
         '01 Nov 2026, 10:13:00, totalPercentageCompleted, 12.8',
@@ -300,9 +300,11 @@ Invoke-WpmTest 'Report records warning, duration and final status; all progress 
     . (Get-WpmFunctionDefinitions -Name Write-OperationReport,Advance-OperationStage,Finish-OperationReport)
     $reportFile = Join-Path $WpmTestRoot 'fixture-report.txt'
     $closedProgress = [Collections.Generic.List[int]]::new()
+    $measuredProgress = [Collections.Generic.List[int]]::new()
     function Write-Host {}
     function Write-Progress($Id,$Activity,$Status,$PercentComplete,[switch]$Completed) {
         if ($Completed) { $closedProgress.Add([int]$Id) }
+        elseif ($Id -eq 7) { $measuredProgress.Add([int]$PercentComplete) }
     }
     $writer = [IO.StreamWriter]::new($reportFile, $false, [Text.UTF8Encoding]::new($true))
     $initial = @{
@@ -324,13 +326,20 @@ Invoke-WpmTest 'Report records warning, duration and final status; all progress 
     try {
         Advance-OperationStage 'Проверка данных'
         Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Синтетическое предупреждение'
+        Advance-OperationStage 'Начало проверки' -Starting -MilestoneActivity 'Импорт' -Milestone 0 -TotalMilestones 2
+        Advance-OperationStage 'Проверен архив' -MilestoneActivity 'Импорт' -Milestone 1 -TotalMilestones 2
+        Advance-OperationStage 'Отчёт готов' -MilestoneActivity 'Импорт' -Milestone 2 -TotalMilestones 2
+        Write-OperationReport 'ДИАГНОСТИКА' "Сообщение`nиз двух строк"
         Finish-OperationReport 'УСПЕШНО'
         Assert-WpmEqual $script:ReportWriter $null
         Assert-WpmEqual $script:ReportPath $null
-        Assert-WpmEqual $closedProgress.ToArray() @(0,1,2,3,4,5,6)
+        Assert-WpmEqual $closedProgress.ToArray() @(0..15)
+        Assert-WpmEqual $measuredProgress.ToArray() @(0,50,100)
         $report = [IO.File]::ReadAllText($reportFile)
         Assert-WpmEqual ($report -match 'Синтетическое предупреждение') $true
         Assert-WpmEqual ($report -match 'ВРЕМЯ ЭТАПА.*Предыдущий этап') $true
+        Assert-WpmEqual ($report -match 'ЭТАП НАЧАТ.+Начало проверки') $true
+        Assert-WpmEqual ($report -match 'Сообщение из двух строк') $true
         Assert-WpmEqual ($report -match 'ВРЕМЯ ЭТАПА.*Проверка данных') $true
         Assert-WpmEqual ($report -match 'УСПЕШНО, ЕСТЬ ПРЕДУПРЕЖДЕНИЯ') $true
         Assert-WpmEqual ($report -match 'Предупреждений: 1; ошибок: 0') $true

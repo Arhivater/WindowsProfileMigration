@@ -47,6 +47,46 @@ Invoke-WpmTest 'Archive ZIP round trip preserves paths and bytes' {
     Assert-WpmEqual (Get-ExactFileSha256 $restored) (Get-ExactFileSha256 $original)
 }
 
+Invoke-WpmTest 'Archive inspection closes measured progress on success and error' {
+    $events = [Collections.Generic.List[object]]::new()
+    function Write-Progress([int]$Id,[string]$Activity,[string]$Status,[int]$PercentComplete,[switch]$Completed) {
+        $events.Add([pscustomobject]@{ Id=$Id; Percent=$PercentComplete; Closed=[bool]$Completed })
+    }
+
+    $valid = Join-Path $WpmTestRoot 'valid.zip'
+    New-TestProfileZip $valid @('Extras/example.txt')
+    Assert-WpmEqual (Get-ProfileZipInfo $valid).Files 3
+    Assert-WpmEqual $events[0].Percent -1
+    Assert-WpmEqual $events[1].Percent 0
+    Assert-WpmEqual $events[$events.Count-2].Percent 100
+    Assert-WpmEqual $events[$events.Count-1].Closed $true
+
+    $events.Clear()
+    $invalid = Join-Path $WpmTestRoot 'invalid.zip'
+    New-TestProfileZip $invalid @('Store/../bad.txt')
+    Assert-WpmThrows { Get-ProfileZipInfo $invalid } 'Недопустимый компонент'
+    Assert-WpmEqual @($events | Where-Object { $_.Percent -eq 100 }).Count 0
+    Assert-WpmEqual $events[$events.Count-1].Closed $true
+}
+
+Invoke-WpmTest 'Large file hashing measures bytes and preserves the SHA-256 digest' {
+    $events = [Collections.Generic.List[object]]::new()
+    function Write-Progress([int]$Id,[string]$Activity,[string]$Status,[int]$PercentComplete,[switch]$Completed) {
+        $events.Add([pscustomobject]@{ Id=$Id; Percent=$PercentComplete; Closed=[bool]$Completed })
+    }
+
+    $path = Join-Path $WpmTestRoot 'large.bin'
+    $stream = [IO.File]::Open($path,'CreateNew','Write','None')
+    try {
+        $stream.SetLength(16MB)
+        $stream.WriteByte(17)
+    } finally { $stream.Dispose() }
+    Assert-WpmEqual (Get-ExactFileSha256 $path) (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+    Assert-WpmEqual $events[0].Percent 0
+    Assert-WpmEqual $events[$events.Count-2].Percent 100
+    Assert-WpmEqual $events[$events.Count-1].Closed $true
+}
+
 Invoke-WpmTest 'ZIP rejects ambiguous path components before extraction' {
     foreach ($name in @('Store/../bad.txt','Extras/double//','Extras/file.txt:stream',
         'Extras/LPT¹.log','Extras/CONIN$.txt','Extras/COM1 .txt','Extras/name./file')) {
@@ -259,10 +299,16 @@ if ($PSVersionTable.PSEdition -eq 'Desktop' -and [Environment]::OSVersion.Platfo
     }
 
     Invoke-WpmTest 'Protected archive round trip preserves ZIP bytes with a Unicode password' {
+        $events = [Collections.Generic.List[object]]::new()
+        function Write-Progress([int]$Id,[string]$Activity,[string]$Status,[int]$PercentComplete,[switch]$Completed) {
+            $events.Add([pscustomobject]@{ Id=$Id; Percent=$PercentComplete; Closed=[bool]$Completed })
+        }
         Invoke-WithProtectedFixture $WpmTestRoot {
             param($fixture)
             Convert-WpmArchive $fixture.Protected $fixture.Output $fixture.Password -Decrypt
             Assert-WpmEqual (Get-ExactFileSha256 $fixture.Output) (Get-ExactFileSha256 $fixture.Zip)
+            Assert-WpmEqual @($events | Where-Object { $_.Id -eq 15 -and $_.Percent -eq 100 }).Count 2
+            Assert-WpmEqual $events[$events.Count-1].Closed $true
         }
     }
 

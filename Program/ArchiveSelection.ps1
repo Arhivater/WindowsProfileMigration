@@ -42,45 +42,72 @@ function Get-AvailableArchives([string]$Root = $Script:BackupRoot) {
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return @() }
     try { Assert-NoReparseAncestor $Root }
     catch { return @() }
-    $list = @()
-    $dirs = @((Get-Item -LiteralPath $Root -ErrorAction Stop))
-    $dirs += @(Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue)
-    foreach ($dir in $dirs) {
-        if ($dir.Name -match '\.partial_[a-fA-F0-9]+$') { continue }
-        $metadataPath = Join-Path $dir.FullName 'metadata.json'
-        try {
-            $meta = Read-ArchiveMetadataFile $metadataPath
-            Assert-ArchiveMetadata $meta
-            if (-not (Test-Path -LiteralPath (Join-Path $dir.FullName 'Store') -PathType Container)) { continue }
-            $date = $dir.CreationTime
-            if ($meta.PSObject.Properties['CreatedAt'] -and $meta.CreatedAt) {
-                $parsed = [datetime]::MinValue
-                if ([datetime]::TryParse([string]$meta.CreatedAt,[ref]$parsed)) { $date = $parsed }
-            }
-            $list += [pscustomobject]@{ Path=$dir.FullName; Computer=[string]$meta.SourceMachine;
-                Account=[string]$meta.SourceAccount; Date=$date; Type=[string]$meta.AccountType; Schema=[int]$meta.SchemaVersion; Format='Папка' }
-        } catch { continue }
+    $activity = 'Поиск архивов'
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $showProgress = {
+        if ($checked -eq 0 -or $clock.ElapsedMilliseconds -ge 250) {
+            $percent = [int][Math]::Floor(100.0 * $checked / $total)
+            Write-Progress -Id 14 -Activity $activity -Status ('Проверено {0} из {1}, найдено архивов {2}' -f $checked,$total,$list.Count) -PercentComplete $percent
+            $clock.Restart()
+        }
     }
-    # Новый формат: один ZIP в Backups. Содержимое metadata.json читается
-    # прямо из ZIP, без распаковки всего профиля при открытии меню.
-    foreach ($zipFile in @(Get-ChildItem -LiteralPath $Root -File -Filter '*.zip' -Force -ErrorAction SilentlyContinue)) {
-        try {
-            $info = Get-ProfileZipInfo $zipFile.FullName
-            $meta = $info.Metadata
-            Assert-ArchiveMetadata $meta
-            $date = $zipFile.LastWriteTime
-            if ($meta.PSObject.Properties['CreatedAt'] -and $meta.CreatedAt) {
-                $parsed = [datetime]::MinValue
-                if ([datetime]::TryParse([string]$meta.CreatedAt,[ref]$parsed)) { $date = $parsed }
-            }
-            $list += [pscustomobject]@{ Path=$zipFile.FullName; Computer=[string]$meta.SourceMachine;
-                Account=[string]$meta.SourceAccount; Date=$date; Type=[string]$meta.AccountType; Schema=[int]$meta.SchemaVersion; Format='ZIP' }
-        } catch { continue }
-    }
-    foreach ($item in @(Get-ChildItem -LiteralPath $Root -File -Filter '*.wpm.pgp' -Force -ErrorAction SilentlyContinue)) {
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
-        $list += [pscustomobject]@{Path=$item.FullName; Computer=''; Account=$item.Name; Date=$item.LastWriteTime;
-            Type='С паролем'; Schema=$null; Format='OpenPGP'}
+    Write-Progress -Id 14 -Activity $activity -Status 'Чтение списка файлов и папок' -PercentComplete -1
+    try {
+        $list = @()
+        $dirs = @((Get-Item -LiteralPath $Root -ErrorAction Stop))
+        $dirs += @(Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue)
+        $zipFiles = @(Get-ChildItem -LiteralPath $Root -File -Filter '*.zip' -Force -ErrorAction SilentlyContinue)
+        $protectedFiles = @(Get-ChildItem -LiteralPath $Root -File -Filter '*.wpm.pgp' -Force -ErrorAction SilentlyContinue)
+        $total = $dirs.Count + $zipFiles.Count + $protectedFiles.Count
+        $checked = 0
+        foreach ($dir in $dirs) {
+            & $showProgress
+            $checked++
+            if ($dir.Name -match '\.partial_[a-fA-F0-9]+$') { continue }
+            $metadataPath = Join-Path $dir.FullName 'metadata.json'
+            try {
+                $meta = Read-ArchiveMetadataFile $metadataPath
+                Assert-ArchiveMetadata $meta
+                if (-not (Test-Path -LiteralPath (Join-Path $dir.FullName 'Store') -PathType Container)) { continue }
+                $date = $dir.CreationTime
+                if ($meta.PSObject.Properties['CreatedAt'] -and $meta.CreatedAt) {
+                    $parsed = [datetime]::MinValue
+                    if ([datetime]::TryParse([string]$meta.CreatedAt,[ref]$parsed)) { $date = $parsed }
+                }
+                $list += [pscustomobject]@{ Path=$dir.FullName; Computer=[string]$meta.SourceMachine;
+                    Account=[string]$meta.SourceAccount; Date=$date; Type=[string]$meta.AccountType; Schema=[int]$meta.SchemaVersion; Format='Папка' }
+            } catch { continue }
+        }
+        # Новый формат: один ZIP в Backups. Содержимое metadata.json читается
+        # прямо из ZIP, без распаковки всего профиля при открытии меню.
+        $rejectedZip = 0
+        foreach ($zipFile in $zipFiles) {
+            & $showProgress
+            $checked++
+            try {
+                $info = Get-ProfileZipInfo $zipFile.FullName
+                $meta = $info.Metadata
+                Assert-ArchiveMetadata $meta
+                $date = $zipFile.LastWriteTime
+                if ($meta.PSObject.Properties['CreatedAt'] -and $meta.CreatedAt) {
+                    $parsed = [datetime]::MinValue
+                    if ([datetime]::TryParse([string]$meta.CreatedAt,[ref]$parsed)) { $date = $parsed }
+                }
+                $list += [pscustomobject]@{ Path=$zipFile.FullName; Computer=[string]$meta.SourceMachine;
+                    Account=[string]$meta.SourceAccount; Date=$date; Type=[string]$meta.AccountType; Schema=[int]$meta.SchemaVersion; Format='ZIP' }
+            } catch { $rejectedZip++ }
+        }
+        foreach ($item in $protectedFiles) {
+            & $showProgress
+            $checked++
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            $list += [pscustomobject]@{Path=$item.FullName; Computer=''; Account=$item.Name; Date=$item.LastWriteTime;
+                Type='С паролем'; Schema=$null; Format='OpenPGP'}
+        }
+        Write-Progress -Id 14 -Activity $activity -Status ('Найдено архивов {0}' -f $list.Count) -PercentComplete 100
+        Write-OperationReport 'АРХИВ' ('Поиск архивов завершён. Проверено объектов {0}, найдено архивов {1}, не прошли проверку ZIP {2}.' -f $checked,$list.Count,$rejectedZip)
+    } finally {
+        Write-Progress -Id 14 -Activity $activity -Completed
     }
     return @($list | Sort-Object Date -Descending)
 }
@@ -153,6 +180,8 @@ function Select-Archive {
             $root=$picked
             continue
         }
-        return $archives[$n-1].Path
+        $selected = $archives[$n-1]
+        Write-OperationReport 'АРХИВ' ('Выбран формат {0}, схема {1}.' -f $selected.Format,$selected.Schema)
+        return $selected.Path
     }
 }

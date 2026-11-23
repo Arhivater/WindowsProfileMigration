@@ -136,7 +136,8 @@ function Assert-LabReport([string]$Root, [string]$Operation, [string[]]$Previous
     if ($body -notmatch ('(?m)^Операция: ' + [regex]::Escape($Operation) + '\r?$') -or
         $body -notmatch '(?m)Код завершения UsmtUtils\.exe: 0\r?$' -or
         $body -notmatch '(?m)\] Результат операции: УСПЕШНО(, ЕСТЬ ПРЕДУПРЕЖДЕНИЯ)?\r?$' -or
-        $body -notmatch '(?m)\] Предупреждений: \d+; ошибок: 0\r?$') { throw 'REPORT' }
+        $body -notmatch '(?m)\] Предупреждений: \d+; ошибок: 0\r?$' -or
+        $body -notmatch '\[ЭТАП НАЧАТ\]' -or $body -notmatch '\[ХОД ОПЕРАЦИИ\].+100% по шагам') { throw 'REPORT' }
     return $new[0].FullName
 }
 

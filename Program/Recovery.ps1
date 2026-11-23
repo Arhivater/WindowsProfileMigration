@@ -244,20 +244,34 @@ function Assert-TrackedOperationStopped([object]$State) {
 function Assert-OperationTreeHasNoReparsePoint([string]$Path) {
     $pending = [Collections.Generic.Stack[string]]::new()
     $pending.Push($Path)
-    while ($pending.Count -gt 0) {
-        $item = Get-Item -LiteralPath ($pending.Pop()) -Force -ErrorAction Stop
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-            throw ('Зарегистрированный путь содержит ссылку: ' + $item.FullName)
-        }
-        if ($item.PSIsContainer) {
-            foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction Stop)) {
-                $pending.Push($child.FullName)
+    $activity = 'Проверка дерева временного каталога'
+    $checked = 0L
+    $refresh = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        Write-Progress -Id 10 -Activity $activity -Status 'Начат обход файлов и папок' -PercentComplete -1
+        while ($pending.Count -gt 0) {
+            $item = Get-Item -LiteralPath ($pending.Pop()) -Force -ErrorAction Stop
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw ('Зарегистрированный путь содержит ссылку: ' + $item.FullName)
+            }
+            $checked++
+            if ($refresh.ElapsedMilliseconds -ge 350) {
+                Write-Progress -Id 10 -Activity $activity -Status ('Проверено объектов: ' + $checked) -PercentComplete -1
+                $refresh.Restart()
+            }
+            if ($item.PSIsContainer) {
+                foreach ($child in @(Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction Stop)) {
+                    $pending.Push($child.FullName)
+                }
             }
         }
+    } finally {
+        Write-Progress -Id 10 -Activity $activity -Completed
     }
+    return $checked
 }
 # Разрешена очистка только собственных временных каталогов под ProgramData.
-function Assert-SafeStaging([string]$Candidate) {
+function Assert-SafeStaging([string]$Candidate, [switch]$ReportTree) {
     if (-not $Candidate) { throw 'Временная папка не указана.' }
     $base = [IO.Path]::GetFullPath($Script:WpmStagingRoot)
     $full = [IO.Path]::GetFullPath($Candidate)
@@ -268,16 +282,24 @@ function Assert-SafeStaging([string]$Candidate) {
     Assert-WpmWorkRoot
     Assert-WpmWorkAcl $base
     Assert-WpmDirectoryChain $full
-    if (Test-Path -LiteralPath $full -ErrorAction Stop) { Assert-OperationTreeHasNoReparsePoint $full }
+    if (Test-Path -LiteralPath $full -ErrorAction Stop) {
+        $checked = Assert-OperationTreeHasNoReparsePoint $full
+        if ($ReportTree) {
+            Write-OperationReport 'ПРОВЕРКА' ('Перед очисткой проверено объектов во временном каталоге: ' + $checked)
+        }
+    }
     return $full
 }
 function Clear-TrackedStaging([hashtable]$State,[bool]$Ask = $false) {
     if (-not $State.StagingPath) { return $true }
-    $safe=Assert-SafeStaging ([string]$State.StagingPath)
-    if ($Ask -and -not (Confirm ('Удалить только временный каталог ' + $safe + ' ?'))) { return $false }
+    $safe=Assert-SafeStaging ([string]$State.StagingPath) -ReportTree:(-not $Ask)
+    if ($Ask -and -not (Confirm ('Удалить только временный каталог ' + $safe + ' ?'))) {
+        Write-OperationReport 'ОТМЕНА' 'Удаление временного каталога не подтверждено.'
+        return $false
+    }
     try {
         Assert-TrackedUsmtStopped $State
-        if ($Ask) { $safe = Assert-SafeStaging ([string]$State.StagingPath) }
+        if ($Ask) { $safe = Assert-SafeStaging ([string]$State.StagingPath) -ReportTree }
         if (Test-Path -LiteralPath $safe -ErrorAction Stop) { Remove-Item -LiteralPath $safe -Recurse -Force -ErrorAction Stop }
         $State.CleanupDone=$true; $State.StagingDisposition='Временная копия удалена'
         Save-TrackedState $State
@@ -469,6 +491,8 @@ function Restore-TrackedPersonalFiles([string]$Archive, $Metadata, $State) {
     }
     $approved = Test-ExtrasManifest $Archive $Metadata
     Assert-PersonalFilesInventory $Metadata $approved
+    $personalCount = @($approved.Keys -like 'UserFiles\*').Count
+    Write-OperationReport 'ПРОВЕРКА' ('Подтверждён исходный архив, личных файлов в перечне: ' + $personalCount)
     $target = Get-TargetUserProfile $State.TargetAccount
     if ($target.Sid -ne $State.TargetSid -or ($State.TargetProfile -and $target.Path -ine $State.TargetProfile)) {
         throw 'Профиль назначения изменился после импорта.'
@@ -480,8 +504,14 @@ function Restore-TrackedPersonalFiles([string]$Archive, $Metadata, $State) {
 }
 
 function Invoke-PersonalFilesRetry($State, [hashtable]$Changes) {
-    if (-not (Test-PersonalFilesRetryAvailable $State)) { return $false }
-    if (-not (Confirm ('Восстановить личные файлы для ' + $State.TargetAccount + '?'))) { return $false }
+    if (-not (Test-PersonalFilesRetryAvailable $State)) {
+        Write-OperationReport 'ВОССТАНОВЛЕНИЕ' 'В записи нет личных файлов, ожидающих повтора.'
+        return $false
+    }
+    if (-not (Confirm ('Восстановить личные файлы для ' + $State.TargetAccount + '?'))) {
+        Write-OperationReport 'ОТМЕНА' 'Повтор личных файлов не подтверждён.'
+        return $false
+    }
     $archive = [string]$State.SourceArchive
     if (Test-Path -LiteralPath $archive) {
         Write-Host ('1. Использовать архив из журнала: ' + $archive)
@@ -496,6 +526,8 @@ function Invoke-PersonalFilesRetry($State, [hashtable]$Changes) {
         $archive = Select-Archive
     }
     if (-not $archive) { return $false }
+    $archiveOrigin = if ($archive -ieq $State.SourceArchive) { 'архив из записи' } else { 'другая копия архива' }
+    Write-OperationReport 'ВОССТАНОВЛЕНИЕ' ('Для повтора выбран источник: ' + $archiveOrigin)
     # Проверка обоих SHA-256 выполняется и при выборе другой копии.
     # При ошибке прежний путь в журнале сохраняется.
     try { $complete = Do-Import -ArchiveOverride $archive -PersonalRetry $State }
@@ -520,18 +552,35 @@ function Invoke-PersonalFilesRetry($State, [hashtable]$Changes) {
 
 # Сначала берём блокировку, затем заново читаем состояние. Другая операция могла изменить его, пока меню было открыто.
 function Invoke-TrackedRecovery([string]$Id, [int]$Action) {
+    $actions = @{
+        1 = 'Очистка временного каталога'
+        2 = 'Удаление созданной программой пустой учётной записи'
+        3 = 'Откат параметров значков'
+        4 = 'Очистка незавершённой копии'
+        5 = 'Подтверждение повторного импорта'
+        6 = 'Повтор восстановления личных файлов'
+    }
     $lock = $null
     try {
         Start-OperationReport 'ВОССТАНОВЛЕНИЕ'
-        Write-OperationReport 'ДЕЙСТВИЕ' ('Операция ' + $Id + ', пункт ' + $Action)
+        $actionName = $actions[$Action]
+        if (-not $actionName) { throw 'Неизвестное действие восстановления.' }
+        Write-OperationReport 'ДЕЙСТВИЕ' ('Операция ' + $Id + ', пункт ' + $Action + ', ' + $actionName)
+        Advance-OperationStage 'Чтение записи операции и проверка процессов'
         $lock = Enter-ProfileMutationLock
         $state = Get-TrackedStates -RequireReadable -Id $Id
         if (-not $state) { throw 'Запись выбранной операции больше недоступна.' }
+        $personalPending = $state.PSObject.Properties['PersonalFilesPending'] -and $state.PersonalFilesPending
+        Write-OperationReport 'СОСТОЯНИЕ' ("Операция: {0}, состояние: {1}, USMT запущен: {2}, USMT завершён: {3}, личные файлы требуют повтора: {4}." -f $state.Kind,$state.Status,$state.USMTStarted,$state.USMTFinished,$personalPending)
         Assert-TrackedOperationStopped $state
+        Advance-OperationStage $actionName
         $changes = @{}
         foreach ($property in $state.PSObject.Properties) { $changes[$property.Name] = $property.Value }
         if (Invoke-RecoveryAction $Action $state $changes) {
+            Write-OperationReport 'ВОССТАНОВЛЕНИЕ' ('Действие выполнено. Состояние исходной записи: ' + $changes.Status)
             Finish-OperationReport 'УСПЕШНО'
+        } elseif ($Script:ReportPath) {
+            Write-OperationReport 'ВОССТАНОВЛЕНИЕ' 'Действие не завершено. Проверьте условие или подтверждение выше.'
         }
     } catch [OperationCanceledException] {
         Write-OperationReport 'ОТМЕНА' $_.Exception.Message
@@ -551,19 +600,31 @@ function Invoke-TrackedRecovery([string]$Id, [int]$Action) {
 function Invoke-RecoveryAction([int]$Action, $State, [hashtable]$Changes) {
     switch ($Action) {
         1 {
-            if (-not $State.StagingPath -or $State.CleanupDone) { Write-Host 'Временной копии нет.'; return $false }
+            if (-not $State.StagingPath -or $State.CleanupDone) {
+                Write-Host 'Временной копии нет.'
+                Write-OperationReport 'ВОССТАНОВЛЕНИЕ' 'Временной копии нет.'
+                return $false
+            }
             return (Clear-TrackedStaging $Changes $true)
         }
         2 { return (Remove-RecoveryAccount $State $Changes) }
         3 {
-            if (-not $State.DesktopBackup) { Write-Host 'Резервной копии значков нет.'; return $false }
+            if (-not $State.DesktopBackup) {
+                Write-Host 'Резервной копии значков нет.'
+                Write-OperationReport 'ВОССТАНОВЛЕНИЕ' 'Резервной копии значков нет.'
+                return $false
+            }
             if (-not $State.PSObject.Properties['DesktopBackupSha256'] -or -not $State.DesktopBackupSha256) {
                 throw 'Для резервной копии отсутствует зарегистрированная контрольная сумма.'
             }
             return (Restore-PreviousDesktopLayout ([string]$State.DesktopBackup) ([string]$State.DesktopBackupSha256))
         }
         4 {
-            if (-not $State.NetworkPartialPath) { Write-Host 'Незавершённой копии нет.'; return $false }
+            if (-not $State.NetworkPartialPath) {
+                Write-Host 'Незавершённой копии нет.'
+                Write-OperationReport 'ВОССТАНОВЛЕНИЕ' 'Незавершённой копии нет.'
+                return $false
+            }
             return (Clear-NetworkPartial $Changes)
         }
         5 { return (Confirm-ImportRetry $State $Changes) }

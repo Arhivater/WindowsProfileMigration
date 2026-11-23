@@ -62,6 +62,25 @@ Invoke-WpmTest 'Network receiver checks block hash and offset before publishing 
     }
 }
 
+Invoke-WpmTest 'Network archive hash reports measured bytes and closes progress' {
+    $data = [byte[]](1,2,3,4,5)
+    $source = [IO.MemoryStream]::new($data)
+    $marks = [Collections.Generic.List[int]]::new()
+    $state = @{ Finished=$false }
+    function Write-Progress {
+        param([int]$Id,[string]$Activity,[string]$Status,[int]$PercentComplete,[switch]$Completed)
+        Assert-WpmEqual $Id 5
+        if ($Completed) { $state.Finished = $true }
+        else { $marks.Add($PercentComplete) }
+    }
+    try {
+        $hash = (Get-FileHash -InputStream $source -Algorithm SHA256).Hash
+        Assert-WpmEqual (Get-RemoteTransferPrefixHash $source $data.Length ([byte[]]::new(2)) 'Сверка архива') $hash
+        Assert-WpmEqual @($marks.ToArray()) @(40,80,100)
+        Assert-WpmEqual $state.Finished $true
+    } finally { $source.Dispose() }
+}
+
 Invoke-WpmTest 'Network resume reuses committed bytes after a lost block acknowledgement' {
     $data = [byte[]]::new(2MB+17)
     for ($i=0; $i -lt $data.Length; $i+=137) { $data[$i] = [byte]($i % 251) }
@@ -71,6 +90,13 @@ Invoke-WpmTest 'Network resume reuses committed bytes after a lost block acknowl
     $expectedHash = (Get-FileHash -InputStream $source -Algorithm SHA256).Hash
     $session = [pscustomobject]@{State='Opened'}
     $offsets = [Collections.Generic.List[long]]::new()
+    $reports = [Collections.Generic.List[string]]::new()
+    $progress = [Collections.Generic.List[int]]::new()
+    function Write-OperationReport([string]$Category,[string]$Message) { $reports.Add($Message) }
+    function Write-Progress {
+        param([int]$Id,[string]$Activity,[string]$Status,[int]$PercentComplete,[switch]$Completed)
+        if ($Id -eq 4 -and -not $Completed) { $progress.Add($PercentComplete) }
+    }
     function Remove-PSSession { param($Session,$ErrorAction) }
     function Start-Sleep { param($Seconds) }
     function Connect-RemoteMigration { param($Connection,$ExpectedComputer) return [pscustomobject]@{State='Opened'} }
@@ -91,6 +117,10 @@ Invoke-WpmTest 'Network resume reuses committed bytes after a lost block acknowl
         Assert-WpmEqual @($offsets) @(5L,(2MB+5L))
         Assert-WpmEqual (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash $expectedHash
         Assert-WpmEqual $session.State 'Opened'
+        Assert-WpmEqual ($progress.Contains(100)) $true
+        Assert-WpmEqual ($progress.Contains(-1)) $true
+        Assert-WpmEqual @($reports | Where-Object { $_ -match 'Попытка [12] из 3' }).Count 2
+        Assert-WpmEqual @($reports | Where-Object { $_ -like ('Получатель подтвердил ' + $data.Length + ' байт*') }).Count 1
     } finally { $source.Dispose() }
 }
 

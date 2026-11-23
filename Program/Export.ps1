@@ -247,6 +247,7 @@ function Save-ProfileScopeProof($ListPath, $ProfilePath, $Archive, $Rules) {
 }
 
 function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$ForcedRoot = '',[bool]$KeepReportOpen = $false,[bool]$AutoApprove = $false, [Security.SecureString]$ArchivePassword = $null) {
+    Advance-OperationStage 'Выбор исходного профиля' -Starting -MilestoneActivity 'Экспорт профиля' -Milestone 0 -TotalMilestones 8
     $p = if ($SelectedProfile) { $SelectedProfile } else { Select-Profile }
     if (-not $p) { Write-OperationReport 'ОТМЕНА' 'Выбор профиля отменён.'; return }
     Advance-OperationStage 'Выбран исходный профиль'
@@ -264,23 +265,26 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
     Assert-ExportProfileReady $p 'перед оценкой файлов'
     $ownedPassword = -not $PSBoundParameters.ContainsKey('ArchivePassword')
     try {
+    Advance-OperationStage 'Выбор файлов и защиты архива' -Starting
     $includeDocuments = Read-PersonalFilesChoice
     if ($ownedPassword) { $ArchivePassword = Read-WpmExportPassword }
     Assert-NoReparseAncestor $p.Path
     Write-Host 'Оценка размера профиля...' -ForegroundColor Cyan
+    Advance-OperationStage 'Оценка объёма профиля' -Starting
     $profileMetrics = Get-FolderMetrics $p.Path
     $estimatedBytes = [UInt64]$profileMetrics.Bytes
     $personalFolders = Get-PersonalFolders $p.SID $p.Path $includeDocuments
     $personalBytes = Measure-PersonalFiles $personalFolders
     $packageInputBytes = [UInt64]($estimatedBytes + $personalBytes)
     $baseline = Get-ProfileValidationBaseline $p.Path
-    Advance-OperationStage 'Подсчитан размер исходного профиля'
+    Advance-OperationStage 'Подсчитан размер исходного профиля' -MilestoneActivity 'Экспорт профиля' -Milestone 1 -TotalMilestones 8
     Write-Host ('Оценочный размер профиля: ' + (Format-ByteSize $estimatedBytes) + '; файлов: ' + $profileMetrics.Files) -ForegroundColor Green
     Write-OperationReport 'ПРОВЕРКА' ('Оценочный размер профиля: ' + (Format-ByteSize $estimatedBytes) + '; файлов: ' + $profileMetrics.Files)
     if ($profileMetrics.SkippedLinks -gt 0) {
         Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не учитывались точки соединения и символические ссылки: ' + $profileMetrics.SkippedLinks)
     }
     Write-OperationReport 'ПРОВЕРКА' 'Объём профиля - оценка, а не точный размер USMT: служебные данные архива и дополнительные файлы модулей учитываются при экспорте.'
+    Advance-OperationStage 'Проверка папки и свободного места для экспорта' -Starting
     $root = if ($ForcedRoot) { $ForcedRoot } else { Select-SaveLocation }
     if (-not $root) { Write-OperationReport 'ОТМЕНА' 'Выбор каталога сохранения отменён.'; return }
     Write-OperationReport 'ПУТЬ' ('Папка резервных копий: ' + $root)
@@ -326,7 +330,7 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
         [void](Clear-TrackedStaging $Script:ActiveOpState $false)
         return
     }
-    Advance-OperationStage 'Экспорт подтверждён'
+    Advance-OperationStage 'Экспорт подтверждён' -MilestoneActivity 'Экспорт профиля' -Milestone 2 -TotalMilestones 8
     Write-OperationReport 'АРХИВ' ('Создаётся: ' + $archive)
     $store = Join-Path $archive 'Store'
     $logBase = Join-Path $Script:WpmWorkRoot 'Logs'
@@ -334,25 +338,31 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
     $logs = Join-Path $logBase ('Export_' + $folderName)
     [void](New-Item -Path $store -ItemType Directory -Force)
     [void](New-Item -Path $logs -ItemType Directory -Force)
+    Advance-OperationStage 'Подготовка правил USMT' -Starting
     $rules = New-ProfileOnlyRules $archive $Usmt $logs
     Advance-OperationStage 'Подготовлены правила USMT'
     # Перед ScanState сохраняем SHA-256, не после. Затем сверим источник повторно.
     Assert-ExportProfileReady $p 'перед созданием контрольного реестра'
     Write-Host 'Формирование контрольного списка ДО ScanState...' -ForegroundColor Cyan
+    Advance-OperationStage 'Расчёт контрольных сумм источника' -Starting
     $manifest = New-ValidationManifest $p.Path $archive
-    Advance-OperationStage 'Создан контрольный реестр до ScanState'
+    Advance-OperationStage 'Создан контрольный реестр до ScanState' -MilestoneActivity 'Экспорт профиля' -Milestone 3 -TotalMilestones 8
     Assert-ExportProfileReady $p 'перед ScanState'
     $listPath = Join-Path $logs 'usmt-files.txt'
+    Advance-OperationStage 'Сохранение профиля через ScanState' -Starting
     Invoke-ProfileScan $Usmt $store $rules $logs $listPath $p.Account
     $scopeProof = Save-ProfileScopeProof $listPath $p.Path $archive $rules
+    Advance-OperationStage 'Проверка созданного хранилища USMT' -Starting
     Verify-Store $Usmt $store $logs
-    Advance-OperationStage 'Целостность USMT проверена'
+    Advance-OperationStage 'Целостность USMT проверена' -MilestoneActivity 'Экспорт профиля' -Milestone 4 -TotalMilestones 8
     Write-OperationReport 'УСПЕХ' ('USMT-архив проверен. Файл: ' + (MigFile $store))
+    Advance-OperationStage 'Сохранение настроек браузеров' -Starting
     $browserCount = 0
     try { $browserCount = Export-BrowserExtras $p $archive }
     catch { Write-Host ('Дополнительный перенос браузеров пропущен: ' + $_.Exception.Message) -ForegroundColor Yellow
         Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Браузеры: ' + $_.Exception.Message) }
     Advance-OperationStage 'Завершена обработка браузеров'
+    Advance-OperationStage 'Сохранение значков, настроек и сетевых дисков' -Starting
     $layoutSaved = $false
     try { $layoutSaved = Export-DesktopLayout $p $archive }
     catch { Write-Host ('Расположение значков не сохранено: ' + $_.Exception.Message) -ForegroundColor Yellow
@@ -364,11 +374,14 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
     Advance-OperationStage 'Сохранены дополнительные настройки Проводника, 1С и дисков'
     Write-OperationReport 'НАСТРОЙКИ' ('Расположение значков: ' + $(if ($layoutSaved) { 'сохранено (без гарантии восстановления на другом мониторе)' } else { 'не сохранено' }))
     Assert-ExportProfileReady $p 'перед повторной сверкой'
+    Advance-OperationStage 'Сохранение личных файлов и ярлыков' -Starting
     $personalFiles = Export-PersonalFiles $p $archive $includeDocuments $personalFolders
     Write-Host 'Повторная сверка SHA-256 источника ПОСЛЕ ScanState...' -ForegroundColor Cyan
+    Advance-OperationStage 'Повторная сверка контрольных сумм источника' -Starting
     $consistency = Assert-ValidationSourceStable $p.Path $archive $manifest
     Assert-ExportProfileReady $p 'после повторной сверки'
-    Advance-OperationStage 'Подтверждена неизменность исходных файлов'
+    Advance-OperationStage 'Подтверждена неизменность исходных файлов' -MilestoneActivity 'Экспорт профиля' -Milestone 5 -TotalMilestones 8
+    Advance-OperationStage 'Подготовка метаданных и манифеста дополнительных файлов' -Starting
     $extrasManifest=New-ExtrasManifest $archive
     $exportLogs = Join-Path $archive 'Logs'
     [void](New-Item -Path $exportLogs -ItemType Directory -Force)
@@ -382,7 +395,7 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
         ArchiveBytes=[UInt64]$archiveMetrics.Bytes; ValidationBaseline=$baseline; ValidationManifest=$manifest; ValidationConsistency=$consistency; ExtrasManifest=$extrasManifest;
         ProfileScope=$scopeProof; PersonalFiles=$personalFiles }
     $meta | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $archive 'metadata.json') -Encoding UTF8
-    Advance-OperationStage 'Созданы метаданные и манифест Extras'
+    Advance-OperationStage 'Созданы метаданные и манифест Extras' -MilestoneActivity 'Экспорт профиля' -Milestone 6 -TotalMilestones 8
     Write-OperationReport 'УСПЕХ' ('Метаданные архива записаны. Браузерных файлов сохранено: ' + $browserCount)
     Write-OperationReport 'ЖУРНАЛ USMT' ('Технические файлы: ' + $exportLogs)
     # ZIP создаётся рядом с рабочим каталогом, затем передаётся в целевую
@@ -391,6 +404,7 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
     $localZip = Join-Path $staging $partialName
     $publishedPartial = Join-Path $root $partialName
     try {
+        Advance-OperationStage 'Упаковка и защита архива' -Starting
         Write-Host 'Упаковка экспортированного профиля в один ZIP...' -ForegroundColor Cyan
         Update-TrackedState 'Упаковка ZIP'
         if ($ArchivePassword) {
@@ -400,7 +414,8 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
                 Convert-WpmArchive $plain $localZip $ArchivePassword
             } finally { [IO.File]::Delete($plain) }
         } else { Compress-ProfileArchive $archive $localZip }
-        Advance-OperationStage 'ZIP упакован и проверен'
+        Advance-OperationStage 'ZIP упакован и проверен' -MilestoneActivity 'Экспорт профиля' -Milestone 7 -TotalMilestones 8
+        Advance-OperationStage 'Копирование и публикация архива' -Starting
         Update-TrackedState 'Публикация ZIP' @{NetworkPartialPath=$publishedPartial}
         Ensure-PathAvailable $root 'Папка назначения'
         if (Test-Path -LiteralPath $finalArchive) { throw 'Готовый ZIP с этим именем уже существует.' }
@@ -413,6 +428,7 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
         Advance-OperationStage 'ZIP опубликован в папке назначения'
         Update-TrackedState 'ZIP опубликован' @{NetworkPartialPath=''}
         Write-OperationReport 'УСПЕХ' ('ZIP проверен и опубликован: ' + $finalArchive)
+        Advance-OperationStage 'Очистка рабочей копии экспорта' -Starting
         [void](Clear-TrackedStaging $Script:ActiveOpState $false)
         $archive = $finalArchive
     } catch [System.OperationCanceledException] {
@@ -429,6 +445,7 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
         throw
     }
     Update-TrackedState 'Экспорт завершён'
+    Advance-OperationStage 'Экспорт завершён' -MilestoneActivity 'Экспорт профиля' -Milestone 8 -TotalMilestones 8
     Write-OperationReport 'УСПЕХ' ('Архив экспорта готов: ' + $archive)
     if (-not $KeepReportOpen) { Finish-OperationReport 'УСПЕШНО' }
     Write-Host ('Экспорт готов: ' + $archive) -ForegroundColor Green
@@ -436,5 +453,8 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
         Write-Host 'Для импорта запустите этот же Start.cmd на другом устройстве (или скопируйте весь комплект с Backups).'
     }
     return $archive
-    } finally { if ($ownedPassword -and $ArchivePassword) { $ArchivePassword.Dispose() } }
+    } finally {
+        if ($ownedPassword -and $ArchivePassword) { $ArchivePassword.Dispose() }
+        Write-Progress -Id 7 -Activity 'Экспорт профиля' -Completed
+    }
 }

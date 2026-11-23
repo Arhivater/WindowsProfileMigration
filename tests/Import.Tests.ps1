@@ -198,6 +198,7 @@ Invoke-WpmTest 'Successful personal-file retry retains an unfinished import erro
     function Confirm { return $true }
     function Choice { return 2 }
     function Select-Archive { return $archiveCopy }
+    function Write-OperationReport {}
     function Save-TrackedState([hashtable]$State) {}
     function Do-Import([string]$ArchiveOverride, $PersonalRetry) {
         Assert-WpmEqual $ArchiveOverride $archiveCopy

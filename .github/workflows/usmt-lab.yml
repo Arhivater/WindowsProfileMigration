@@ -32,7 +32,12 @@ jobs:
               '26H1' { 'https://go.microsoft.com/fwlink/?linkid=2337875' }
               default { throw "Unverified ADK version for Windows $release." }
           }
-          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing -TimeoutSec 120
+          . .\Program\Profiles.ps1
+          . .\Program\Usmt.ps1
+          function Write-OperationReport([string]$Category,[string]$Message) {
+              Write-Host ('[{0}] {1}' -f $Category,$Message)
+          }
+          Save-ADKInstaller $url $installer
           $signature = Get-AuthenticodeSignature -LiteralPath $installer
           if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch '(^|,)\s*O=Microsoft Corporation(,|$)') {
               throw 'The ADK installer signature is invalid.'

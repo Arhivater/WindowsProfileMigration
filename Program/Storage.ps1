@@ -122,37 +122,51 @@ function Validate-RestoredProfile([object]$Meta,[object]$TargetProfile) {
     }
     $missingDirs = @()
     $warns = @()
-    $expectedDirs = 0
+    $directories = @($baseline.Directories | Where-Object { $_.Exists })
+    $samples = @($baseline.SampleFiles)
+    $expectedDirs = $directories.Count
+    $sampleTotal = $samples.Count
     $presentDirs = 0
-    foreach ($dir in @($baseline.Directories)) {
-        if (-not $dir.Exists) { continue }
-        $expectedDirs++
-        $dest = Get-ProfileDataItem $TargetProfile.Path ([string]$dir.RelativePath)
-        if ($dest -and $dest.PSIsContainer) {
-            $presentDirs++
-            if ([Int64]$dir.FileCount -gt 0) {
-                $m = Get-FolderMetrics $dest.FullName
-                if ($m.Files -eq 0) {
-                    $warns += ('Каталог пуст после восстановления: ' + $dir.RelativePath)
-                }
-            }
-        } else {
-            $missingDirs += [string]$dir.RelativePath
-        }
-    }
-    $sampleTotal = 0
     $sampleMatched = 0
     $sampleMissing = @()
-    foreach ($sample in @($baseline.SampleFiles)) {
-        $sampleTotal++
-        $targetFile = Get-ProfileDataItem $TargetProfile.Path ([string]$sample)
-        if ($targetFile -and -not $targetFile.PSIsContainer) { $sampleMatched++ }
-        else { $sampleMissing += [string]$sample }
+    $total = $expectedDirs + $sampleTotal
+    $checked = 0
+    $activity = 'Проверка папок и контрольных файлов после импорта'
+    try {
+        if ($total -gt 0) {
+            Write-Progress -Id 12 -Activity $activity -Status ("Проверено объектов: 0 из {0}" -f $total) -PercentComplete 0
+        }
+        foreach ($dir in $directories) {
+            $dest = Get-ProfileDataItem $TargetProfile.Path ([string]$dir.RelativePath)
+            if ($dest -and $dest.PSIsContainer) {
+                $presentDirs++
+                if ([Int64]$dir.FileCount -gt 0) {
+                    $m = Get-FolderMetrics $dest.FullName -Activity 'Подсчёт файлов в восстановленной папке'
+                    if ($m.Files -eq 0) {
+                        $warns += ('Каталог пуст после восстановления: ' + $dir.RelativePath)
+                    }
+                }
+            } else {
+                $missingDirs += [string]$dir.RelativePath
+            }
+            $checked++
+            Write-Progress -Id 12 -Activity $activity -Status ("Проверено объектов: {0} из {1}" -f $checked,$total) -PercentComplete ([int][Math]::Floor(100.0 * $checked / $total))
+        }
+        foreach ($sample in $samples) {
+            $targetFile = Get-ProfileDataItem $TargetProfile.Path ([string]$sample)
+            if ($targetFile -and -not $targetFile.PSIsContainer) { $sampleMatched++ }
+            else { $sampleMissing += [string]$sample }
+            $checked++
+            Write-Progress -Id 12 -Activity $activity -Status ("Проверено объектов: {0} из {1}" -f $checked,$total) -PercentComplete ([int][Math]::Floor(100.0 * $checked / $total))
+        }
+    } finally {
+        Write-Progress -Id 12 -Activity $activity -Completed
     }
-    if ($expectedDirs -gt 0 -and $presentDirs -eq 0) {
-        throw 'После импорта не найдена ни одна из ожидаемых основных папок профиля.'
-    }
-    if ($sampleTotal -gt 0 -and $sampleMatched -eq 0) {
+    if (($expectedDirs -gt 0 -and $presentDirs -eq 0) -or ($sampleTotal -gt 0 -and $sampleMatched -eq 0)) {
+        Write-OperationReport 'ПРОВЕРКА' ("До остановки найдено папок: {0} из {1}, контрольных файлов: {2} из {3}." -f $presentDirs,$expectedDirs,$sampleMatched,$sampleTotal)
+        if ($expectedDirs -gt 0 -and $presentDirs -eq 0) {
+            throw 'После импорта не найдена ни одна из ожидаемых основных папок профиля.'
+        }
         throw 'После импорта не найден ни один из контрольных файлов профиля.'
     }
     return [pscustomobject]@{

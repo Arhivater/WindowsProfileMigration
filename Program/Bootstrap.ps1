@@ -13,7 +13,10 @@ function Get-BootstrapFailureText([object]$Record) {
         ('Время: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')),
         ('Компьютер: ' + $env:COMPUTERNAME),
         'Этап: Bootstrap / UAC',
+        ('PowerShell ' + $PSVersionTable.PSVersion + ' | Windows ' + [Environment]::OSVersion.Version + ' | ' + $env:PROCESSOR_ARCHITECTURE),
         ('Тип: ' + $Record.Exception.GetType().FullName),
+        ('HRESULT: 0x{0:X8}' -f $Record.Exception.GetBaseException().HResult),
+        ('Строка в загрузчике: ' + $Record.InvocationInfo.ScriptLineNumber),
         ('Причина: ' + $Record.Exception.Message),
         ('Стек: ' + [string]$Record.ScriptStackTrace)
     ) -join [Environment]::NewLine)

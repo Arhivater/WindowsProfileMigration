@@ -76,22 +76,38 @@ function Assert-ProfileExtraPath([string]$Path,[string]$Root,[bool]$AllowMissing
 # Один проход одновременно считает SHA-256 и, если нужен выходной поток, копирует файл.
 function Get-ExtraStreamSha256([IO.Stream]$Stream, [IO.Stream]$Destination = $null, [string]$Activity = '') {
     $sha = [Security.Cryptography.SHA256]::Create()
+    $showProgress = $false
     try {
         $Stream.Position = 0
         if (-not $Destination -and -not $Activity) {
             return [BitConverter]::ToString($sha.ComputeHash($Stream)).Replace('-','')
         }
         $buffer = [byte[]]::new(1MB)
+        $length = if ($Activity) { $Stream.Length } else { 0 }
+        # Короткие файлы видны на общей полосе. Отдельная нужна, когда файл читается несколькими блоками.
+        $showProgress = $length -gt $buffer.Length
+        $lastPercent = 0
+        if ($showProgress) {
+            Write-Progress -Id 3 -ParentId 8 -Activity $Activity -Status ('Байт обработано: 0 из ' + $length) -PercentComplete 0
+        }
         while (($count = $Stream.Read($buffer,0,$buffer.Length)) -gt 0) {
             if ($Activity -and (Test-RunningProcessStopRequest $Activity 3)) {
                 throw [OperationCanceledException]::new('Операция с личным файлом отменена.')
             }
             if ($Destination) { $Destination.Write($buffer,0,$count) }
             [void]$sha.TransformBlock($buffer,0,$count,$null,0)
+            if ($showProgress) {
+                $percent = [int][Math]::Min(100.0,[Math]::Floor(100.0 * $Stream.Position / $length))
+                if ($percent -ne $lastPercent) {
+                    Write-Progress -Id 3 -ParentId 8 -Activity $Activity -Status ('Байт обработано: {0} из {1}' -f $Stream.Position,$length) -PercentComplete $percent
+                    $lastPercent = $percent
+                }
+            }
         }
         [void]$sha.TransformFinalBlock([byte[]]@(),0,0)
         return [BitConverter]::ToString($sha.Hash).Replace('-','')
     } finally {
+        if ($showProgress) { Write-Progress -Id 3 -ParentId 8 -Activity $Activity -Completed }
         $Stream.Position = 0
         $sha.Dispose()
     }
@@ -129,8 +145,9 @@ function Copy-RequiredFile(
             $sourceHash = Get-ExtraStreamSha256 $source $output $activity
             $output.Flush($true)
         } finally { $output.Dispose() }
+        $verifyActivity = if ($AllowCancel) { 'сверку копии личного файла' } else { '' }
         if (($ExpectedHash -and $sourceHash -ne $ExpectedHash) -or
-            $sourceHash -ne (Get-ExtraFileSha256 $temporary $activity)) {
+            $sourceHash -ne (Get-ExtraFileSha256 $temporary $verifyActivity)) {
             throw ('SHA-256 скопированного файла отличается: ' + $From)
         }
         if ($AllowedDestinationRoot) { Assert-ProfileExtraPath $To $AllowedDestinationRoot $true }
@@ -165,10 +182,18 @@ function New-ExtrasManifest([string]$Archive) {
     $path=Join-Path $valid 'extras.jsonl'
     $writer=[IO.StreamWriter]::new($path,$false,[Text.UTF8Encoding]::new($false))
     [long]$count=0; [long]$skipped=0
+    $activity = 'Контрольные суммы дополнительных файлов'
+    $total = 0
+    Write-OperationReport 'ПРОВЕРКА' 'Начато создание списка SHA-256 для дополнительных файлов.'
     try {
+        Write-Progress -Id 9 -Activity $activity -Status 'Поиск дополнительных файлов в архиве' -PercentComplete -1
         if (Test-Path -LiteralPath $extras -PathType Container) {
             Assert-ProfileExtraPath $extras $Archive
-            foreach ($file in @(Get-ChildItem -LiteralPath $extras -Recurse -File -Force -ErrorAction Stop)) {
+            $files = @(Get-ChildItem -LiteralPath $extras -Recurse -File -Force -ErrorAction Stop)
+            $total = $files.Count
+            if ($total) { Write-Progress -Id 9 -Activity $activity -Status ('Файлов обработано: 0 из ' + $total) -PercentComplete 0 }
+            $lastPercent = 0
+            foreach ($file in $files) {
                 $rel = $file.FullName.Substring($extras.Length).TrimStart([char[]]@('\','/')).Replace('/','\')
                 try {
                     Assert-ProfileExtraPath $file.FullName $Archive
@@ -180,12 +205,23 @@ function New-ExtrasManifest([string]$Archive) {
                         throw ('Не удалось проверить сохранённый личный файл: ' + $rel)
                     }
                     $skipped++
-                    Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Extras: файл не прошёл хеширование ' + $rel + ': ' + $_.Exception.Message)
+                    if ($skipped -le 5) {
+                        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалось вычислить SHA-256 для ' + $rel + '. ' + $_.Exception.Message)
+                    }
+                }
+                $processed = $count + $skipped
+                $percent = [int][Math]::Floor(100.0 * $processed / $total)
+                if ($percent -ne $lastPercent) {
+                    Write-Progress -Id 9 -Activity $activity -Status ('Файлов обработано: {0} из {1}' -f $processed,$total) -PercentComplete $percent
+                    $lastPercent = $percent
                 }
             }
         }
-    } finally { $writer.Dispose() }
-    Write-OperationReport 'ПРОВЕРКА' ('Extras: записано контрольных файлов ' + $count + '; не удалось ' + $skipped)
+    } finally {
+        Write-Progress -Id 9 -Activity $activity -Completed
+        $writer.Dispose()
+        Write-OperationReport 'ПРОВЕРКА' ('Дополнительные файлы: найдено {0}, контрольных сумм записано {1}, пропущено {2}.' -f $total,$count,$skipped)
+    }
     return [pscustomobject]@{Path='Validation/extras.jsonl'; Files=$count; Skipped=$skipped}
 }
 # Повреждённые файлы Extras исключаются из восстановления, но не останавливают USMT.
@@ -215,12 +251,25 @@ function Test-ExtrasManifest([string]$Archive,[object]$Meta) {
     $approved = @{}
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $root = Join-Path $Archive 'Extras'
+    $activity = 'Проверка дополнительных файлов'
+    $expected = [int]$info.Files
+    $rejected = 0
+    $lineNumber = 0
+    $lastPercent = 0
+    Write-OperationReport 'ПРОВЕРКА' ('Начата сверка SHA-256 дополнительных файлов. Записей по данным архива: ' + $expected)
     # Закрываем поток и при ошибке разбора или проверки записи.
     $reader = [IO.StreamReader]::new($path,[Text.Encoding]::UTF8,$true)
     try {
+        if ($expected -gt 0) {
+            Write-Progress -Id 9 -Activity $activity -Status ('Записей обработано: 0 из ' + $expected) -PercentComplete 0
+        } else {
+            Write-Progress -Id 9 -Activity $activity -Status 'Чтение контрольного списка' -PercentComplete -1
+        }
         while ($null -ne ($line = $reader.ReadLine())) {
+            $lineNumber++
             if (-not $line.Trim()) { continue }
-            $entry = $line | ConvertFrom-Json -ErrorAction Stop
+            try { $entry = $line | ConvertFrom-Json -ErrorAction Stop }
+            catch { throw ('Некорректный JSON в манифесте дополнительных файлов на строке ' + $lineNumber + '.') }
             $rel = [string]$entry.RelativePath
             $parts = $rel -split '[/\\]'
             foreach ($part in $parts) {
@@ -233,23 +282,39 @@ function Test-ExtrasManifest([string]$Archive,[object]$Meta) {
                 throw 'Некорректный размер или SHA-256 в манифесте Extras.'
             }
             $full = Join-Path $root ($parts -join [IO.Path]::DirectorySeparatorChar)
-            $ok = $false
+            $reason = ''
             try {
                 # Проверяем и корневой каталог Extras, и путь внутри него.
                 Assert-ProfileExtraPath $full $Archive
                 $file = Get-Item -LiteralPath $full -Force -ErrorAction Stop
-                if (-not $file.PSIsContainer -and $file.Length -eq [long]$entry.Length -and
-                    (Get-ExactFileSha256 $full) -eq $hash) { $ok = $true }
-            } catch { }
-            if ($ok) { $approved[$key] = $hash }
-            else { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Extras: файл отсутствует или повреждён, пропускается: ' + $rel) }
+                if ($file.PSIsContainer) { $reason = 'в архиве находится папка вместо файла' }
+                elseif ($file.Length -ne [long]$entry.Length) { $reason = 'изменился размер файла' }
+                elseif ((Get-ExactFileSha256 $full) -ne $hash) { $reason = 'не совпадает SHA-256' }
+            } catch [System.Management.Automation.ItemNotFoundException] { $reason = 'файл отсутствует' }
+            catch { $reason = 'файл недоступен для чтения или путь отклонён (' + $_.Exception.GetType().Name + ')' }
+            if ($reason) {
+                $rejected++
+                if ($rejected -le 5) {
+                    Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Дополнительный файл ' + $rel + ' пропущен: ' + $reason + '.')
+                }
+            } else { $approved[$key] = $hash }
+            if ($expected -gt 0) {
+                $percent = [int][Math]::Min(100.0,[Math]::Floor(100.0 * $seen.Count / $expected))
+                if ($percent -ne $lastPercent) {
+                    Write-Progress -Id 9 -Activity $activity -Status ('Записей обработано: {0} из {1}' -f $seen.Count,$expected) -PercentComplete $percent
+                    $lastPercent = $percent
+                }
+            }
         }
-    } finally { $reader.Dispose() }
-    if ($seen.Count -ne [int]$info.Files) { throw 'Число записей Extras не совпадает с метаданными.' }
+    } finally {
+        Write-Progress -Id 9 -Activity $activity -Completed
+        $reader.Dispose()
+        Write-OperationReport 'ПРОВЕРКА' ('Дополнительные файлы: записей обработано {0} из {1}, совпало {2}, отклонено {3}.' -f $seen.Count,$expected,$approved.Count,$rejected)
+    }
+    if ($seen.Count -ne $expected) { throw 'Число записей Extras не совпадает с метаданными.' }
     if ([int]$info.Skipped -gt 0) {
         Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('При экспорте не удалось вычислить хеши Extras: ' + $info.Skipped)
     }
-    Write-OperationReport 'ПРОВЕРКА' ('Extras: проверено ' + $seen.Count + '; совпало ' + $approved.Count)
     return $approved
 }
 function Is-AllowedExtra([hashtable]$Approved,[string]$Relative) {
@@ -261,6 +326,7 @@ function Is-AllowedExtra([hashtable]$Approved,[string]$Relative) {
 # закрепления быстрого доступа Проводника и список информационных баз 1С.
 # Исходные базы данных 1С (вне профиля) здесь не копируются.
 function Export-ExplorerAndOneCExtras([object]$Profile,[string]$Archive) {
+    Write-OperationReport 'НАСТРОЙКИ' 'Начато сохранение закреплений Проводника и параметров 1С.'
     $quickAccess = 'AppData\Roaming\Microsoft\Windows\Recent\AutomaticDestinations\f01b4d95cf55d32a.automaticDestinations-ms'
     $quickSource = Join-Path $Profile.Path $quickAccess
     [int]$saved = 0
@@ -275,21 +341,33 @@ function Export-ExplorerAndOneCExtras([object]$Profile,[string]$Archive) {
     } else { Write-OperationReport 'ПРОВОДНИК' 'Файл закреплений быстрого доступа отсутствует.' }
     $sourceDir = Join-Path $Profile.Path 'AppData\Roaming\1C\1CEStart'
     [int]$oneCSaved = 0
+    $total = 0
+    $activity = 'Сохранение параметров 1С'
     if (Test-Path -LiteralPath $sourceDir -PathType Container) {
-        Assert-ProfileExtraPath $sourceDir $Profile.Path
-        foreach ($file in @(Get-ChildItem -LiteralPath $sourceDir -File -Force -ErrorAction Stop | Where-Object {
-            $_.Name -match '(?i)^(ibases[^\\/]*\.v8i|1cestart\.cfg)$'
-        })) {
-            try {
-                $dest = Join-Path (Join-Path $Archive 'Extras\OneC') $file.Name
-                if (Copy-RequiredFile $file.FullName $dest $Profile.Path $Archive) {
-                    $oneCSaved++; $saved++
-                    Write-OperationReport '1С' ('Сохранён файл списка баз/настроек запуска: ' + $file.Name + '; размер ' + (Format-ByteSize ([UInt64]$file.Length)))
+        try {
+            Write-Progress -Id 9 -Activity $activity -Status 'Поиск файлов настроек' -PercentComplete -1
+            Assert-ProfileExtraPath $sourceDir $Profile.Path
+            $files = @(Get-ChildItem -LiteralPath $sourceDir -File -Force -ErrorAction Stop | Where-Object {
+                $_.Name -match '(?i)^(ibases[^\\/]*\.v8i|1cestart\.cfg)$'
+            })
+            $total = $files.Count
+            $processed = 0
+            foreach ($file in $files) {
+                $percent = [int][Math]::Floor(100.0 * $processed / $total)
+                Write-Progress -Id 9 -Activity $activity -Status ('Файлов обработано: {0} из {1}' -f $processed,$total) -PercentComplete $percent
+                try {
+                    $dest = Join-Path (Join-Path $Archive 'Extras\OneC') $file.Name
+                    if (-not (Copy-RequiredFile $file.FullName $dest $Profile.Path $Archive)) { throw 'Файл исчез во время экспорта.' }
+                    $oneCSaved++
+                    $saved++
+                } catch {
+                    if (($processed - $oneCSaved) -lt 5) { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалось сохранить настройки 1С: ' + $_.Exception.Message) }
                 }
-            } catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('1С: файл ' + $file.Name + ': ' + $_.Exception.Message) }
-        }
+                $processed++
+            }
+        } finally { Write-Progress -Id 9 -Activity $activity -Completed }
     }
-    Write-OperationReport '1С' ('Сохранено файлов списка информационных баз: ' + $oneCSaved)
+    Write-OperationReport '1С' ('Файлов настроек сохранено: {0} из {1}.' -f $oneCSaved,$total)
     return $saved
 }
 
@@ -321,23 +399,35 @@ function Restore-ExplorerAndOneCExtras([string]$Archive,[string]$TargetPath,[has
     $backupRoot = Join-Path $backupBase ((Get-Date -Format 'yyyyMMdd_HHmmss_fff') + '_' + [guid]::NewGuid().ToString('N').Substring(0,8))
     Update-TrackedState '' @{ConfigBackupPath=$backupRoot}
     [int]$done = 0
-    foreach ($job in $jobs) {
-        try {
-            if (-not (Is-AllowedExtra $ApprovedExtras $job.Key)) {
-                throw ('Файл не прошёл SHA-256: ' + $job.Key)
+    $processed = 0
+    $backedUp = 0
+    $activity = 'Восстановление настроек Проводника и 1С'
+    Write-OperationReport 'НАСТРОЙКИ' ('Начато восстановление настроек Проводника и 1С. Файлов: ' + $jobs.Count)
+    try {
+        foreach ($job in $jobs) {
+            $percent = [int][Math]::Floor(100.0 * $processed / $jobs.Count)
+            Write-Progress -Id 9 -Activity $activity -Status ('Файлов обработано: {0} из {1}' -f $processed,$jobs.Count) -PercentComplete $percent
+            try {
+                if (-not (Is-AllowedExtra $ApprovedExtras $job.Key)) {
+                    throw ('Файл не прошёл SHA-256: ' + $job.Key)
+                }
+                $dest = [string]$job.Destination
+                $backup = Join-Path $backupRoot $job.Key
+                $hash = if ($null -ne $ApprovedExtras) { [string]$ApprovedExtras[$job.Key] } else { '' }
+                if (-not (Copy-RequiredFile -From $job.Source -To $dest -AllowedSourceRoot $Archive -AllowedDestinationRoot $TargetPath -Backup $backup -ExpectedHash $hash)) {
+                    throw ('Файл исчез до восстановления: ' + $job.Key)
+                }
+                $done++
+                if ([IO.File]::Exists($backup)) { $backedUp++ }
+            } catch {
+                if (($processed - $done) -lt 5) { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не перенесён ' + $job.Name + ': ' + $_.Exception.Message) }
             }
-            $dest = [string]$job.Destination
-            $backup = Join-Path $backupRoot $job.Key
-            $hash = if ($null -ne $ApprovedExtras) { [string]$ApprovedExtras[$job.Key] } else { '' }
-            if (-not (Copy-RequiredFile -From $job.Source -To $dest -AllowedSourceRoot $Archive -AllowedDestinationRoot $TargetPath -Backup $backup -ExpectedHash $hash)) {
-                throw ('Файл исчез до восстановления: ' + $job.Key)
-            }
-            $done++
-            $backupNote = if ([IO.File]::Exists($backup)) { '; прежний файл сохранён в ' + $backup } else { '' }
-            Write-OperationReport 'НАСТРОЙКИ' ('Восстановлено: ' + $job.Name + $backupNote)
-        } catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не перенесён ' + $job.Name + ': ' + $_.Exception.Message) }
+            $processed++
+        }
+    } finally {
+        Write-Progress -Id 9 -Activity $activity -Completed
+        Write-OperationReport 'НАСТРОЙКИ' ('Проводник и 1С: восстановлено файлов {0} из {1}, резервных копий {2}.' -f $done,$jobs.Count,$backedUp)
     }
-    Write-OperationReport 'НАСТРОЙКИ' ('Закрепления Проводника и 1С: восстановлено ' + $done + ' из ' + $jobs.Count + ' файлов.')
 }
 
 function Invoke-ProfileRegistryCommand([string[]]$Arguments) {
@@ -402,36 +492,40 @@ function Test-NetworkDriveRemotePath([string]$Path) {
 # Сохраняет постоянные подключения сетевых дисков из HKCU\Network
 # выбранного пользователя (пароли и учётные данные не извлекаются).
 function Export-NetworkDrives([object]$Profile,[string]$Archive) {
-    $drives = @(Invoke-ProfileHive $Profile.SID $Profile.Path {
-        param($hku,$mount)
-        $network = $hku.OpenSubKey(($mount + '\Network'),$false)
-        if (-not $network) { return }
-        try {
-            foreach ($letter in @($network.GetSubKeyNames())) {
-                if ($letter -notmatch '^[a-zA-Z]$') { continue }
-                $key = $network.OpenSubKey($letter,$false)
-                if (-not $key) { continue }
-                try {
-                    $remote = [string]$key.GetValue('RemotePath','')
-                    if (-not (Test-NetworkDriveRemotePath $remote)) {
-                        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Некорректный UNC-путь сетевого диска ' + $letter + ': пропущен.')
-                        continue
-                    }
-                    [pscustomobject]@{ Letter=$letter.ToUpperInvariant(); RemotePath=$remote;
-                        ProviderName=[string]$key.GetValue('ProviderName','Microsoft Windows Network');
-                        ProviderType=[int]$key.GetValue('ProviderType',131072);
-                        ConnectionType=[int]$key.GetValue('ConnectionType',1);
-                        DeferFlags=[int]$key.GetValue('DeferFlags',4) }
-                } finally { $key.Dispose() }
-            }
-        } finally { $network.Dispose() }
-    } | Where-Object { $null -ne $_ })
+    $activity = 'Сохранение сетевых дисков'
+    Write-OperationReport 'СЕТЕВЫЕ ДИСКИ' 'Начато чтение постоянных сетевых подключений.'
+    Write-Progress -Id 9 -Activity $activity -Status 'Чтение реестра профиля' -PercentComplete -1
+    try {
+        $drives = @(Invoke-ProfileHive $Profile.SID $Profile.Path {
+            param($hku,$mount)
+            $network = $hku.OpenSubKey(($mount + '\Network'),$false)
+            if (-not $network) { return }
+            try {
+                foreach ($letter in @($network.GetSubKeyNames())) {
+                    if ($letter -notmatch '^[a-zA-Z]$') { continue }
+                    $key = $network.OpenSubKey($letter,$false)
+                    if (-not $key) { continue }
+                    try {
+                        $remote = [string]$key.GetValue('RemotePath','')
+                        if (-not (Test-NetworkDriveRemotePath $remote)) {
+                            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Некорректный UNC-путь сетевого диска ' + $letter + ': пропущен.')
+                            continue
+                        }
+                        [pscustomobject]@{ Letter=$letter.ToUpperInvariant(); RemotePath=$remote;
+                            ProviderName=[string]$key.GetValue('ProviderName','Microsoft Windows Network');
+                            ProviderType=[int]$key.GetValue('ProviderType',131072);
+                            ConnectionType=[int]$key.GetValue('ConnectionType',1);
+                            DeferFlags=[int]$key.GetValue('DeferFlags',4) }
+                    } finally { $key.Dispose() }
+                }
+            } finally { $network.Dispose() }
+        } | Where-Object { $null -ne $_ })
+    } finally { Write-Progress -Id 9 -Activity $activity -Completed }
     $destination = Join-Path $Archive 'Extras\NetworkDrives.json'
     [void](New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force -ErrorAction Stop)
     [pscustomobject]@{ SchemaVersion=1; Mappings=$drives } |
         ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $destination -Encoding UTF8 -ErrorAction Stop
-    foreach ($drive in $drives) { Write-OperationReport 'СЕТЕВОЙ ДИСК' ('Сохранено: ' + $drive.Letter + ': -> ' + $drive.RemotePath) }
-    Write-OperationReport 'СЕТЕВЫЕ ДИСКИ' ('Постоянных подключений обнаружено: ' + $drives.Count)
+    Write-OperationReport 'СЕТЕВЫЕ ДИСКИ' ('Сохранено постоянных подключений: ' + $drives.Count)
     return $drives.Count
 }
 
@@ -457,10 +551,13 @@ function Restore-NetworkDrives([string]$Archive,[string]$TargetSid,[string]$Targ
     }
     $localLetters = @(Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType <> 4' -ErrorAction Stop |
         ForEach-Object { ([string]$_.DeviceID).TrimEnd(':') })
-    $added = Invoke-ProfileHive $TargetSid $TargetPath {
+    $restoreMappings = {
         param($hku,$mount)
         [int]$count = 0
+        $processed = 0
         foreach ($mapping in $mappings) {
+            $percent = [int][Math]::Floor(100.0 * $processed / $mappings.Count)
+            Write-Progress -Id 9 -Activity $activity -Status ('Подключений проверено: {0} из {1}' -f $processed,$mappings.Count) -PercentComplete $percent
             $letter = ''
             try {
                 $letter = [string]$mapping.Letter
@@ -502,10 +599,19 @@ function Restore-NetworkDrives([string]$Archive,[string]$TargetSid,[string]$Targ
                     if ($key) { $key.Dispose() }
                 }
                 $count++
-                Write-OperationReport 'СЕТЕВОЙ ДИСК' ('Восстановлено: ' + $letter + ': -> ' + $remote + '; подключение при входе пользователя')
-            } catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не восстановлен сетевой диск ' + $letter + ': ' + $_.Exception.Message) }
+            } catch {
+                if (($processed - $count) -lt 5) {
+                    Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не восстановлено постоянное подключение. ' + $_.Exception.Message)
+                }
+            }
+            $processed++
         }
         return $count
-    } $true
-    Write-OperationReport 'СЕТЕВЫЕ ДИСКИ' ('Добавлено ' + $added + ' из ' + $mappings.Count + ' постоянных подключений.')
+    }
+    $activity = 'Восстановление сетевых дисков'
+    Write-OperationReport 'СЕТЕВЫЕ ДИСКИ' ('Начато восстановление постоянных подключений. Записей: ' + $mappings.Count)
+    Write-Progress -Id 9 -Activity $activity -Status 'Открытие реестра профиля' -PercentComplete -1
+    try { $added = Invoke-ProfileHive $TargetSid $TargetPath $restoreMappings $true }
+    finally { Write-Progress -Id 9 -Activity $activity -Completed }
+    Write-OperationReport 'СЕТЕВЫЕ ДИСКИ' ('Добавлено постоянных подключений: {0} из {1}. Windows подключит их при входе пользователя.' -f $added,$mappings.Count)
 }

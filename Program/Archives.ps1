@@ -6,7 +6,31 @@
 function Get-ExactFileSha256([string]$Path) {
     $stream = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
     try {
-        return (Get-FileHash -InputStream $stream -Algorithm SHA256 -ErrorAction Stop).Hash
+        $length = $stream.Length
+        if ($length -lt 16MB) {
+            return (Get-FileHash -InputStream $stream -Algorithm SHA256 -ErrorAction Stop).Hash
+        }
+        # Для крупных файлов показываем долю реально прочитанных байтов.
+        $activity = 'Вычисление SHA-256 крупного файла'
+        $hash = [Security.Cryptography.SHA256]::Create()
+        $buffer = [byte[]]::new(1MB)
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            Write-Progress -Id 15 -Activity $activity -Status 'Чтение файла' -PercentComplete 0
+            while (($read = $stream.Read($buffer,0,$buffer.Length)) -gt 0) {
+                [void]$hash.TransformBlock($buffer,0,$read,$buffer,0)
+                if ($clock.ElapsedMilliseconds -ge 250 -or $stream.Position -eq $length) {
+                    $percent = [int][Math]::Min(100,[Math]::Floor(100.0 * $stream.Position / $length))
+                    Write-Progress -Id 15 -Activity $activity -Status ('Прочитано {0} из {1} байт' -f $stream.Position,$length) -PercentComplete $percent
+                    $clock.Restart()
+                }
+            }
+            [void]$hash.TransformFinalBlock([byte[]]::new(0),0,0)
+            return [BitConverter]::ToString($hash.Hash).Replace('-','')
+        } finally {
+            $hash.Dispose()
+            Write-Progress -Id 15 -Activity $activity -Completed
+        }
     } finally {
         $stream.Dispose()
     }
@@ -31,6 +55,8 @@ function Assert-CopiedZipHash([string]$Source,[string]$Destination) {
         $streamDst = [IO.File]::Open($Destination,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
         $sourceLength = $streamSrc.Length
         if ($sourceLength -ne $streamDst.Length) { throw 'ZIP изменился перед сверкой.' }
+        Write-OperationReport 'ПРОВЕРКА' ('Сверка исходника и копии ZIP по SHA-256, размер каждого файла {0} байт.' -f $sourceLength)
+        Write-Progress -Id 5 -Activity 'Проверка ZIP после копирования' -Status 'Чтение исходника и копии' -PercentComplete 0
         while (($n = $streamSrc.Read($bufferSrc,0,$bufferSrc.Length)) -gt 0) {
             $readDst = 0
             while ($readDst -lt $n) {
@@ -42,7 +68,7 @@ function Assert-CopiedZipHash([string]$Source,[string]$Destination) {
             [void]$hashDst.TransformBlock($bufferDst,0,$n,$bufferDst,0)
             $done = [UInt64]($done + [UInt64]$n)
             $percent = if ($sourceLength -gt 0) { [int][Math]::Floor(100.0 * $done / [double]$sourceLength) } else { 100 }
-            Write-Progress -Id 5 -Activity 'Проверка ZIP после копирования' -Status ('Сверено: ' + (Format-ByteSize $done)) -PercentComplete $percent
+            Write-Progress -Id 5 -Activity 'Проверка ZIP после копирования' -Status ('Сверено {0} из {1}' -f (Format-ByteSize $done),(Format-ByteSize $sourceLength)) -PercentComplete $percent
             if (Test-RunningProcessStopRequest 'проверку ZIP' 5) {
                 throw [System.OperationCanceledException]::new('Проверка ZIP остановлена пользователем.')
             }
@@ -54,6 +80,7 @@ function Assert-CopiedZipHash([string]$Source,[string]$Destination) {
         $original = [BitConverter]::ToString($hashSrc.Hash).Replace('-','')
         $copy = [BitConverter]::ToString($hashDst.Hash).Replace('-','')
         if ($original -ne $copy) { throw 'SHA-256 ZIP не совпал после копирования. Архив не опубликован.' }
+        Write-OperationReport 'ПРОВЕРКА' ('ZIP после копирования совпал по SHA-256, сверено {0} байт.' -f $done)
         return $original
     } finally {
         Write-Progress -Id 5 -Activity 'Проверка ZIP после копирования' -Completed
@@ -117,24 +144,41 @@ function Get-ArchiveFileMap([string]$ArchiveRoot) {
     $files = @{}
     $pending = New-Object 'System.Collections.Generic.Stack[string]'
     $pending.Push($base)
-    while ($pending.Count -gt 0) {
-        $current = $pending.Pop()
-        foreach ($item in @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop)) {
-            Assert-WindowsPathComponent $item.Name
-            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-                throw ('В архиве обнаружена ссылка, проверка остановлена: ' + $item.FullName)
+    $activity = 'Обход содержимого архива'
+    $directories = 0
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    Write-Progress -Id 13 -Activity $activity -Status 'Подсчёт папок и файлов' -PercentComplete -1
+    try {
+        while ($pending.Count -gt 0) {
+            $current = $pending.Pop()
+            $directories++
+            foreach ($item in @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop)) {
+                Assert-WindowsPathComponent $item.Name
+                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                    throw ('В архиве обнаружена ссылка, проверка остановлена: ' + $item.FullName)
+                }
+                if ($item.PSIsContainer) {
+                    $pending.Push([string]$item.FullName)
+                    continue
+                }
+                $relative = ([string]$item.FullName).Substring($base.Length).TrimStart($separator)
+                if (-not $relative -or $files.ContainsKey($relative)) {
+                    throw ('Неоднозначное имя файла в архиве: ' + $item.FullName)
+                }
+                $files[$relative] = [pscustomobject]@{ Path=[string]$item.FullName; Length=[long]$item.Length }
             }
-            if ($item.PSIsContainer) {
-                $pending.Push([string]$item.FullName)
-                continue
+            if ($clock.ElapsedMilliseconds -ge 250) {
+                Write-Progress -Id 13 -Activity $activity -Status ('Проверено папок {0}, файлов {1}' -f $directories,$files.Count) -PercentComplete -1
+                $clock.Restart()
             }
-            $relative = ([string]$item.FullName).Substring($base.Length).TrimStart($separator)
-            if (-not $relative -or $files.ContainsKey($relative)) {
-                throw ('Неоднозначное имя файла в архиве: ' + $item.FullName)
-            }
-            $files[$relative] = [pscustomobject]@{ Path=[string]$item.FullName; Length=[long]$item.Length }
         }
+    } catch {
+        Write-OperationReport 'ДИАГНОСТИКА' ('Обход папки архива прерван. Проверено папок {0}, файлов {1}.' -f $directories,$files.Count)
+        throw
+    } finally {
+        Write-Progress -Id 13 -Activity $activity -Completed
     }
+    Write-OperationReport 'ДИАГНОСТИКА' ('Обход папки архива завершён. Проверено папок {0}, файлов {1}.' -f $directories,$files.Count)
     return $files
 }
 
@@ -187,43 +231,66 @@ function Read-ProfileZipInfo([IO.Compression.ZipArchive]$Zip) {
     [UInt64]$expanded = 0
     [int]$storeFiles = 0
     $metaEntry = $null
-    if ($Zip.Entries.Count -gt 1000000) { throw 'Слишком много записей в ZIP.' }
-    foreach ($entry in $Zip.Entries) {
-        $rel = [string]$entry.FullName
-        $isDir = $rel.EndsWith('/')
-        $name = if ($isDir) { $rel.Substring(0,$rel.Length - 1) } else { $rel }
-        if (-not $seen.Add($name)) { throw ('Повторяющееся имя в ZIP: ' + $rel) }
-        foreach ($part in $name.Split('/')) { Assert-WindowsPathComponent $part }
-        # Windows reparse-point и Unix symlink внутри ZIP запрещены.
-        if (($entry.ExternalAttributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or
-            ((($entry.ExternalAttributes -shr 16) -band 0xF000) -eq 0xA000)) {
-            throw ('Ссылка в ZIP запрещена: ' + $rel)
+    $activity = 'Проверка структуры ZIP'
+    $checked = 0
+    $total = 0
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    Write-Progress -Id 13 -Activity $activity -Status 'Чтение оглавления архива' -PercentComplete -1
+    try {
+        $entries = $Zip.Entries
+        $total = $entries.Count
+        if ($total -gt 1000000) { throw 'Слишком много записей в ZIP.' }
+        Write-Progress -Id 13 -Activity $activity -Status ('Проверяется {0} записей' -f $total) -PercentComplete 0
+        foreach ($entry in $entries) {
+            if ($clock.ElapsedMilliseconds -ge 250) {
+                $percent = [int][Math]::Floor(100.0 * $checked / $total)
+                Write-Progress -Id 13 -Activity $activity -Status ('Проверено {0} из {1} записей' -f $checked,$total) -PercentComplete $percent
+                $clock.Restart()
+            }
+            $checked++
+            $rel = [string]$entry.FullName
+            $isDir = $rel.EndsWith('/')
+            $name = if ($isDir) { $rel.Substring(0,$rel.Length - 1) } else { $rel }
+            if (-not $seen.Add($name)) { throw ('Повторяющееся имя в ZIP: ' + $rel) }
+            foreach ($part in $name.Split('/')) { Assert-WindowsPathComponent $part }
+            # Windows reparse-point и Unix symlink внутри ZIP запрещены.
+            if (($entry.ExternalAttributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                ((($entry.ExternalAttributes -shr 16) -band 0xF000) -eq 0xA000)) {
+                throw ('Ссылка в ZIP запрещена: ' + $rel)
+            }
+            for ($slash = $name.LastIndexOf('/'); $slash -ge 0; $slash = $parent.LastIndexOf('/')) {
+                $parent = $name.Substring(0,$slash)
+                if ($filePaths.Contains($parent)) { throw ('Файл ZIP используется как каталог: ' + $parent) }
+                if (-not $directories.Add($parent)) { break }
+            }
+            if ($isDir) {
+                if ($entry.Length -ne 0) { throw ('Каталог ZIP содержит данные: ' + $rel) }
+                [void]$directories.Add($name)
+                continue
+            }
+            if ($directories.Contains($name)) { throw ('Файл ZIP используется как каталог: ' + $name) }
+            [void]$filePaths.Add($name)
+            if ($entry.Length -lt 0 -or $expanded -gt ([UInt64]::MaxValue - [UInt64]$entry.Length)) {
+                throw 'Недопустимый размер ZIP.'
+            }
+            $expanded = [UInt64]($expanded + [UInt64]$entry.Length)
+            if ($name -ceq 'metadata.json') { $metaEntry = $entry }
+            if ($name -match '^Store/.+\.mig$') { $storeFiles++ }
         }
-        for ($slash = $name.LastIndexOf('/'); $slash -ge 0; $slash = $parent.LastIndexOf('/')) {
-            $parent = $name.Substring(0,$slash)
-            if ($filePaths.Contains($parent)) { throw ('Файл ZIP используется как каталог: ' + $parent) }
-            if (-not $directories.Add($parent)) { break }
+        if (-not $metaEntry -or $storeFiles -ne 1) {
+            throw 'ZIP должен содержать metadata.json размером до 2 МБ и ровно одно USMT-хранилище.'
         }
-        if ($isDir) {
-            if ($entry.Length -ne 0) { throw ('Каталог ZIP содержит данные: ' + $rel) }
-            [void]$directories.Add($name)
-            continue
-        }
-        if ($directories.Contains($name)) { throw ('Файл ZIP используется как каталог: ' + $name) }
-        [void]$filePaths.Add($name)
-        if ($entry.Length -lt 0 -or $expanded -gt ([UInt64]::MaxValue - [UInt64]$entry.Length)) {
-            throw 'Недопустимый размер ZIP.'
-        }
-        $expanded = [UInt64]($expanded + [UInt64]$entry.Length)
-        if ($name -ceq 'metadata.json') { $metaEntry = $entry }
-        if ($name -match '^Store/.+\.mig$') { $storeFiles++ }
+        $stream = $metaEntry.Open()
+        try { $meta = Read-BoundedArchiveMetadata $stream $metaEntry.Length }
+        finally { $stream.Dispose() }
+        Write-Progress -Id 13 -Activity $activity -Status 'Записи и метаданные проверены' -PercentComplete 100
+    } catch {
+        Write-OperationReport 'ДИАГНОСТИКА' ('Проверка структуры ZIP прервана на записи {0} из {1}.' -f $checked,$total)
+        throw
+    } finally {
+        Write-Progress -Id 13 -Activity $activity -Completed
     }
-    if (-not $metaEntry -or $storeFiles -ne 1) {
-        throw 'ZIP должен содержать metadata.json размером до 2 МБ и ровно одно USMT-хранилище.'
-    }
-    $stream = $metaEntry.Open()
-    try { $meta = Read-BoundedArchiveMetadata $stream $metaEntry.Length }
-    finally { $stream.Dispose() }
+    Write-OperationReport 'ПРОВЕРКА' ('Структура ZIP проверена. Записей {0}, файлов {1}, объём распаковки {2} байт.' -f $total,$filePaths.Count,$expanded)
     return [pscustomobject]@{ Metadata=$meta; ExpandedBytes=$expanded; Files=$filePaths.Count }
 }
 # Сжимает каталог в один ZIP с поддержкой больших файлов (ZIP64) и клавиши 0.
@@ -241,6 +308,9 @@ function Compress-ProfileArchive([string]$Source,[string]$ZipPath) {
     $zip = $null
     try {
         $zip = [IO.Compression.ZipArchive]::new($zipStream,[IO.Compression.ZipArchiveMode]::Create,$false,[Text.Encoding]::UTF8)
+        Write-OperationReport 'АРХИВ' ('Начата упаковка ZIP. Файлов {0}, исходный объём {1} байт.' -f $items.Count,$total)
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        Write-Progress -Id 6 -Activity 'Упаковка профиля в ZIP' -Status 'Запись первых файлов' -PercentComplete 0
         foreach ($rel in @($items.Keys | Sort-Object)) {
             $file = $items[$rel]
             $entryName = $rel.Replace('\','/')
@@ -255,8 +325,11 @@ function Compress-ProfileArchive([string]$Source,[string]$ZipPath) {
                     while (($n = $inputStream.Read($buffer,0,$buffer.Length)) -gt 0) {
                         $entryStream.Write($buffer,0,$n)
                         $done = [UInt64]($done + [UInt64]$n)
-                        $percent = if ($total -gt 0) { [int][Math]::Floor(100.0 * $done / $total) } else { 100 }
-                        Write-Progress -Id 6 -Activity 'Упаковка профиля в ZIP' -Status ('Файлов: ' + $fileCount + ' из ' + $items.Count) -PercentComplete $percent
+                        if ($clock.ElapsedMilliseconds -ge 250) {
+                            $percent = if ($total -gt 0) { [int][Math]::Min(99,[Math]::Floor(100.0 * $done / $total)) } else { 0 }
+                            Write-Progress -Id 6 -Activity 'Упаковка профиля в ZIP' -Status ('Записано {0} из {1}, готовых файлов {2} из {3}' -f (Format-ByteSize $done),(Format-ByteSize $total),$fileCount,$items.Count) -PercentComplete $percent
+                            $clock.Restart()
+                        }
                         if (Test-RunningProcessStopRequest 'упаковку ZIP' 6) {
                             throw [System.OperationCanceledException]::new('Упаковка ZIP остановлена пользователем.')
                         }
@@ -265,6 +338,10 @@ function Compress-ProfileArchive([string]$Source,[string]$ZipPath) {
             } finally { $entryStream.Dispose() }
             $fileCount++
         }
+        Write-Progress -Id 6 -Activity 'Упаковка профиля в ZIP' -Status ('Обработано файлов {0}' -f $fileCount) -PercentComplete 100
+    } catch {
+        Write-OperationReport 'ДИАГНОСТИКА' ('Упаковка ZIP прервана. Записано {0} из {1} байт, завершено файлов {2} из {3}.' -f $done,$total,$fileCount,$items.Count)
+        throw
     } finally {
         Write-Progress -Id 6 -Activity 'Упаковка профиля в ZIP' -Completed
         if ($zip) { $zip.Dispose() }
@@ -287,6 +364,7 @@ function Expand-ProfileArchive([string]$ZipPath,[string]$Destination) {
     [UInt64]$done = 0
     $buffer = New-Object byte[] (1024 * 1024)
     $zip = [IO.Compression.ZipFile]::OpenRead($ZipPath)
+    $fileCount = 0
     try {
         # Проверяем тот же открытый ZIP, который будем читать. На Windows
         # файловый дескриптор не разрешает в это время запись или подмену.
@@ -294,10 +372,13 @@ function Expand-ProfileArchive([string]$ZipPath,[string]$Destination) {
         if (Test-Path -LiteralPath $root) { throw 'Каталог распаковки уже существует.' }
         Assert-NoReparseAncestor $root
         $free = Get-PathFreeBytes ([IO.Path]::GetDirectoryName($root))
+        Write-OperationReport 'АРХИВ' ('Подготовка к распаковке ZIP. Файлов {0}, объём {1} байт, свободно {2} байт, резерв 1 ГБ.' -f $info.Files,$info.ExpandedBytes,$free)
         if ([double]$free -lt ([double]$info.ExpandedBytes + 1GB)) {
             throw 'Недостаточно места для распаковки открытого ZIP с резервом 1 ГБ.'
         }
         [void][IO.Directory]::CreateDirectory($root)
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        Write-Progress -Id 6 -Activity 'Распаковка архива' -Status 'Чтение первых файлов' -PercentComplete 0
         foreach ($entry in $zip.Entries) {
             $full = [IO.Path]::GetFullPath((Join-Path $root ($entry.FullName.Replace([char]'/', $separator))))
             if (-not $full.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) {
@@ -318,8 +399,11 @@ function Expand-ProfileArchive([string]$ZipPath,[string]$Destination) {
                         if ($entryBytes -gt [UInt64]$entry.Length) { throw ('Размер ZIP не совпадает с данными: ' + $entry.FullName) }
                         $outputStream.Write($buffer,0,$n)
                         $done = [UInt64]($done + [UInt64]$n)
-                        $percent = if ($info.ExpandedBytes -gt 0) { [int][Math]::Floor(100.0 * $done / $info.ExpandedBytes) } else { 100 }
-                        Write-Progress -Id 6 -Activity 'Распаковка архива' -Status ('Распаковано: ' + (Format-ByteSize $done)) -PercentComplete $percent
+                        if ($clock.ElapsedMilliseconds -ge 250) {
+                            $percent = if ($info.ExpandedBytes -gt 0) { [int][Math]::Min(99,[Math]::Floor(100.0 * $done / $info.ExpandedBytes)) } else { 0 }
+                            Write-Progress -Id 6 -Activity 'Распаковка архива' -Status ('Распаковано {0} из {1}, готовых файлов {2} из {3}' -f (Format-ByteSize $done),(Format-ByteSize $info.ExpandedBytes),$fileCount,$info.Files) -PercentComplete $percent
+                            $clock.Restart()
+                        }
                         if (Test-RunningProcessStopRequest 'распаковку ZIP' 6) {
                             throw [System.OperationCanceledException]::new('Распаковка ZIP остановлена пользователем.')
                         }
@@ -327,7 +411,12 @@ function Expand-ProfileArchive([string]$ZipPath,[string]$Destination) {
                     if ($entryBytes -ne [UInt64]$entry.Length) { throw ('Файл ZIP распакован не полностью: ' + $entry.FullName) }
                 } finally { $outputStream.Dispose() }
             } finally { $inputStream.Dispose() }
+            $fileCount++
         }
+        Write-Progress -Id 6 -Activity 'Распаковка архива' -Status ('Обработано файлов {0}' -f $fileCount) -PercentComplete 100
+    } catch {
+        Write-OperationReport 'ДИАГНОСТИКА' ('Распаковка ZIP прервана. Распаковано {0} байт, завершено файлов {1}.' -f $done,$fileCount)
+        throw
     } finally {
         Write-Progress -Id 6 -Activity 'Распаковка архива' -Completed
         $zip.Dispose()
@@ -348,6 +437,8 @@ function Assert-NetworkArchiveCopy([string]$Source,[string]$Destination) {
     }
     [int]$checked = 0
     [UInt64]$checkedBytes = 0
+    Write-OperationReport 'ПРОВЕРКА' ('Начата сверка SHA-256 сетевой копии. Файлов {0}.' -f $sourceFiles.Count)
+    Write-Progress -Id 5 -Activity 'Проверка сетевой копии' -Status 'Чтение первых файлов' -PercentComplete 0
     try {
         foreach ($relative in @($sourceFiles.Keys | Sort-Object)) {
             if (-not $targetFiles.ContainsKey($relative)) {
@@ -374,6 +465,9 @@ function Assert-NetworkArchiveCopy([string]$Source,[string]$Destination) {
                 throw [System.OperationCanceledException]::new('Проверка сетевой копии остановлена пользователем.')
             }
         }
+    } catch {
+        Write-OperationReport 'ДИАГНОСТИКА' ('Проверка сетевой копии прервана. Сверено файлов {0} из {1}, байт {2}.' -f $checked,$sourceFiles.Count,$checkedBytes)
+        throw
     } finally {
         Write-Progress -Id 5 -Activity 'Проверка сетевой копии' -Completed
     }

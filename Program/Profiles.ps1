@@ -121,12 +121,16 @@ function Get-PathFreeBytes([string]$Path) {
 # Считает размер и число файлов без подавления ошибок доступа.
 # Переходы через junction/symlink намеренно не выполняются, иначе возможны циклы.
 # Если не получается прочитать хотя бы один каталог, результат НЕ используется как оценка.
-function Get-FolderMetrics([string]$Path,[int]$SampleCount = 0) {
+function Get-FolderMetrics([string]$Path,[int]$SampleCount = 0,[string]$Activity = 'Подсчёт файлов и объёма') {
     [UInt64]$bytes = 0
     [Int64]$files = 0
     [Int64]$links = 0
     $samples = [Collections.Generic.List[string]]::new()
+    $directories = 0L
+    $refresh = [Diagnostics.Stopwatch]::StartNew()
+    # При обходе число файлов заранее неизвестно. Показываем уже подсчитанное.
     try {
+        Write-Progress -Id 10 -Activity $Activity -Status 'Открывается каталог' -PercentComplete -1
         $root = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
         if (-not $root.PSIsContainer) { throw 'Указанный путь не является каталогом.' }
         if ($root.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Указанный каталог является ссылкой.' }
@@ -135,17 +139,26 @@ function Get-FolderMetrics([string]$Path,[int]$SampleCount = 0) {
         while ($pending.Count -gt 0) {
             $current = $pending.Pop()
             try {
-                foreach ($item in @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop)) {
+                $directories++
+                if ($refresh.ElapsedMilliseconds -ge 350) {
+                    Write-Progress -Id 10 -Activity $Activity -Status ("Каталогов: {0}, файлов: {1}, объём: {2}" -f $directories,$files,(Format-ByteSize $bytes)) -PercentComplete -1
+                    $refresh.Restart()
+                }
+                Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop | ForEach-Object {
+                    $item = $_
                     if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                         $links++
-                        continue
-                    }
-                    if ($item.PSIsContainer) {
+                    } elseif ($item.PSIsContainer) {
                         $pending.Push([string]$item.FullName)
                     } else {
                         $bytes = [UInt64]($bytes + [UInt64]$item.Length)
                         $files++
                         if ($samples.Count -lt $SampleCount) { $samples.Add([string]$item.FullName) }
+                    }
+                    # И в одной большой папке счётчик обновляется, пока идёт перечисление.
+                    if ($refresh.ElapsedMilliseconds -ge 350) {
+                        Write-Progress -Id 10 -Activity $Activity -Status ("Каталогов: {0}, файлов: {1}, объём: {2}" -f $directories,$files,(Format-ByteSize $bytes)) -PercentComplete -1
+                        $refresh.Restart()
                     }
                 }
             } catch {
@@ -154,6 +167,8 @@ function Get-FolderMetrics([string]$Path,[int]$SampleCount = 0) {
         }
     } catch {
         throw ('Подсчёт размера не завершён для ' + $Path + '. Миграция остановлена, чтобы не занизить объём. ' + $_.Exception.Message)
+    } finally {
+        Write-Progress -Id 10 -Activity $Activity -Completed
     }
     return [pscustomobject]@{ Bytes = $bytes; Files = $files; SkippedLinks = $links; Samples = $samples.ToArray() }
 }
@@ -162,26 +177,36 @@ function Get-ProfileValidationBaseline([string]$ProfilePath) {
     $dirs = @('Desktop','Documents','Downloads','Pictures','AppData\Roaming')
     $resultDirs = @()
     $samples = @()
-    foreach ($rel in $dirs) {
-        $directory = Get-ProfileDataItem $ProfilePath $rel
-        $exists = $directory -and $directory.PSIsContainer
-        [UInt64]$bytes = 0
-        [Int64]$files = 0
-        if ($exists) {
-            $m = Get-FolderMetrics $directory.FullName 3
-            $bytes = [UInt64]$m.Bytes
-            $files = [Int64]$m.Files
-            foreach ($item in $m.Samples) {
-                if ($item.Length -gt $ProfilePath.Length) {
-                    $samples += $item.Substring($ProfilePath.Length).TrimStart([IO.Path]::DirectorySeparatorChar)
+    $activity = 'Сбор данных для проверки профиля после импорта'
+    try {
+        Write-Progress -Id 11 -Activity $activity -Status ("Обработано папок: 0 из {0}" -f $dirs.Count) -PercentComplete 0
+        foreach ($rel in $dirs) {
+            $directory = Get-ProfileDataItem $ProfilePath $rel
+            $exists = $directory -and $directory.PSIsContainer
+            [UInt64]$bytes = 0
+            [Int64]$files = 0
+            if ($exists) {
+                $m = Get-FolderMetrics $directory.FullName 3 'Подсчёт файлов для исходной сверки'
+                $bytes = [UInt64]$m.Bytes
+                $files = [Int64]$m.Files
+                foreach ($item in $m.Samples) {
+                    if ($item.Length -gt $ProfilePath.Length) {
+                        $samples += $item.Substring($ProfilePath.Length).TrimStart([IO.Path]::DirectorySeparatorChar)
+                    }
                 }
             }
+            $resultDirs += [pscustomobject]@{ RelativePath = $rel; Exists = $exists; FileCount = $files; TotalBytes = $bytes }
+            Write-Progress -Id 11 -Activity $activity -Status ("Обработано папок: {0} из {1}" -f $resultDirs.Count,$dirs.Count) -PercentComplete ([int][Math]::Floor(100.0 * $resultDirs.Count / $dirs.Count))
         }
-        $resultDirs += [pscustomobject]@{ RelativePath = $rel; Exists = $exists; FileCount = $files; TotalBytes = $bytes }
+    } finally {
+        Write-Progress -Id 11 -Activity $activity -Completed
     }
+    $uniqueSamples = @($samples | Select-Object -Unique | Select-Object -First 12)
+    $foundDirs = @($resultDirs | Where-Object Exists).Count
+    Write-OperationReport 'ПРОВЕРКА' ("Для исходной сверки найдено папок: {0} из {1}, отобрано файлов: {2}." -f $foundDirs,$dirs.Count,$uniqueSamples.Count)
     return [pscustomobject]@{
         Directories = $resultDirs
-        SampleFiles = @($samples | Select-Object -Unique | Select-Object -First 12)
+        SampleFiles = $uniqueSamples
     }
 }
 # Единая область проверки: стандартные пользовательские каталоги, без AppData.
