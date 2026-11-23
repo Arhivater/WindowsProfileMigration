@@ -6,7 +6,7 @@
     Compress-ProfileArchive,Expand-ProfileArchive,Get-ExactFileSha256,Read-MigrationXml,
     Get-ValidationSourceDirectories,Get-ValidationSourceFiles,Read-ValidationManifestRecord,
     New-ValidationManifest,Assert-ValidationSourceStable,Assert-ValidationManifestIntegrity,Test-ValidationManifest,
-    Assert-ExportProfileReady,Write-EmbeddedProfileOnlyRule,Assert-ArchiveCacheOutsideSource,
+    Assert-ExportProfileReady,Write-EmbeddedProfileOnlyRule,Get-CurrentProfileOnlyRuleHash,Assert-ProfileOnlyArchive,Assert-ArchiveCacheOutsideSource,
     Copy-DirectoryRobust,Quote-WindowsArgument,Inspect-UsmtFileScope)
 
 function Write-OperationReport {}
@@ -191,6 +191,44 @@ Invoke-WpmTest 'Embedded profile-only rule matches the pinned SHA-256' {
     $components = @($xml.SelectNodes('/migration/component'))
     Assert-WpmEqual $components.Count 2
     Assert-WpmEqual @($components | ForEach-Object { $_.GetAttribute('context') }) @('User','User')
+}
+
+Invoke-WpmTest 'Archive validates both Temp rules and earlier profile-only rules' {
+    $rules = Join-Path $WpmTestRoot 'Rules'
+    $validation = Join-Path $WpmTestRoot 'Validation'
+    [void][IO.Directory]::CreateDirectory($rules)
+    [void][IO.Directory]::CreateDirectory($validation)
+    $rule = Join-Path $rules 'ProfileOnly.xml'
+    $config = Join-Path $rules 'Config.xml'
+    $list = Join-Path $validation 'usmt-files.txt'
+    $profile = 'C:\Users\Synthetic'
+    [IO.File]::WriteAllText($config,'<Configuration><WindowsComponents /></Configuration>')
+    [IO.File]::WriteAllLines($list, [string[]]@($profile, ($profile + '\Documents\fixture.txt')))
+    Write-EmbeddedProfileOnlyRule $rule
+    $current = [IO.File]::ReadAllText($rule)
+    $xml = Read-MigrationXml $rule
+    $patterns = @($xml.SelectNodes('/migration/component/role/rules/exclude/objectSet/pattern') | ForEach-Object InnerText)
+    Assert-WpmEqual @($patterns | Where-Object { $_ -like '*\Temp*' }) @(
+        '%CSIDL_PROFILE%\AppData\Local\Temp [*]',
+        '%CSIDL_PROFILE%\AppData\Local\Temp\* [*]'
+    )
+    $scope = [pscustomobject]@{
+        Policy='ArhivaterProfileOnlyV1'; ProfilePath=$profile; Files=2
+        RuleSHA256=(Get-ExactFileSha256 $rule); ConfigSHA256=(Get-ExactFileSha256 $config); ListSHA256=(Get-ExactFileSha256 $list)
+    }
+    $meta = [pscustomobject]@{ SchemaVersion=7; SourceProfilePath=$profile; ProfileScope=$scope }
+    Assert-ProfileOnlyArchive $WpmTestRoot $meta
+
+    # Removing the two new rules produces the byte-for-byte v1.11 template.
+    $legacy = [regex]::Replace($current, '(?m)^ *<pattern type="File">%CSIDL_PROFILE%\\AppData\\Local\\Temp[^\n]*\n', '')
+    [IO.File]::WriteAllText($rule,$legacy,[Text.UTF8Encoding]::new($false))
+    $scope.RuleSHA256 = Get-ExactFileSha256 $rule
+    Assert-WpmEqual $scope.RuleSHA256.ToLowerInvariant() '5bf12aa9ff9d874faec31829cc7f0b8277af82311810321ec97c89aa6803705c'
+    Assert-ProfileOnlyArchive $WpmTestRoot $meta
+
+    [IO.File]::AppendAllText($rule,"<!-- arbitrary rules -->`n")
+    $scope.RuleSHA256 = Get-ExactFileSha256 $rule
+    Assert-WpmThrows { Assert-ProfileOnlyArchive $WpmTestRoot $meta } 'подтверждённого шаблона'
 }
 
 Invoke-WpmTest 'USMT scope list handles BOM and releases files after approval or rejection' {

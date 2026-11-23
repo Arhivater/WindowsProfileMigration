@@ -121,11 +121,12 @@ function Get-PathFreeBytes([string]$Path) {
 # Считает размер и число файлов без подавления ошибок доступа.
 # Переходы через junction/symlink намеренно не выполняются, иначе возможны циклы.
 # Если не получается прочитать хотя бы один каталог, результат НЕ используется как оценка.
-function Get-FolderMetrics([string]$Path,[int]$SampleCount = 0,[string]$Activity = 'Подсчёт файлов и объёма') {
+function Get-FolderMetrics([string]$Path,[int]$SampleCount = 0,[string]$Activity = 'Подсчёт файлов и объёма', [bool]$ExcludeProfileTemp = $false) {
     [UInt64]$bytes = 0
     [Int64]$files = 0
     [Int64]$links = 0
     $samples = [Collections.Generic.List[string]]::new()
+    $skippedTemp = $false
     $directories = 0L
     $refresh = [Diagnostics.Stopwatch]::StartNew()
     # При обходе число файлов заранее неизвестно. Показываем уже подсчитанное.
@@ -134,6 +135,8 @@ function Get-FolderMetrics([string]$Path,[int]$SampleCount = 0,[string]$Activity
         $root = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
         if (-not $root.PSIsContainer) { throw 'Указанный путь не является каталогом.' }
         if ($root.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Указанный каталог является ссылкой.' }
+        # Сравниваем полный путь. Папки с именем Temp в других местах остаются в подсчёте.
+        $profileTemp = if ($ExcludeProfileTemp) { [IO.Path]::Combine($root.FullName,'AppData','Local','Temp') }
         $pending = New-Object 'System.Collections.Generic.Stack[string]'
         $pending.Push([string]$root.FullName)
         while ($pending.Count -gt 0) {
@@ -146,7 +149,9 @@ function Get-FolderMetrics([string]$Path,[int]$SampleCount = 0,[string]$Activity
                 }
                 Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop | ForEach-Object {
                     $item = $_
-                    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    if ($profileTemp -and $item.PSIsContainer -and $item.FullName -ieq $profileTemp) {
+                        $skippedTemp = $true
+                    } elseif (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                         $links++
                     } elseif ($item.PSIsContainer) {
                         $pending.Push([string]$item.FullName)
@@ -170,7 +175,7 @@ function Get-FolderMetrics([string]$Path,[int]$SampleCount = 0,[string]$Activity
     } finally {
         Write-Progress -Id 10 -Activity $Activity -Completed
     }
-    return [pscustomobject]@{ Bytes = $bytes; Files = $files; SkippedLinks = $links; Samples = $samples.ToArray() }
+    return [pscustomobject]@{ Bytes = $bytes; Files = $files; SkippedLinks = $links; SkippedTemp = $skippedTemp; Samples = $samples.ToArray() }
 }
 # Запоминает стандартные папки и небольшую выборку файлов для проверки после импорта.
 function Get-ProfileValidationBaseline([string]$ProfilePath) {

@@ -15,30 +15,47 @@ function Test-DesktopShortcut([string]$Name) {
     return [IO.Path]::GetExtension($Name) -in @('.lnk', '.url', '.rdp', '.website')
 }
 
-# Читаем папки владельца профиля. Переменные администратора запуска здесь дали бы чужие пути.
+# Эти ключи подсказывают расположение папок. Без них всё ещё можно читать обычные папки профиля.
+function Read-PersonalRegistryValues($Users, [string]$Path, [hashtable]$ValueNames, [string]$Warning) {
+    $key = $null
+    try {
+        $key = $Users.OpenSubKey($Path)
+        $values = @{}
+        if ($key) {
+            $raw = [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+            foreach ($name in $ValueNames.Keys) {
+                $values[$name] = $key.GetValue($ValueNames[$name], $null, $raw)
+            }
+        }
+        return $values
+    } catch {
+        $cause = $_.Exception.GetBaseException()
+        if ($cause -isnot [Security.SecurityException] -and $cause -isnot [UnauthorizedAccessException]) { throw }
+        Write-Host $Warning -ForegroundColor Yellow
+        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ($Warning + ' ' + $cause.Message)
+        return $null
+    } finally {
+        if ($key) { $key.Dispose() }
+    }
+}
+
+# Используем параметры выбранного пользователя. У администратора запуска могут быть другие папки.
 function Get-PersonalFolderSettings([string]$Sid, [string]$ProfileRoot) {
     return Invoke-ProfileHive $Sid $ProfileRoot {
         param($users, $mount)
-        $result = @{}
-        $raw = [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
-        $shell = $users.OpenSubKey("$mount\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders")
-        try {
-            if ($shell) {
-                $result.Desktop = $shell.GetValue('Desktop', $null, $raw)
-                $result.Documents = $shell.GetValue('Personal', $null, $raw)
-                $result.Downloads = $shell.GetValue('{374DE290-123F-4565-9164-39C4925E467B}', $null, $raw)
-            }
-        } finally { if ($shell) { $shell.Dispose() } }
+        $shell = Read-PersonalRegistryValues $users "$mount\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders" @{
+            Desktop='Desktop'; Documents='Personal'; Downloads='{374DE290-123F-4565-9164-39C4925E467B}'
+        } 'Нет доступа к User Shell Folders. Используются стандартные локальные папки. Проверьте перенаправленные папки и OneDrive.'
+        $environment = Read-PersonalRegistryValues $users "$mount\Environment" @{
+            OneDrive='OneDrive'; OneDriveConsumer='OneDriveConsumer'; OneDriveCommercial='OneDriveCommercial'
+        } 'Нет доступа к Environment. Проверьте перенаправленные папки и OneDrive.'
 
-        $environment = $users.OpenSubKey("$mount\Environment")
-        try {
-            if ($environment) {
-                foreach ($name in @('OneDrive','OneDriveConsumer','OneDriveCommercial')) {
-                    $result[$name] = $environment.GetValue($name, $null, $raw)
-                }
-            }
-        } finally { if ($environment) { $environment.Dispose() } }
-        return $result
+        $settings = @{ShellFoldersUnavailable=($null -eq $shell)}
+        foreach ($values in @($shell, $environment)) {
+            if ($null -eq $values) { continue }
+            foreach ($name in $values.Keys) { $settings[$name] = $values[$name] }
+        }
+        return $settings
     }
 }
 
@@ -66,7 +83,7 @@ function Get-OwnedRedirectedFolder([string]$Path, [string]$Sid) {
 
 function Resolve-PersonalFolder([string]$Group, [string]$Sid, [string]$ProfileRoot, [hashtable]$Settings) {
     $default = Join-Path $ProfileRoot $Group
-    $local = [pscustomobject]@{Path=$default; Root=$ProfileRoot; Redirected=$false; Fallback=$false}
+    $local = [pscustomobject]@{Path=$default; Root=$ProfileRoot; Redirected=$false; Fallback=[bool]$Settings['ShellFoldersUnavailable']}
     $value = [string]$Settings[$Group]
     if (-not $value) { return $local }
     foreach ($name in @('OneDrive','OneDriveConsumer','OneDriveCommercial','USERPROFILE')) {

@@ -2,7 +2,7 @@
 # Автор: Arhivater
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$Script:WpmVersion = '1.11'
+$Script:WpmVersion = '1.11.1'
 # Program лежит рядом с папками для отчётов и архивов. Корень диска тоже допустим.
 $Script:KitRoot = [IO.Directory]::GetParent($PSScriptRoot).FullName
 

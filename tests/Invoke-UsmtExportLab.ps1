@@ -178,6 +178,11 @@ public static class WpmLabUserEnv {
 '@
     $source = New-LabProfile 'WpmS'
     $other = New-LabProfile 'WpmO'
+    $profileTemp = Join-Path $source.Path 'AppData\Local\Temp'
+    $nestedTemp = Join-Path $profileTemp 'WpmNested'
+    [void][IO.Directory]::CreateDirectory($nestedTemp)
+    [IO.File]::WriteAllText((Join-Path $profileTemp 'wpm-temp-direct.txt'),'temporary')
+    [IO.File]::WriteAllText((Join-Path $nestedTemp 'wpm-temp-nested.txt'),'temporary')
     Write-Host 'PASS PROFILES'
 
     $stage = 'EXPORT'
@@ -206,6 +211,11 @@ public static class WpmLabUserEnv {
         if ($source.MarkerPath -notin $paths -or @($paths | Where-Object {
             $_ -ine $source.Path -and -not $_.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)
         }).Count) { throw 'SCOPE' }
+        $tempPrefix = $profileTemp + '\'
+        if (@($paths | Where-Object {
+            $_.StartsWith($tempPrefix,[StringComparison]::OrdinalIgnoreCase)
+        }).Count) { throw 'TEMP_SCOPE' }
+        Write-Host 'PASS TEMP EXCLUDED'
     } finally { $zip.Dispose() }
     Write-Host 'PASS W05'
 
@@ -222,7 +232,7 @@ public static class WpmLabUserEnv {
         $cause = $failure.GetBaseException()
         Write-Host ('PROFILE CAUSE {0} 0x{1:X8} LINE {2}' -f $cause.GetType().Name,$cause.HResult,$_.InvocationInfo.ScriptLineNumber)
     }
-    if ($failure.Message -in @('HOST','USMT','PROFILE','PROFILE_MENU','REPORT','ZIP','ZIP_ENTRY','SOURCE','SCOPE','MANIFEST')) {
+    if ($failure.Message -in @('HOST','USMT','PROFILE','PROFILE_MENU','REPORT','ZIP','ZIP_ENTRY','SOURCE','SCOPE','TEMP_SCOPE','MANIFEST')) {
         Write-Host ('CHECK ' + $failure.Message)
     }
     if ($kit -and (Test-Path -LiteralPath (Join-Path $kit 'Reports'))) {

@@ -212,3 +212,48 @@ Invoke-WpmTest 'Extras registry launch preserves account path argument and proce
         Assert-WpmEqual $syntheticProcess.Disposed $true
     } finally { $env:SystemRoot = $systemRoot }
 }
+
+Invoke-WpmTest 'Missing registry access falls back without hiding available personal folder settings' {
+    . (Get-WpmFunctionDefinitions -Name Read-PersonalRegistryValues,Get-PersonalFolderSettings,Resolve-PersonalFolder)
+    $warnings = [Collections.Generic.List[string]]::new()
+    function Write-OperationReport($Kind,$Message) {
+        if ($Kind -eq 'ПРЕДУПРЕЖДЕНИЕ') { $warnings.Add($Message) }
+    }
+    function Write-Host {}
+    function Test-NetworkDriveRemotePath { return $false }
+    $source = [pscustomobject]@{ Denied='Environment'; Unexpected=$false }
+    $source | Add-Member ScriptMethod OpenSubKey {
+        param($path)
+        if ($this.Unexpected) { throw [InvalidOperationException]::new('unexpected registry fault') }
+        if ($path.EndsWith($this.Denied)) { throw [Security.SecurityException]::new('denied') }
+        $key = [pscustomobject]@{ Path=$path }
+        $key | Add-Member ScriptMethod GetValue {
+            param($name,$default,$options)
+            if ($name -eq 'Personal') { return '%OneDrive%\Documents' }
+            if ($name -eq 'Desktop') { return '%USERPROFILE%\Desktop' }
+            if ($name -eq 'OneDrive') { return 'C:\Cloud' }
+            return $default
+        }
+        $key | Add-Member ScriptMethod Dispose {}
+        return $key
+    }
+    function Invoke-ProfileHive($Sid,$ProfileRoot,[scriptblock]$Action) { return (& $Action $source 'UserHive') }
+
+    $settings = Get-PersonalFolderSettings 'S-1-5-21-1-2-3-1001' $WpmTestRoot
+    Assert-WpmEqual $settings.ShellFoldersUnavailable $false
+    Assert-WpmEqual $settings.Documents '%OneDrive%\Documents'
+    Assert-WpmEqual ($settings.ContainsKey('OneDrive')) $false
+    Assert-WpmEqual ($warnings[0] -match 'Environment.+OneDrive') $true
+
+    $source.Denied = 'User Shell Folders'
+    $settings = Get-PersonalFolderSettings 'S-1-5-21-1-2-3-1001' $WpmTestRoot
+    Assert-WpmEqual $settings.ShellFoldersUnavailable $true
+    Assert-WpmEqual $settings.OneDrive 'C:\Cloud'
+    $folder = Resolve-PersonalFolder 'Documents' 'S-1-5-21-1-2-3-1001' $WpmTestRoot $settings
+    Assert-WpmEqual $folder.Path (Join-Path $WpmTestRoot 'Documents')
+    Assert-WpmEqual $folder.Fallback $true
+    Assert-WpmEqual ($warnings[1] -match 'User Shell Folders.+OneDrive') $true
+
+    $source.Unexpected = $true
+    Assert-WpmThrows { Get-PersonalFolderSettings 'S-1-5-21-1-2-3-1001' $WpmTestRoot } 'unexpected registry fault'
+}

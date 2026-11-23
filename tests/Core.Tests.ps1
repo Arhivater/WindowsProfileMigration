@@ -239,6 +239,27 @@ Invoke-WpmTest 'USMT progress uses valid measured percentages and ignores malfor
     Assert-WpmEqual $observed.Percent 100
 }
 
+Invoke-WpmTest 'Profile estimate skips only the selected profile Temp without suppressing other errors' {
+    . (Get-WpmFunctionDefinitions -Name Get-FolderMetrics,Format-ByteSize)
+    $profileTemp = [IO.Path]::Combine($WpmTestRoot,'AppData','Local','Temp')
+    $documentTemp = [IO.Path]::Combine($WpmTestRoot,'Documents','Temp')
+    foreach ($path in @($profileTemp,$documentTemp)) { [void][IO.Directory]::CreateDirectory($path) }
+    [IO.File]::WriteAllBytes((Join-Path $profileTemp 'packed.tmp'), [byte[]]@(1,2,3))
+    [IO.File]::WriteAllBytes((Join-Path $documentTemp 'keep.txt'), [byte[]]@(4,5))
+    $deny = @{Path=$profileTemp}
+    function Get-ChildItem([string]$LiteralPath,[switch]$Force,$ErrorAction) {
+        if ($LiteralPath -ieq $deny.Path) { throw [UnauthorizedAccessException]::new('fixture denied') }
+        Microsoft.PowerShell.Management\Get-ChildItem @PSBoundParameters
+    }
+    Assert-WpmThrows { Get-FolderMetrics $WpmTestRoot } 'fixture denied'
+    $metrics = Get-FolderMetrics $WpmTestRoot -ExcludeProfileTemp $true
+    Assert-WpmEqual $metrics.Bytes 2
+    Assert-WpmEqual $metrics.Files 1
+    Assert-WpmEqual $metrics.SkippedTemp $true
+    $deny.Path = $documentTemp
+    Assert-WpmThrows { Get-FolderMetrics $WpmTestRoot -ExcludeProfileTemp $true } 'fixture denied'
+}
+
 Invoke-WpmTest 'Insufficient synthetic profile volume space stops import preflight' {
     . (Get-WpmFunctionDefinitions -Name Test-TargetFreeSpace,Format-ByteSize)
     function Get-ProfileStoreRoot { return $WpmTestRoot }

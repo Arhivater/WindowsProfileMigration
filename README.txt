@@ -1,4 +1,4 @@
-﻿WindowsProfileMigration v1.11
+﻿WindowsProfileMigration v1.11.1
 Перенос профиля между компьютерами с Windows 10 и 11
 
 КАК ПРОХОДИТ ПЕРЕНОС

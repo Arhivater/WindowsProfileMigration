@@ -1,6 +1,6 @@
 ﻿#Requires -Version 5.1
 # Автор: Arhivater
-# WindowsProfileMigration 1.11 | Windows PowerShell 5.1 | Windows 10/11
+# WindowsProfileMigration 1.11.1 | Windows PowerShell 5.1 | Windows 10/11
 # Экспорт выбранного профиля и подтверждённый автоматический импорт по WinRM.
 # Учётная запись администратора запуска не подставляется вместо выбранного профиля.
 
@@ -13,7 +13,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$Script:WpmVersion = '1.11'
+$Script:WpmVersion = '1.11.1'
 $Script:ToolRoot = [IO.Path]::GetFullPath($ToolRoot)
 if ($Script:ToolRoot.Length -gt [IO.Path]::GetPathRoot($Script:ToolRoot).Length) {
     $Script:ToolRoot = $Script:ToolRoot.TrimEnd('\')

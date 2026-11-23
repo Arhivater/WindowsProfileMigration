@@ -2,7 +2,11 @@
 
 # Встроенный оригинал ProfileOnly.xml. Правила будут созданы автоматически,
 # даже если при копировании комплекта потерялась отдельная папка Rules.
-# Контрольный SHA-256 оставлен совместимым с архивами v1.9.6.
+# При экспорте используется актуальный шаблон. При импорте принимается также прежний шаблон.
+function Get-CurrentProfileOnlyRuleHash {
+    return '565b6d4e9d2e672eda2585e86f82db1e25164cde7a997246112d82ae28bf85e9'
+}
+
 function Write-EmbeddedProfileOnlyRule([string]$Destination) {
     $xmlText = @'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -25,6 +29,8 @@ function Write-EmbeddedProfileOnlyRule([string]$Destination) {
             <pattern type="File">%CSIDL_PROFILE% [NTUSER.DAT*]</pattern>
             <pattern type="File">%CSIDL_PROFILE% [NTUSER.INI]</pattern>
             <pattern type="File">%CSIDL_PROFILE%\AppData\Local\Microsoft\Windows [UsrClass.dat*]</pattern>
+            <pattern type="File">%CSIDL_PROFILE%\AppData\Local\Temp [*]</pattern>
+            <pattern type="File">%CSIDL_PROFILE%\AppData\Local\Temp\* [*]</pattern>
           </objectSet>
         </exclude>
       </rules>
@@ -50,7 +56,7 @@ function Write-EmbeddedProfileOnlyRule([string]$Destination) {
     # Это обеспечивает одинаковый файл и его SHA-256 на разных компьютерах.
     $normalized = ($xmlText -replace "`r`n", "`n").TrimEnd([char[]]@([char]13,[char]10)) + "`n"
     [IO.File]::WriteAllText($Destination, $normalized, [System.Text.UTF8Encoding]::new($false))
-    if ((Get-ExactFileSha256 $Destination) -ne '5bf12aa9ff9d874faec31829cc7f0b8277af82311810321ec97c89aa6803705c') {
+    if ((Get-ExactFileSha256 $Destination) -ne (Get-CurrentProfileOnlyRuleHash)) {
         throw 'Контрольная сумма встроенных правил ProfileOnly.xml не совпала. Экспорт остановлен.'
     }
 }
@@ -188,7 +194,8 @@ function Assert-ProfileOnlyArchive([string]$Archive,[object]$Meta) {
         }
     }
     # Надёжный шаблон встроен в этот файл, внешняя папка Rules не нужна.
-    if ([string]$proof.RuleSHA256 -ne '5bf12aa9ff9d874faec31829cc7f0b8277af82311810321ec97c89aa6803705c') {
+    $supportedRules = @((Get-CurrentProfileOnlyRuleHash),'5bf12aa9ff9d874faec31829cc7f0b8277af82311810321ec97c89aa6803705c')
+    if ([string]$proof.RuleSHA256 -notin $supportedRules) {
         throw 'Правила в архиве отличаются от подтверждённого шаблона комплекта.'
     }
     $configDoc = Read-MigrationXml $config
@@ -271,7 +278,7 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
     Assert-NoReparseAncestor $p.Path
     Write-Host 'Оценка размера профиля...' -ForegroundColor Cyan
     Advance-OperationStage 'Оценка объёма профиля' -Starting
-    $profileMetrics = Get-FolderMetrics $p.Path
+    $profileMetrics = Get-FolderMetrics $p.Path -ExcludeProfileTemp $true
     $estimatedBytes = [UInt64]$profileMetrics.Bytes
     $personalFolders = Get-PersonalFolders $p.SID $p.Path $includeDocuments
     $personalBytes = Measure-PersonalFiles $personalFolders
@@ -280,6 +287,9 @@ function Do-Export([string]$Usmt,[object]$SelectedProfile = $null,[string]$Force
     Advance-OperationStage 'Подсчитан размер исходного профиля' -MilestoneActivity 'Экспорт профиля' -Milestone 1 -TotalMilestones 8
     Write-Host ('Оценочный размер профиля: ' + (Format-ByteSize $estimatedBytes) + '; файлов: ' + $profileMetrics.Files) -ForegroundColor Green
     Write-OperationReport 'ПРОВЕРКА' ('Оценочный размер профиля: ' + (Format-ByteSize $estimatedBytes) + '; файлов: ' + $profileMetrics.Files)
+    if ($profileMetrics.SkippedTemp) {
+        Write-OperationReport 'ПРОВЕРКА' 'Папка AppData\Local\Temp исключена из оценки и правил ScanState.'
+    }
     if ($profileMetrics.SkippedLinks -gt 0) {
         Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не учитывались точки соединения и символические ссылки: ' + $profileMetrics.SkippedLinks)
     }
