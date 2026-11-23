@@ -21,12 +21,22 @@ function Initialize-LabUserProfile([string]$Name, [string]$Sid, [Security.Secure
     $shell = Join-Path $env:SystemRoot 'System32\cmd.exe'
     $process = Start-Process -FilePath $shell -Credential $credential -LoadUserProfile -WorkingDirectory $env:SystemRoot -ArgumentList '/d /c exit 0' -WindowStyle Hidden -PassThru
     try {
-        if (-not $process.WaitForExit(15000) -or $process.ExitCode -ne 0) { throw 'PROFILE' }
+        [void]$process.Handle
+        if ($process.WaitForExit(60000)) {
+            Write-Host ('PROFILE LOGON EXIT {0}' -f $process.ExitCode)
+        } else {
+            Write-Host 'PROFILE LOGON TIMED OUT'
+        }
     } finally {
-        if (-not $process.HasExited) { $process.Kill() }
+        if (-not $process.HasExited) {
+            $process.Kill()
+            [void]$process.WaitForExit(5000)
+        }
         $process.Dispose()
     }
-    for ($attempt = 0; $attempt -lt 15; $attempt++) {
+    # Only the registered, signed-out profile with a hive can become a lab fixture.
+    # cmd.exe's exit code is printed for diagnosis and does not establish profile creation.
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
         $profile = Get-CimInstance Win32_UserProfile -Filter "SID='$Sid'"
         if ($profile -and $profile.LocalPath -and -not $profile.Loaded) {
             Write-Host 'PROFILE INITIALIZED BY TEST LOGON'
