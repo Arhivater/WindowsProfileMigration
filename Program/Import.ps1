@@ -313,6 +313,10 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         Advance-OperationStage 'Дополнительные файлы исключены из импорта'
     }
     Assert-PersonalFilesInventory $meta $approvedExtras
+    $sourcePersonalFilesComplete = $true
+    if ($meta.PSObject.Properties['PersonalFiles']) {
+        $sourcePersonalFilesComplete = Write-PersonalFilesCoverage $meta.PersonalFiles
+    }
     if ($JustVerify) {
         if ([int]$meta.SchemaVersion -ge 5 -and $approvedExtras.Count -ne [int]$meta.ExtrasManifest.Files) {
             throw 'Проверка USMT завершена, но один или несколько дополнительных файлов не прошли проверку.'
@@ -462,7 +466,10 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     Write-OperationReport 'ПРИЁМКА' 'Не выполнена. Для подтверждения доступа, настроек и программ пользователь должен войти под своей учётной записью.'
     Write-OperationReport 'USMT' ('Технический импорт выполнен для: '+$target)
     $personalStatus = if ($personalFilesComplete) { '' } else { '; ЛИЧНЫЕ ФАЙЛЫ ВОССТАНОВЛЕНЫ НЕ ПОЛНОСТЬЮ' }
-    $trackedStatus = if ($personalFilesComplete) { 'Технически завершено, ожидает приёмки' } else { 'USMT завершён, личные файлы требуют повтора' }
+    if (-not $sourcePersonalFilesComplete) { $personalStatus += '; ЧАСТЬ ЛИЧНЫХ ПАПОК ПРОПУЩЕНА ПРИ ЭКСПОРТЕ' }
+    $trackedStatus = if (-not $personalFilesComplete) { 'USMT завершён, личные файлы требуют повтора' }
+        elseif (-not $sourcePersonalFilesComplete) { 'USMT завершён, архив личных файлов неполный' }
+        else { 'Технически завершено, ожидает приёмки' }
     Update-TrackedState $trackedStatus @{ImportCompleted=$true}
     Advance-OperationStage 'Результаты восстановления записаны в отчёт'
     if (Clear-TrackedStaging $Script:ActiveOpState $false) {
