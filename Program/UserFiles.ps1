@@ -141,8 +141,10 @@ function Get-PersonalSourceFiles([string]$Folder, [string]$ProfileRoot, [bool]$S
         foreach ($item in (Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop)) {
             if ($ShortcutsOnly -and -not $item.PSIsContainer -and -not (Test-DesktopShortcut $item.Name)) { continue }
             if (-not (Test-PersonalFileLocal $item)) {
-                if ($Outcome) { $Outcome.Skipped++ }
-                Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Пропущена ссылка или облачный объект: ' + $item.FullName)
+                if ($Outcome) {
+                    $Outcome.Skipped++
+                    Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Пропущена ссылка или облачный объект: ' + $item.FullName)
+                }
                 continue
             }
             if ($item.PSIsContainer) { $pending.Push($item.FullName) }
@@ -245,9 +247,11 @@ function Write-PersonalFilesCoverage($Inventory) {
         if (-not $result) { continue }
         $problems = @()
         if ($result.Fallback) { $problems += 'не удалось прочитать настроенную папку, использована локальная' }
-        if ($result.Missing) { $problems += 'выбранная папка отсутствовала' }
         if ($result.ReadFailed) { $problems += 'чтение папки завершилось ошибкой' }
         if ($result.Skipped -gt 0) { $problems += ('пропущено объектов: ' + $result.Skipped) }
+        if ($result.Missing) {
+            Write-OperationReport 'ФАЙЛЫ' ($names[$group] + ' — папка отсутствовала на исходном ПК.')
+        }
         if ($problems.Count) {
             $complete = $false
             $message = $names[$group] + ' при экспорте — ' + ($problems -join ', ') + '.'
