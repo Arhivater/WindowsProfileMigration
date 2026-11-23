@@ -184,15 +184,30 @@ function Test-RunningProcessStopRequest([string]$Activity,[int]$ProgressId) {
     return (Confirm ('Остановить выполняемый процесс: ' + $Activity + '?'))
 }
 # Запускает USMT и обновляет индикатор в течение выполнения процесса.
-function Invoke-USMT([string]$File,[string[]]$Options,[string]$WorkingPath,[string]$ProgressPath = '') {
+function Invoke-USMT([string]$File,[string[]]$Options,[string]$WorkingPath,[string]$ProgressPath = '',[switch]$TrackProcess) {
     $argLine = (@($Options | ForEach-Object { Quote-WindowsArgument ([string]$_) }) -join ' ')
     $proc = $null
     $code = $null
+    if ($TrackProcess) {
+        # Сначала записываем имя. Если PowerShell завершится в момент запуска,
+        # меню восстановления проверит это имя, даже когда PID ещё неизвестен.
+        Update-TrackedState '' @{UsmtProcessName=[IO.Path]::GetFileNameWithoutExtension($File); UsmtProcessId=0; UsmtProcessStartTicks=0}
+    }
     try {
         $proc = Start-Process -FilePath $File -WorkingDirectory $WorkingPath -ArgumentList $argLine -PassThru -NoNewWindow -ErrorAction Stop
         # В Windows PowerShell Start-Process -NoNewWindow может вернуть null
         # в ExitCode после ожидания. Раннее обращение к Handle сохраняет дескриптор.
         [void]$proc.Handle
+        if ($TrackProcess -and -not $proc.HasExited) {
+            try { $startTicks = $proc.StartTime.ToUniversalTime().Ticks }
+            catch [InvalidOperationException] {
+                if (-not $proc.HasExited) { throw }
+                $startTicks = 0
+            }
+            if ($startTicks) {
+                Update-TrackedState '' @{UsmtProcessId=$proc.Id; UsmtProcessStartTicks=$startTicks}
+            }
+        }
         Write-Host 'Во время работы USMT нажмите клавишу 0 (без Enter), чтобы запросить отмену.' -ForegroundColor Yellow
         while (-not $proc.WaitForExit(950)) {
             Show-UsmtProgress $ProgressPath ('Миграция: '+[IO.Path]::GetFileNameWithoutExtension($File))
@@ -214,8 +229,14 @@ function Invoke-USMT([string]$File,[string[]]$Options,[string]$WorkingPath,[stri
         Show-UsmtProgress $ProgressPath ('Миграция: '+[IO.Path]::GetFileNameWithoutExtension($File))
         $code = $proc.ExitCode
     } finally {
-        Write-Progress -Id 1 -Activity 'USMT' -Completed
-        if ($proc) { $proc.Dispose() }
+        try {
+            if ($TrackProcess -and $proc -and $proc.HasExited) {
+                Update-TrackedState '' @{UsmtProcessName=''; UsmtProcessId=0; UsmtProcessStartTicks=0}
+            }
+        } finally {
+            if ($proc) { $proc.Dispose() }
+            Write-Progress -Id 1 -Activity 'USMT' -Completed
+        }
     }
     if ($null -eq $code) {
         throw 'Не удалось прочитать код завершения USMT. Проверьте журнал запуска; успех не подтверждён.'

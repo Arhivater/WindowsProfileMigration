@@ -2,7 +2,7 @@
 . (Get-WpmFunctionDefinitions -ScriptName 'ProfileMigration.ps1' -Name @(
     'Assert-ArchiveMetadata','Assert-WpmDirectoryChain','New-WpmWorkDirectoryAcl','Assert-WpmWorkAcl',
     'Initialize-WpmWorkDirectory','Assert-WpmWorkRoot',
-    'Save-TrackedState','Get-TrackedStates','Read-BoundedArchiveMetadata','Enter-ProfileMutationLock','Assert-TrackedOperationStopped',
+    'Save-TrackedState','Get-TrackedStates','Read-BoundedArchiveMetadata','Enter-ProfileMutationLock','Assert-TrackedOperationStopped','Assert-TrackedUsmtStopped',
     'Assert-OperationTreeHasNoReparsePoint','Assert-SafeStaging','Resolve-ImportTarget',
     'Select-ImportDestination','Assert-NoUnreviewedImport','Show-RecoveryMenu','Select-RecoveryRecord',
     'Show-LegacyRecoveryRecord','Assert-RegularNetworkPartial',

@@ -213,5 +213,5 @@ function Verify-Store([string]$Usmt,[string]$Store,[string]$Logs) {
     [void](New-Item -ItemType Directory -Path $Logs -Force)
     $mig = MigFile $Store
     Write-Host 'Проверка целостности USMT...' -ForegroundColor Cyan
-    Invoke-USMT (Join-Path $Usmt 'UsmtUtils.exe') @('/verify:all',$mig,('/l:'+(Join-Path $Logs 'verify.log')),'/v:5') $Usmt
+    Invoke-USMT (Join-Path $Usmt 'UsmtUtils.exe') @('/verify:all',$mig,('/l:'+(Join-Path $Logs 'verify.log')),'/v:5') $Usmt -TrackProcess
 }

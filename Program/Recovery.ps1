@@ -117,6 +117,7 @@ function Start-TrackedState([string]$Kind,[string]$Archive) {
         StagingPath=''; StagingDisposition=''; StagingPurpose=''; DesktopBackup=''; DesktopBackupSha256='';
         NetworkPartialPath=''; BrowserBackupPath=''; ConfigBackupPath='';
         USMTStarted=$false; USMTFinished=$false; CleanupDone=$false;
+        UsmtProcessName=''; UsmtProcessId=0; UsmtProcessStartTicks=0;
         LastError=''; LastUpdated=''; Report=[string]$Script:ReportPath;
         ProcessId=$PID; ProcessStartTicks=$startTicks
     }
@@ -183,7 +184,51 @@ function Enter-ProfileMutationLock {
     }
 }
 
+# PID и время запуска отличают процесс USMT от другого процесса, получившего тот же PID.
+function Assert-TrackedUsmtStopped([object]$State) {
+    $name = ''
+    $childId = 0
+    $startedAt = 0L
+    if ($State -is [System.Collections.IDictionary]) {
+        $name = [string]$State['UsmtProcessName']
+        $childId = [int]$State['UsmtProcessId']
+        $startedAt = [long]$State['UsmtProcessStartTicks']
+        $hasProcessRecord = $State.Contains('UsmtProcessName')
+    } else {
+        $hasProcessRecord = $null -ne $State.PSObject.Properties['UsmtProcessName']
+        if ($hasProcessRecord) {
+            $name = [string]$State.UsmtProcessName
+            $childId = [int]$State.UsmtProcessId
+            $startedAt = [long]$State.UsmtProcessStartTicks
+        }
+    }
+    if (-not $hasProcessRecord -and $State.PSObject.Properties['USMTStarted'] -and $State.USMTStarted -and -not $State.USMTFinished) {
+        # Старые журналы не хранят PID USMT. Для них проверяем имя процесса.
+        $name = if ($State.Kind -eq 'Импорт') { 'LoadState' } elseif ($State.Kind -eq 'Экспорт') { 'ScanState' }
+    }
+    if (-not $name) { return }
+    if ($name -notin @('ScanState','LoadState','UsmtUtils')) { throw 'Некорректное имя процесса USMT в журнале.' }
+    $running = @(Get-Process -Name $name -ErrorAction SilentlyContinue)
+    try {
+        foreach ($process in $running) {
+            if ($childId -gt 0 -and $startedAt -gt 0) {
+                if ($process.Id -ne $childId) { continue }
+                try {
+                    if ($process.StartTime.ToUniversalTime().Ticks -ne $startedAt) { continue }
+                } catch [InvalidOperationException] {
+                    if ($process.HasExited) { continue }
+                    throw
+                }
+            }
+            if (-not $process.HasExited) { throw 'USMT ещё работает. Очистка и повтор операции пока недоступны.' }
+        }
+    } finally {
+        foreach ($process in $running) { $process.Dispose() }
+    }
+}
+
 function Assert-TrackedOperationStopped([object]$State) {
+    Assert-TrackedUsmtStopped $State
     if (-not $State.PSObject.Properties['ProcessId'] -or -not $State.PSObject.Properties['ProcessStartTicks'] -or
         [int]$State.ProcessId -le 0) { return }
     if ([int]$State.ProcessId -eq $PID -and (-not $Script:ActiveOpState -or $Script:ActiveOpState.Id -ne $State.Id)) { return }
@@ -231,6 +276,7 @@ function Clear-TrackedStaging([hashtable]$State,[bool]$Ask = $false) {
     $safe=Assert-SafeStaging ([string]$State.StagingPath)
     if ($Ask -and -not (Confirm ('Удалить только временный каталог ' + $safe + ' ?'))) { return $false }
     try {
+        Assert-TrackedUsmtStopped $State
         if ($Ask) { $safe = Assert-SafeStaging ([string]$State.StagingPath) }
         if (Test-Path -LiteralPath $safe -ErrorAction Stop) { Remove-Item -LiteralPath $safe -Recurse -Force -ErrorAction Stop }
         $State.CleanupDone=$true; $State.StagingDisposition='Временная копия удалена'

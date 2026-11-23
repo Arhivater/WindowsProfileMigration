@@ -90,7 +90,7 @@ function New-ProfileOnlyRules([string]$Archive,[string]$Usmt,[string]$Logs) {
     Write-OperationReport 'ЖУРНАЛ USMT' ('Подготовка Config.xml: ' + $genconfigLog)
     Invoke-USMT (Join-Path $Usmt 'ScanState.exe') @(
         ('/i:'+$rule),('/genconfig:'+$configPath),'/v:5',('/l:'+$genconfigLog)
-    ) $Usmt
+    ) $Usmt -TrackProcess
     if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
         throw 'USMT не создал Config.xml для ограничения настроек компьютера.'
     }
@@ -221,7 +221,7 @@ function Invoke-ProfileScan($Usmt, $Store, $Rules, $Logs, $ListPath, $Account) {
     Write-Host 'Экспорт USMT...' -ForegroundColor Cyan
     Write-OperationReport 'ЖУРНАЛ USMT' ('Экспорт: ' + (Join-Path $logs 'scanstate.log'))
     Update-TrackedState 'ScanState выполняется' @{USMTStarted=$true}
-    Invoke-USMT (Join-Path $Usmt 'ScanState.exe') $scanArguments $Usmt (Join-Path $logs 'scan-progress.log')
+    Invoke-USMT (Join-Path $Usmt 'ScanState.exe') $scanArguments $Usmt (Join-Path $logs 'scan-progress.log') -TrackProcess
     Advance-OperationStage 'ScanState завершён'
     Update-TrackedState 'ScanState завершён' @{USMTFinished=$true}
     Write-OperationReport 'УСПЕХ' 'USMT ScanState: экспорт завершён, код 0.'

@@ -130,10 +130,12 @@ function Assert-NoUnreviewedImport([object]$Target) {
     }
     foreach ($prior in @(Get-TrackedStates -RequireReadable)) {
         if ($prior.Kind -ne 'Импорт' -or $prior.Id -eq $Script:ActiveOpState.Id) { continue }
-        if ($prior.PSObject.Properties['RecoveryReviewed'] -and $prior.RecoveryReviewed -eq $true) { continue }
         $sameSid = $Target.Sid -and $prior.PSObject.Properties['TargetSid'] -and $Target.Sid -eq $prior.TargetSid
+        if (-not $sameSid -and $prior.TargetAccount -ine $Target.Account) { continue }
+        Assert-TrackedUsmtStopped $prior
+        if ($prior.PSObject.Properties['RecoveryReviewed'] -and $prior.RecoveryReviewed -eq $true) { continue }
         $pending = $prior.PSObject.Properties['AccountCreationPending'] -and $prior.AccountCreationPending -eq $true
-        if (($sameSid -or $prior.TargetAccount -ieq $Target.Account) -and ($prior.USMTStarted -or $pending)) {
+        if ($prior.USMTStarted -or $pending) {
             throw ('Для назначения уже есть операция ' + $prior.Id + '. Проверьте её состояние в пункте 4 перед повторным импортом.')
         }
     }
@@ -149,7 +151,7 @@ function Invoke-ProfileLoad($Usmt, $Store, $Archive, $Map, $LogRoot, $Log) {
     Update-TrackedState 'LoadState выполняется' @{USMTStarted=$true}
     Write-Host 'Импорт USMT...' -ForegroundColor Cyan
     Write-OperationReport 'ЖУРНАЛ USMT' ('Импорт: ' + $log)
-    Invoke-USMT (Join-Path $Usmt 'LoadState.exe') $opts $Usmt $progressLog
+    Invoke-USMT (Join-Path $Usmt 'LoadState.exe') $opts $Usmt $progressLog -TrackProcess
     Advance-OperationStage 'LoadState завершён'
     Update-TrackedState 'LoadState завершён, проверка продолжается' @{USMTFinished=$true}
     Write-OperationReport 'USMT' 'LoadState завершился с кодом 0; проверка файлов выполняется отдельно.'
