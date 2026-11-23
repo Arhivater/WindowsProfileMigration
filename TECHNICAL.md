@@ -84,4 +84,4 @@ flowchart TD
 
 ## Проверки сборки
 
-При запуске на Windows распакуйте весь ZIP и откройте `start.cmd`. Результаты автоматических проверок и стенда публикуются вместе с версией комплекта. [Скачать ZIP](https://github.com/Arhivater/WindowsProfileMigration/releases/download/v1.11/WindowsProfileMigration_v1.11_Arhivater.zip) · [Прогоны GitHub Actions](https://github.com/Arhivater/WindowsProfileMigration/actions?query=branch%3Arelease%2Fv1.11.0)
+При запуске на Windows распакуйте весь ZIP и откройте `start.cmd`. Результаты автоматических проверок и стенда публикуются вместе с версией комплекта. [Скачать ZIP](https://github.com/Arhivater/WindowsProfileMigration/releases/download/v1.11/WindowsProfileMigration_v1.11.zip) · [Прогоны GitHub Actions](https://github.com/Arhivater/WindowsProfileMigration/actions?query=branch%3Arelease%2Fv1.11.0)

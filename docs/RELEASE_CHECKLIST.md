@@ -35,7 +35,7 @@
 
 ## Точка продолжения
 
-[Скачать комплект v1.11](https://github.com/Arhivater/WindowsProfileMigration/releases/download/v1.11/WindowsProfileMigration_v1.11_Arhivater.zip). SHA-256 опубликованного ZIP `56b932c446b34ed90a4ec7f646340b138ee4cf9d5d1047ecaf2e0507cd1eba31`.
+[Скачать комплект v1.11](https://github.com/Arhivater/WindowsProfileMigration/releases/download/v1.11/WindowsProfileMigration_v1.11.zip). SHA-256 опубликованного ZIP `79212a71da2984abec07c74895f8266accc82d72fb61b7a1afc7b41f670e1b7f`.
 
 ## Тестирование 23 ноября 2026
 
