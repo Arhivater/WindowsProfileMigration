@@ -144,8 +144,37 @@ Invoke-WpmTest 'Network deployment lock and durable marker refuse ambiguous or d
         [IO.File]::WriteAllText($done,$marker)
         Assert-WpmEqual (Enter-RemoteMigration $null $WpmTestRoot $hash $account) 'Completed'
         Clear-WpmSyntheticRemoteLock
+        [IO.File]::WriteAllText($done, ($marker + [Environment]::NewLine + 'Result=8'))
+        Assert-WpmEqual (Enter-RemoteMigration $null $WpmTestRoot $hash $account) 'Result=8'
+        Clear-WpmSyntheticRemoteLock
+        [IO.File]::WriteAllText($done, ($marker + [Environment]::NewLine + 'Result=15'))
+        Assert-WpmEqual (Enter-RemoteMigration $null $WpmTestRoot $hash $account) 'Result=15'
+        Clear-WpmSyntheticRemoteLock
         Assert-WpmThrows { Enter-RemoteMigration $null $WpmTestRoot $hash 'PC\Different' } 'другом или повреждённом'
+        Clear-WpmSyntheticRemoteLock
+        [IO.File]::WriteAllText($done, ($marker + [Environment]::NewLine + 'Result=16'))
+        Assert-WpmThrows { Enter-RemoteMigration $null $WpmTestRoot $hash $account } 'другом или повреждённом'
     } finally { Clear-WpmSyntheticRemoteLock }
+}
+
+Invoke-WpmTest 'Network sender distinguishes an empty manifest from detected missing files' {
+    . (Get-WpmFunctionDefinitions -Name 'Complete-RemoteMigration')
+    $observed = [pscustomobject]@{ FinalStatus=''; Warnings=[Collections.Generic.List[string]]::new() }
+    function Write-Host($Message,$ForegroundColor) {}
+    function Write-OperationReport($Category,$Message) { $observed.Warnings.Add($Message) }
+    function Finish-OperationReport($Status) { $observed.FinalStatus = $Status }
+
+    Complete-RemoteMigration 8 'PC\User' $true
+    Assert-WpmEqual $observed.FinalStatus 'ПОЛНОТА ПЕРЕНОСА НЕ ПОДТВЕРЖДЕНА'
+    Assert-WpmEqual $observed.Warnings.Count 1
+    Assert-WpmEqual ($observed.Warnings[0] -match 'реестр пуст') $true
+
+    $observed.Warnings.Clear()
+    Complete-RemoteMigration 12 'PC\User'
+    Assert-WpmEqual $observed.FinalStatus 'ПРОФИЛЬ ПЕРЕНЕСЁН ЧАСТИЧНО'
+    Assert-WpmEqual $observed.Warnings.Count 2
+    Assert-WpmEqual ($observed.Warnings[0] -match 'пропущенные папки') $true
+    Assert-WpmEqual ($observed.Warnings[1] -match 'реестр пуст') $true
 }
 
 Invoke-WpmTest 'Network reconnect rejects a different device with same hostname' {

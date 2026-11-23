@@ -429,7 +429,10 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         }
         Write-OperationReport 'ПРОВЕРКА' ("Реестр: {0} файлов; совпали: {1}; отсутствуют: {2}; различаются: {3}; не считались на источнике: {4}" -f $fileCheck.Total,$fileCheck.Matched,$fileCheck.Missing,$fileCheck.Changed,$fileCheck.SourceSkipped)
         foreach ($issue in $fileCheck.Errors) { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' $issue }
-        if ($fileCheck.Total -eq 0 -or $fileCheck.Missing -gt 0 -or $fileCheck.Changed -gt 0 -or $fileCheck.SourceSkipped -gt 0) {
+        if ($fileCheck.Total -eq 0) {
+            $validationStatus = 'ПОЛНОТА ПЕРЕНОСА НЕ ПОДТВЕРЖДЕНА: КОНТРОЛЬНЫЙ РЕЕСТР ПУСТ'
+            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Контрольный реестр пуст. Нельзя считать перенос полностью проверенным.'
+        } elseif ($fileCheck.Missing -gt 0 -or $fileCheck.Changed -gt 0 -or $fileCheck.SourceSkipped -gt 0) {
             Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Есть расхождения в контрольном списке файлов. Нельзя считать перенос полностью проверенным.'
         }
     } else {
@@ -497,9 +500,14 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         $result = 0
         if (-not $personalFilesComplete) { $result = $result -bor 1 }
         if (-not $sourcePersonalFilesComplete) { $result = $result -bor 2 }
-        if ($fileCheck -and ($fileCheck.Missing -gt 0 -or $fileCheck.Changed -gt 0 -or $fileCheck.SourceSkipped -gt 0)) {
+        # Базовая проверка охватывает в том числе AppData, которого нет в реестре SHA-256.
+        if ($validation.MissingDirectories.Count -gt 0 -or $validation.MissingSamples.Count -gt 0 -or
+            $validation.Warnings.Count -gt 0 -or ($fileCheck -and
+                ($fileCheck.Missing -gt 0 -or $fileCheck.Changed -gt 0 -or $fileCheck.SourceSkipped -gt 0))) {
             $result = $result -bor 4
         }
+        # Пустой реестр ограничивает проверку, даже если все ожидаемые папки найдены.
+        if ($fileCheck -and $fileCheck.Total -eq 0) { $result = $result -bor 8 }
         return [pscustomobject]@{Result=$result}
     }
     return $true

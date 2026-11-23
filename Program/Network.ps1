@@ -336,7 +336,7 @@ function Enter-RemoteMigration([object]$Session,[string]$Root,[string]$Hash,[str
             if ([IO.File]::Exists($started) -and [IO.File]::ReadAllText($started) -ieq $tag) {
                 $lines = [IO.File]::ReadAllLines($done)
                 if ($lines.Length -eq 1 -and $lines[0] -ieq $tag) { return 'Completed' }
-                if ($lines.Length -eq 2 -and $lines[0] -ieq $tag -and $lines[1] -cmatch '^Result=[0-7]$') {
+                if ($lines.Length -eq 2 -and $lines[0] -ieq $tag -and $lines[1] -cmatch '^Result=(?:[0-9]|1[0-5])$') {
                     return $lines[1]
                 }
             }
@@ -532,7 +532,7 @@ function Invoke-RemoteProfileImport([object]$Session,[string]$Root,[string]$Arch
                 & $binary @launchOptions -File $script -ToolRoot $root -RemoteImportArchive $zip -RemoteTargetAccount $account
                 $code = $LASTEXITCODE
             }
-            if ($code -ne 0 -and ($code -lt 11 -or $code -gt 17)) {
+            if ($code -ne 0 -and ($code -lt 11 -or $code -gt 25)) {
                 throw ('На целевом ПК импорт завершился кодом ' + $code + '.')
             }
             $result = if ($code -eq 0) { 0 } else { $code - 10 }
@@ -554,16 +554,22 @@ function Complete-RemoteMigration([int]$Result, [string]$Account, [bool]$Previou
         return
     }
     if ($Previous) { Write-Host 'Сохранённый результат предыдущего импорта:' -ForegroundColor Yellow }
-    Write-Host ('Профиль перенесён частично: ' + $Account) -ForegroundColor Yellow
+    # Только пустой реестр ограничивает проверку без обнаруженных пропусков.
+    $status = if ($Result -band 7) { 'ПРОФИЛЬ ПЕРЕНЕСЁН ЧАСТИЧНО' }
+        else { 'ПОЛНОТА ПЕРЕНОСА НЕ ПОДТВЕРЖДЕНА' }
+    $message = if ($Result -band 7) { 'Профиль перенесён частично' }
+        else { 'Полнота переноса не подтверждена' }
+    Write-Host ($message + ': ' + $Account) -ForegroundColor Yellow
     $hints = @()
     if ($Result -band 1) { $hints += 'На целевом ПК откройте пункт 4 → 6, чтобы повторить восстановление личных файлов, или проверить, выполнено ли оно ранее.' }
     if ($Result -band 2) { $hints += 'На исходном ПК проверьте пропущенные при экспорте папки и сохраните недостающие файлы.' }
-    if ($Result -band 4) { $hints += 'В отчёте целевого ПК проверьте расхождения контрольных сумм.' }
+    if ($Result -band 4) { $hints += 'В отчёте целевого ПК проверьте пропущенные папки, контрольные файлы и расхождения контрольных сумм.' }
+    if ($Result -band 8) { $hints += 'Контрольный реестр пуст. Проверьте перенесённые данные на целевом ПК.' }
     foreach ($hint in $hints) {
         Write-Host $hint -ForegroundColor Yellow
         Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' $hint
     }
-    Finish-OperationReport 'ПРОФИЛЬ ПЕРЕНЕСЁН ЧАСТИЧНО'
+    Finish-OperationReport $status
 }
 
 # WinRM передаёт проверяемый ZIP и запускает подтверждённый импорт.
@@ -819,7 +825,7 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
         Write-Host 'Автоматический запуск LoadState на целевом компьютере...' -ForegroundColor Cyan
         $remoteResult = $null
         Invoke-RemoteProfileImport $session $remoteRoot $remoteArchive $targetAccount $localHash $archivePassword | ForEach-Object {
-            if ([string]$_ -cmatch '^WPM_REMOTE_RESULT=([0-7])$') { $remoteResult = [int]$Matches[1] }
+            if ([string]$_ -cmatch '^WPM_REMOTE_RESULT=([0-9]|1[0-5])$') { $remoteResult = [int]$Matches[1] }
             else { Write-Host ([string]$_) }
         }
         if ($null -eq $remoteResult) {
