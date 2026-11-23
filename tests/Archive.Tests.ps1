@@ -239,3 +239,55 @@ Invoke-WpmTest 'Robocopy preserves the volume root and tolerates an exit racing 
         Assert-WpmThrows { Copy-DirectoryRobust $source $destination 'synthetic' } 'Код: -1'
     } finally { $env:SystemRoot = $oldSystemRoot }
 }
+
+# Windows PowerShell 5.1 uses the framework assembly shipped with the package.
+if ($PSVersionTable.PSEdition -eq 'Desktop' -and [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    . (Join-Path $script:WpmProgramRoot 'Encryption.ps1')
+
+    function Invoke-WithProtectedFixture([string]$Root, [scriptblock]$Check) {
+        $fixture = @{
+            Zip = Join-Path $Root 'profile.zip'
+            Protected = Join-Path $Root 'profile.wpm.pgp'
+            Output = Join-Path $Root 'restored.zip'
+            Password = ConvertTo-SecureString 'Synthetic-Архив-42' -AsPlainText -Force
+        }
+        try {
+            New-TestProfileZip $fixture.Zip @('Extras/UserFiles/Documents/sample.txt')
+            Convert-WpmArchive $fixture.Zip $fixture.Protected $fixture.Password
+            & $Check $fixture
+        } finally { $fixture.Password.Dispose() }
+    }
+
+    Invoke-WpmTest 'Protected archive round trip preserves ZIP bytes with a Unicode password' {
+        Invoke-WithProtectedFixture $WpmTestRoot {
+            param($fixture)
+            Convert-WpmArchive $fixture.Protected $fixture.Output $fixture.Password -Decrypt
+            Assert-WpmEqual (Get-ExactFileSha256 $fixture.Output) (Get-ExactFileSha256 $fixture.Zip)
+        }
+    }
+
+    Invoke-WpmTest 'Protected archive rejects a wrong password and tampering without leaving a ZIP' {
+        Invoke-WithProtectedFixture $WpmTestRoot {
+            param($fixture)
+            $wrongPassword = ConvertTo-SecureString 'Different-fixture-password' -AsPlainText -Force
+            try {
+                Assert-WpmThrows { Convert-WpmArchive $fixture.Protected $fixture.Output $wrongPassword -Decrypt } 'Не удалось открыть архив'
+                Assert-WpmEqual (Test-Path -LiteralPath $fixture.Output) $false
+            } finally { $wrongPassword.Dispose() }
+            $bytes = [IO.File]::ReadAllBytes($fixture.Protected)
+            $bytes[$bytes.Length - 1] = $bytes[$bytes.Length - 1] -bxor 1
+            [IO.File]::WriteAllBytes($fixture.Protected, $bytes)
+            Assert-WpmThrows { Convert-WpmArchive $fixture.Protected $fixture.Output $fixture.Password -Decrypt } 'Не удалось открыть архив'
+            Assert-WpmEqual (Test-Path -LiteralPath $fixture.Output) $false
+        }
+    }
+
+    Invoke-WpmTest 'Protected archive preflight stops before writing when the staging disk is full' {
+        Invoke-WithProtectedFixture $WpmTestRoot {
+            param($fixture)
+            function Get-PathFreeBytes { 0 }
+            Assert-WpmThrows { Convert-WpmArchive $fixture.Protected $fixture.Output $fixture.Password -Decrypt } 'Недостаточно места'
+            Assert-WpmEqual (Test-Path -LiteralPath $fixture.Output) $false
+        }
+    }
+}
