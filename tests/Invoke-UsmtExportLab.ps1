@@ -16,7 +16,11 @@ function New-LabProfile([string]$Prefix) {
     $buffer = [Text.StringBuilder]::new(1024)
     $sid = $user.SID.Value
     $result = [WpmLabUserEnv]::CreateProfile($sid, $name, $buffer, $buffer.Capacity)
-    if ($result -ne 0) { [Runtime.InteropServices.Marshal]::ThrowExceptionForHR($result); throw 'PROFILE' }
+    if ($result -ne 0) {
+        Write-Host ('CREATE_PROFILE HRESULT 0x{0:X8}' -f $result)
+        [Runtime.InteropServices.Marshal]::ThrowExceptionForHR($result)
+        throw 'PROFILE'
+    }
     $profile = @(Get-CimInstance Win32_UserProfile -Filter "SID='$sid'")
     $path = $buffer.ToString()
     if ($profile.Count -ne 1 -or $profile[0].LocalPath -ine $path -or $profile[0].Special -or
@@ -177,6 +181,10 @@ public static class WpmLabUserEnv {
     # Keep source paths, profile contents and native logs local. Only bounded numeric diagnostics leave the VM.
     $failure = $_.Exception
     Write-Host ('FAIL {0} {1} {2}' -f $stage,$failure.GetType().Name,$failure.HResult)
+    if ($stage -eq 'PROFILES') {
+        $cause = $failure.GetBaseException()
+        Write-Host ('PROFILE CAUSE {0} 0x{1:X8} LINE {2}' -f $cause.GetType().Name,$cause.HResult,$_.InvocationInfo.ScriptLineNumber)
+    }
     if ($failure.Message -in @('HOST','USMT','PROFILE','PROFILE_MENU','REPORT','ZIP','ZIP_ENTRY','SOURCE','SCOPE','MANIFEST')) {
         Write-Host ('CHECK ' + $failure.Message)
     }
