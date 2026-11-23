@@ -508,9 +508,12 @@ function Invoke-PersonalFilesRetry($State, [hashtable]$Changes) {
         return $false
     }
     $Changes.PersonalFilesPending = $false
-    # Повтор копирует файлы из архива. Пропуски на исходном ПК всё ещё требуют внимания.
-    $Changes.Status = if ($Changes['PersonalSourceIncomplete']) { 'Файлы из архива восстановлены, при экспорте были пропуски' }
-        else { 'Личные файлы восстановлены, ожидает приёмки' }
+    # Успех повтора меняет итог импорта, только если ранее завершились все остальные этапы.
+    # При незавершённом импорте сохраняем его статус и ошибку.
+    if (-not $Changes.ContainsKey('ImportCompleted') -or $Changes.ImportCompleted) {
+        $Changes.Status = if ($Changes['PersonalSourceIncomplete']) { 'Файлы из архива восстановлены, при экспорте были пропуски' }
+            else { 'Личные файлы восстановлены, ожидает приёмки' }
+    }
     Save-TrackedState $Changes
     return $true
 }
