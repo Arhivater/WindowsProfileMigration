@@ -480,15 +480,26 @@ function Invoke-PersonalFilesRetry($State, [hashtable]$Changes) {
     if (-not (Test-PersonalFilesRetryAvailable $State)) { return $false }
     if (-not (Confirm ('Восстановить личные файлы для ' + $State.TargetAccount + '?'))) { return $false }
     $archive = [string]$State.SourceArchive
-    if (-not (Test-Path -LiteralPath $archive)) {
+    if (Test-Path -LiteralPath $archive) {
+        Write-Host ('1. Использовать архив из журнала: ' + $archive)
+        Write-Host '2. Выбрать другую копию архива'
+        Write-Host '0. Назад'
+        switch (Choice 'Выберите архив' 2) {
+            0 { return $false }
+            2 { $archive = Select-Archive }
+        }
+    } else {
         Write-Host 'Исходный архив не найден. Выберите его из другой папки.'
         $archive = Select-Archive
-        if (-not $archive) { return $false }
     }
-    # Внутренний импорт готовит архив в собственном временном каталоге.
+    if (-not $archive) { return $false }
+    # Проверка обоих SHA-256 выполняется и при выборе другой копии.
+    # При ошибке прежний путь в журнале сохраняется.
     try { $complete = Do-Import -ArchiveOverride $archive -PersonalRetry $State }
     finally { $Script:ActiveOpState = $null }
+    $Changes.SourceArchive = [IO.Path]::GetFullPath($archive)
     if (-not $complete) {
+        Save-TrackedState $Changes
         Write-Host 'Остались невосстановленные личные файлы. Причины указаны в отчёте.' -ForegroundColor Yellow
         Finish-OperationReport 'ЛИЧНЫЕ ФАЙЛЫ ВОССТАНОВЛЕНЫ НЕ ПОЛНОСТЬЮ'
         return $false
