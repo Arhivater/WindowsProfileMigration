@@ -272,11 +272,11 @@ function Write-PersonalFilesCoverage($Inventory) {
         if ($result.ReadFailed) { $problems += 'чтение папки завершилось ошибкой' }
         if ($result.Skipped -gt 0) { $problems += ('пропущено объектов: ' + $result.Skipped) }
         if ($result.Missing) {
-            Write-OperationReport 'ФАЙЛЫ' ($names[$group] + ' — папка отсутствовала на исходном ПК.')
+            Write-OperationReport 'ФАЙЛЫ' ($names[$group] + ' - папка отсутствовала на исходном ПК.')
         }
         if ($problems.Count) {
             $complete = $false
-            $message = $names[$group] + ' при экспорте — ' + ($problems -join ', ') + '.'
+            $message = $names[$group] + ' при экспорте - ' + ($problems -join ', ') + '.'
             Write-Host $message -ForegroundColor Yellow
             Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' $message
         }
