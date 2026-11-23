@@ -1,4 +1,4 @@
-# WindowsProfileMigration v1.11.0
+# WindowsProfileMigration v1.11
 
 Рабочая ветка `release/v1.11.0`. Галочка означает, что результат доступен в ветке. Испытания отмечаются отдельно.
 
@@ -35,7 +35,7 @@
 
 ## Точка продолжения
 
-[Скачать комплект v1.11.0](https://raw.githubusercontent.com/Arhivater/WindowsProfileMigration/release/v1.11.0/dist/WindowsProfileMigration_v1.11.0_Arhivater.zip). SHA-256 опубликованного ZIP `5c8926aa3e2cba5bb79ccdbc4c5dbf0a9c6a399a8d5fcb2a633b418d64db6ab8`.
+[Скачать комплект v1.11](https://github.com/Arhivater/WindowsProfileMigration/releases/download/v1.11/WindowsProfileMigration_v1.11_Arhivater.zip). SHA-256 опубликованного ZIP `56b932c446b34ed90a4ec7f646340b138ee4cf9d5d1047ecaf2e0507cd1eba31`.
 
 ## Тестирование 23 ноября 2026
 
@@ -48,7 +48,7 @@
 | Windows Server 2022, Windows PowerShell 5.1 | 97 из 97. Проверки выполнялись на временных данных. |
 | Защищённый ZIP на Windows | Восстановление исходных байтов по паролю с кириллицей. Отказ при неверном пароле, повреждении или недостатке места. Временный открытый ZIP при отказе отсутствовал. |
 | Дополнительные сценарии | Проверены копирование, SHA-256, ошибки места, остановка, выбор другой копии архива и журнал. В сценариях WinRM и USMT использовались заглушки. |
-| Реальный экспорт USMT | Стенд остановился при создании тестового профиля. Windows API CreateProfile вернул `0x800706F7`; программа переноса ещё не запускалась. [Диагностика](https://github.com/Arhivater/WindowsProfileMigration/actions/runs/45096051088) |
+| Реальный экспорт USMT после исправления стенда | Windows 11 ARM64 создала временный профиль. Экспорт ScanState и проверка ZIP через UsmtUtils прошли. [Прогон](https://github.com/Arhivater/WindowsProfileMigration/actions/runs/45096684276) |
 
 [Штатный прогон Windows](https://github.com/Arhivater/WindowsProfileMigration/actions/runs/45095768782) · [Расширенный прогон Windows](https://github.com/Arhivater/WindowsProfileMigration/actions/runs/45095908927)
 
@@ -62,4 +62,13 @@
 
 ### Продолжение после прогона
 
-Все пять исправлений внесены в `release/v1.11.0`. Далее повторить регрессию и обновить документацию и ZIP.
+Все пять исправлений внесены в `release/v1.11.0`. После них прошли 95 из 95 проверок на Linux и по 101 из 101 на Windows. [Прогон исправлений](https://github.com/Arhivater/WindowsProfileMigration/actions/runs/45096550317)
+
+## Отчёт и прогресс
+
+- [x] Записывать начало и конец этапов, длительность, версию среды, HRESULT и код Windows.
+- [x] Показывать общий процент по шагам и измерять внутренний объём по байтам, файлам или группам.
+- [x] Указывать стадию ожидания, когда Windows, USMT и WinRM не сообщают объём.
+- [x] Проверить актуальный код [55bd31e](https://github.com/Arhivater/WindowsProfileMigration/commit/55bd31e). На Linux прошло 99 из 99, на Windows 11 ARM64 и Windows Server 2022 по 105 из 105. На Windows 11 открыт и закрыт стартовый экран. [Регрессия Windows](https://github.com/Arhivater/WindowsProfileMigration/actions/runs/45097284037)
+- [ ] Проверить отчёт и проценты в реальном экспорте Windows. [Лаборатория USMT](https://github.com/Arhivater/WindowsProfileMigration/actions/runs/45097287472)
+- [x] Сверить содержимое дистрибутива с файлами программы и разместить SHA-256 рядом со ссылкой на GitHub Releases.
