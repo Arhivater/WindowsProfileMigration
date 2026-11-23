@@ -1,6 +1,6 @@
 ﻿#Requires -Version 5.1
-# Runs W05 and the positive ZIP case of W06 on a fresh GitHub-hosted Windows 11 VM.
-# The real launcher, ScanState and UsmtUtils run locally. No profile archives or logs leave the VM.
+# Runs export, verification and import on a disposable GitHub-hosted Windows 11 VM.
+# Uses real ScanState and LoadState with synthetic local accounts. No profile archives or logs leave the VM.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -47,7 +47,7 @@ function Initialize-LabUserProfile([string]$Name, [string]$Sid, [Security.Secure
     throw 'PROFILE'
 }
 
-function New-LabProfile([string]$Prefix) {
+function New-LabProfile([string]$Prefix,[switch]$AccountOnly) {
     $name = $Prefix + [guid]::NewGuid().ToString('N').Substring(0,16)
     $random = [Security.Cryptography.RandomNumberGenerator]::Create()
     $bytes = New-Object byte[] 32
@@ -56,6 +56,7 @@ function New-LabProfile([string]$Prefix) {
     try {
         $user = New-LocalUser -Name $name -Password $password
         $sid = $user.SID.Value
+        if ($AccountOnly) { return [pscustomobject]@{ Account="$env:COMPUTERNAME\$name"; SID=$sid } }
         $path = Initialize-LabUserProfile $name $sid $password
     } finally { $password.Dispose() }
     $profile = @(Get-CimInstance Win32_UserProfile -Filter "SID='$sid'")
@@ -77,7 +78,7 @@ function New-LabProfile([string]$Prefix) {
         Marker = $marker; MarkerPath = $markerPath; Hash = (Get-FileHash -LiteralPath $markerPath).Hash }
 }
 
-function Invoke-LabMenu([string]$Root, $Source) {
+function Invoke-LabMenu([string]$Root, $Source, [string]$Target = '') {
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'
     $start.Arguments = '/d /q /c call start.cmd'
@@ -101,6 +102,10 @@ function Invoke-LabMenu([string]$Root, $Source) {
             } until ($read.Result -match $row)
             # Профиль, без отдельной копии папок, каталог Backups, обычный ZIP, подтверждение, назад, выход.
             $inputs = @($Matches[1], '2', '1', '1', '1', '0', '0')
+        } elseif ($Target) {
+            # A single archive and a fresh, empty local account. The same-machine
+            # confirmation is deliberate in this disposable one-PC lab.
+            $inputs = @('2','1','1','2',$Target,'1','0','0','0','0')
         } else {
             # A clean Backups directory was checked to contain exactly the ZIP from the preceding export.
             $inputs = @('3', '1', '0', '0')
@@ -139,6 +144,37 @@ function Assert-LabReport([string]$Root, [string]$Operation, [string[]]$Previous
         $body -notmatch '(?m)\] Предупреждений: \d+; ошибок: 0\r?$' -or
         $body -notmatch '\[ЭТАП НАЧАТ\]' -or $body -notmatch '\[ХОД ОПЕРАЦИИ\].+100% по шагам') { throw 'REPORT' }
     return $new[0].FullName
+}
+
+function Assert-LabImport([string]$Kit, $Source, [string]$Prefix) {
+    $target = New-LabProfile $Prefix -AccountOnly
+    $existing = @(Get-CimInstance Win32_UserProfile -Filter ("SID='" + $target.SID + "'"))
+    if ($existing.Count -ne 0) { throw 'TARGET_PROFILE' }
+    $reports = Join-Path $Kit 'Reports'
+    $before = @(Get-ChildItem -LiteralPath $reports -File -Filter '*.txt' | ForEach-Object FullName)
+    Invoke-LabMenu $Kit $null -Target $target.Account
+    $new = @(Get-ChildItem -LiteralPath $reports -File -Filter '*.txt' | Where-Object { $_.FullName -notin $before })
+    if ($new.Count -ne 1) { throw 'IMPORT_REPORT' }
+    $body = [IO.File]::ReadAllText($new[0].FullName)
+    if ($body -notmatch '(?m)^Операция: ИМПОРТ\r?$' -or
+        $body -notmatch '(?m)Код завершения LoadState\.exe: 0\r?$' -or
+        $body -notmatch '(?m)\] Результат операции: ТЕХНИЧЕСКИ ЗАВЕРШЕНО') { throw 'IMPORT_REPORT' }
+
+    $profile = @(Get-CimInstance Win32_UserProfile -Filter ("SID='" + $target.SID + "'"))
+    if ($profile.Count -ne 1 -or $profile[0].Special -or -not $profile[0].LocalPath) { throw 'TARGET_PROFILE' }
+    $marker = Join-Path $profile[0].LocalPath ('Documents\' + $Source.Marker)
+    if (-not (Test-Path -LiteralPath $marker -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $marker).Hash -ne $Source.Hash) { throw 'IMPORT_HASH' }
+}
+
+function New-LabLegacyKit([string]$Project) {
+    # Export an actual .mig using the previous tagged runtime and its original rules.
+    $legacyZip = Join-Path $env:RUNNER_TEMP ('WpmLegacy-' + [guid]::NewGuid().ToString('N') + '.zip')
+    $legacyKit = [IO.Path]::ChangeExtension($legacyZip, $null)
+    & git -C $Project archive --format=zip "--output=$legacyZip" v1.11 start.cmd Program
+    if ($LASTEXITCODE -ne 0) { throw 'LEGACY_SOURCE' }
+    Expand-Archive -LiteralPath $legacyZip -DestinationPath $legacyKit
+    return $legacyKit
 }
 
 $stage = 'HOST'
@@ -224,6 +260,24 @@ public static class WpmLabUserEnv {
     [void](Assert-LabReport $kit 'ПРОВЕРКА АРХИВА' @($report))
     if ((Get-FileHash -LiteralPath $archive).Hash -ne $hash) { throw 'ZIP' }
     Write-Host 'PASS W06-POSITIVE'
+
+    $stage = 'IMPORT_CURRENT'
+    Assert-LabImport $kit $source 'WpmN'
+    Write-Host 'PASS LOADSTATE CURRENT'
+
+    $stage = 'EXPORT_LEGACY'
+    $legacyKit = New-LabLegacyKit $project
+    Invoke-LabMenu $legacyKit $other
+    [void](Assert-LabReport $legacyKit 'ЭКСПОРТ' @())
+    $legacyArchives = @(Get-ChildItem -LiteralPath (Join-Path $legacyKit 'Backups') -File -Filter '*.zip')
+    if ($legacyArchives.Count -ne 1) { throw 'ZIP' }
+
+    $stage = 'IMPORT_LEGACY'
+    $backupRoot = Join-Path $kit 'Backups'
+    Move-Item -LiteralPath $archive -Destination (Join-Path $env:RUNNER_TEMP ('Current-' + [guid]::NewGuid().ToString('N') + '.zip'))
+    Copy-Item -LiteralPath $legacyArchives[0].FullName -Destination $backupRoot
+    Assert-LabImport $kit $other 'WpmL'
+    Write-Host 'PASS LOADSTATE LEGACY'
 } catch {
     # Keep source paths, profile contents and native logs local. Only bounded numeric diagnostics leave the VM.
     $failure = $_.Exception
@@ -232,7 +286,7 @@ public static class WpmLabUserEnv {
         $cause = $failure.GetBaseException()
         Write-Host ('PROFILE CAUSE {0} 0x{1:X8} LINE {2}' -f $cause.GetType().Name,$cause.HResult,$_.InvocationInfo.ScriptLineNumber)
     }
-    if ($failure.Message -in @('HOST','USMT','PROFILE','PROFILE_MENU','REPORT','ZIP','ZIP_ENTRY','SOURCE','SCOPE','TEMP_SCOPE','MANIFEST')) {
+    if ($failure.Message -in @('HOST','USMT','PROFILE','PROFILE_MENU','REPORT','ZIP','ZIP_ENTRY','SOURCE','SCOPE','TEMP_SCOPE','MANIFEST','TARGET_PROFILE','IMPORT_REPORT','IMPORT_HASH','LEGACY_SOURCE')) {
         Write-Host ('CHECK ' + $failure.Message)
     }
     if ($kit -and (Test-Path -LiteralPath (Join-Path $kit 'Reports'))) {
