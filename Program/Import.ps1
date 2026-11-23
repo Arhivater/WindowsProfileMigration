@@ -483,6 +483,16 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     }
     Finish-OperationReport ('ТЕХНИЧЕСКИ ЗАВЕРШЕНО; '+$validationStatus+$personalStatus+'; ОЖИДАЕТ ПРИЁМКИ')
     Write-Host 'Не удаляйте источник и архив до проверки всех данных.' -ForegroundColor Yellow
+    if ($Unattended) {
+        # Отправитель получает причины частичного переноса даже без текстового отчёта.
+        $result = 0
+        if (-not $personalFilesComplete) { $result = $result -bor 1 }
+        if (-not $sourcePersonalFilesComplete) { $result = $result -bor 2 }
+        if ($fileCheck -and ($fileCheck.Missing -gt 0 -or $fileCheck.Changed -gt 0 -or $fileCheck.SourceSkipped -gt 0)) {
+            $result = $result -bor 4
+        }
+        return [pscustomobject]@{Result=$result}
+    }
     return $true
     } finally {
         if ($ownedPassword -and $ArchivePassword) { $ArchivePassword.Dispose() }

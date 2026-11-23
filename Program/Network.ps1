@@ -333,8 +333,12 @@ function Enter-RemoteMigration([object]$Session,[string]$Root,[string]$Hash,[str
         $done = Join-Path $root 'import-completed.txt'
         $tag = $hash + ' ' + $account
         if ([IO.File]::Exists($done)) {
-            if ([IO.File]::Exists($started) -and [IO.File]::ReadAllText($started) -ieq $tag -and [IO.File]::ReadAllText($done) -ieq $tag) {
-                return 'Completed'
+            if ([IO.File]::Exists($started) -and [IO.File]::ReadAllText($started) -ieq $tag) {
+                $lines = [IO.File]::ReadAllLines($done)
+                if ($lines.Length -eq 1 -and $lines[0] -ieq $tag) { return 'Completed' }
+                if ($lines.Length -eq 2 -and $lines[0] -ieq $tag -and $lines[1] -cmatch '^Result=[0-7]$') {
+                    return $lines[1]
+                }
             }
             throw ('Есть запись о другом или повреждённом импорте. Проверьте состояние на целевом ПК: ' + $root)
         }
@@ -528,14 +532,38 @@ function Invoke-RemoteProfileImport([object]$Session,[string]$Root,[string]$Arch
                 & $binary @launchOptions -File $script -ToolRoot $root -RemoteImportArchive $zip -RemoteTargetAccount $account
                 $code = $LASTEXITCODE
             }
-            if ($code -ne 0) { throw ('На целевом ПК импорт завершился кодом ' + $code + '.') }
-            Write-ImportMarker $done $tag
-            'WPM_REMOTE_SUCCESS'
+            if ($code -ne 0 -and ($code -lt 11 -or $code -gt 17)) {
+                throw ('На целевом ПК импорт завершился кодом ' + $code + '.')
+            }
+            $result = if ($code -eq 0) { 0 } else { $code - 10 }
+            # Сохраняем итог и для случая, когда связь пропадёт сразу после импорта.
+            Write-ImportMarker $done ($tag + [Environment]::NewLine + 'Result=' + $result)
+            'WPM_REMOTE_RESULT=' + $result
         } finally {
             $lockedZip.Dispose()
             if ($password) { $password.Dispose() }
         }
     }
+}
+
+# При возобновлении показываем результат, который получатель сохранил сразу после импорта.
+function Complete-RemoteMigration([int]$Result, [string]$Account, [bool]$Previous = $false) {
+    if ($Result -eq 0) {
+        Write-Host ('Архив применён для ' + $Account + '. Проверьте профиль на целевом ПК.') -ForegroundColor Green
+        Finish-OperationReport 'ТЕХНИЧЕСКИ ЗАВЕРШЕНО; ОЖИДАЕТ ПРОВЕРКИ ПОД ПОЛЬЗОВАТЕЛЕМ'
+        return
+    }
+    if ($Previous) { Write-Host 'Сохранённый результат предыдущего импорта:' -ForegroundColor Yellow }
+    Write-Host ('Профиль перенесён частично: ' + $Account) -ForegroundColor Yellow
+    $hints = @()
+    if ($Result -band 1) { $hints += 'На целевом ПК откройте пункт 4 → 6, чтобы повторить восстановление личных файлов, или проверить, выполнено ли оно ранее.' }
+    if ($Result -band 2) { $hints += 'На исходном ПК проверьте пропущенные при экспорте папки и сохраните недостающие файлы.' }
+    if ($Result -band 4) { $hints += 'В отчёте целевого ПК проверьте расхождения контрольных сумм.' }
+    foreach ($hint in $hints) {
+        Write-Host $hint -ForegroundColor Yellow
+        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' $hint
+    }
+    Finish-OperationReport 'ПРОФИЛЬ ПЕРЕНЕСЁН ЧАСТИЧНО'
 }
 
 # WinRM передаёт проверяемый ZIP и запускает подтверждённый импорт.
@@ -723,12 +751,16 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
 
         $releaseDeploymentLock = $true
         $deployment = Enter-RemoteMigration $session $remoteRoot $localHash $targetAccount
-        if ($deployment -eq 'Completed') {
-            Write-OperationReport 'ВОЗОБНОВЛЕНИЕ' 'На получателе сохранено подтверждение завершения импорта этого ZIP для выбранного пользователя.'
+        if ($deployment -ne 'Ready') {
+            Write-OperationReport 'ВОЗОБНОВЛЕНИЕ' 'На получателе сохранён итог предыдущего импорта этого архива для выбранного пользователя.'
             try { Include-RemoteReport $session $remoteRoot }
             catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Не удалось прочитать удалённый отчёт: ' + $_.Exception.Message) }
-            Finish-OperationReport 'РАНЕЕ ТЕХНИЧЕСКИ ЗАВЕРШЕНО; ОЖИДАЕТ ПРОВЕРКИ ПОД ПОЛЬЗОВАТЕЛЕМ'
-            Write-Host 'Этот архив уже применён для выбранной учётной записи. Проверьте профиль на целевом ПК.' -ForegroundColor Green
+            if ($deployment -eq 'Completed') {
+                Write-Host 'Этот архив уже применяли. Подробный статус проверьте на целевом ПК.' -ForegroundColor Yellow
+                Finish-OperationReport 'АРХИВ РАНЕЕ ПРИМЕНЁН; ПОЛНОТА ПЕРЕНОСА НЕИЗВЕСТНА'
+            } else {
+                Complete-RemoteMigration ([int]$deployment.Substring(7)) $targetAccount $true
+            }
             return
         }
         # При возобновлении допускаем существующий профиль до чтения записи
@@ -785,13 +817,13 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
             throw [OperationCanceledException]::new('Удалённый импорт отменён до запуска. Проверенный ZIP сохранён.')
         }
         Write-Host 'Автоматический запуск LoadState на целевом компьютере...' -ForegroundColor Cyan
-        $remoteSucceeded = $false
+        $remoteResult = $null
         Invoke-RemoteProfileImport $session $remoteRoot $remoteArchive $targetAccount $localHash $archivePassword | ForEach-Object {
-            if ([string]$_ -eq 'WPM_REMOTE_SUCCESS') { $remoteSucceeded = $true }
+            if ([string]$_ -cmatch '^WPM_REMOTE_RESULT=([0-7])$') { $remoteResult = [int]$Matches[1] }
             else { Write-Host ([string]$_) }
         }
-        if (-not $remoteSucceeded) {
-            throw 'Удалённый процесс не подтвердил успешное техническое завершение импорта.'
+        if ($null -eq $remoteResult) {
+            throw 'Удалённый процесс не подтвердил результат импорта.'
         }
         Advance-OperationStage 'LoadState выполнен на целевом ПК'
         try {
@@ -800,8 +832,7 @@ function Do-RemoteDeploy([string]$Usmt,[string]$ResumeZip = '') {
         } catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Импорт подтверждён. Отчёт сохранён на получателе: ' + $_.Exception.Message) }
         Write-OperationReport 'ИТОГ' ('Прямой перенос: ' + $sourceProfile.Account + ' → ' + $targetAccount + '; получатель=' + $remote.Name + '; ZIP=' + $remoteArchive)
         Advance-OperationStage 'Прямой перенос завершён'
-        Finish-OperationReport 'ТЕХНИЧЕСКИ ЗАВЕРШЕНО; ОЖИДАЕТ ПРОВЕРКИ ПОД ПОЛЬЗОВАТЕЛЕМ'
-        Write-Host ('Готово. На целевом ПК выполнено автоматическое развёртывание: ' + $targetAccount) -ForegroundColor Green
+        Complete-RemoteMigration $remoteResult $targetAccount
     } catch {
         Write-DiagnosticFailure $_ 'Прямой сетевой перенос'
         if ($session -and $remoteRoot) {

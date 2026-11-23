@@ -26,8 +26,12 @@ try {
         $remotePassword = $null
         try {
             if ($isProtected) { $remotePassword = Read-RemoteArchivePassword }
-            $importCompleted = Do-Import $remoteUsmt $false $RemoteImportArchive $RemoteTargetAccount $true -ArchivePassword $remotePassword
-            if ($importCompleted -ne $true) { throw 'Удалённый импорт завершился без подтверждения результата.' }
+            $outcome = Do-Import $remoteUsmt $false $RemoteImportArchive $RemoteTargetAccount $true -ArchivePassword $remotePassword
+            if (-not $outcome -or -not $outcome.PSObject.Properties['Result']) {
+                throw 'Удалённый импорт завершился без подтверждения результата.'
+            }
+            # Коды 11–17 передают причины частичного результата. Код 1 означает сбой запуска или импорта.
+            if ($outcome.Result) { exit (10 + [int]$outcome.Result) }
             exit 0
         } catch {
             Write-DiagnosticFailure $_ 'Удалённый автоматический импорт'
