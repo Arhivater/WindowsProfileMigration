@@ -473,6 +473,9 @@ function Restore-TrackedPersonalFiles([string]$Archive, $Metadata, $State) {
     if ($target.Sid -ne $State.TargetSid -or ($State.TargetProfile -and $target.Path -ine $State.TargetProfile)) {
         throw 'Профиль назначения изменился после импорта.'
     }
+    Update-TrackedState 'Выполняется повтор личных файлов' @{
+        TargetAccount=$State.TargetAccount; TargetSid=$target.Sid; TargetProfile=$target.Path
+    }
     return (Restore-PersonalFiles $Archive $target $Metadata $approved)
 }
 
@@ -505,7 +508,9 @@ function Invoke-PersonalFilesRetry($State, [hashtable]$Changes) {
         return $false
     }
     $Changes.PersonalFilesPending = $false
-    $Changes.Status = 'Личные файлы восстановлены, ожидает приёмки'
+    # Повтор копирует файлы из архива. Пропуски на исходном ПК всё ещё требуют внимания.
+    $Changes.Status = if ($Changes['PersonalSourceIncomplete']) { 'Файлы из архива восстановлены, при экспорте были пропуски' }
+        else { 'Личные файлы восстановлены, ожидает приёмки' }
     Save-TrackedState $Changes
     return $true
 }

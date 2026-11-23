@@ -289,7 +289,13 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         $requiredImportBytes = if ($meta.PSObject.Properties.Name -contains 'EstimatedProfileBytes' -and $meta.EstimatedProfileBytes) { [UInt64]$meta.EstimatedProfileBytes } else { [UInt64](Get-FolderMetrics $store).Bytes }
         Test-TargetFreeSpace $requiredImportBytes
     }
-    if ($PersonalRetry) { return (Restore-TrackedPersonalFiles $archive $meta $PersonalRetry) }
+    if ($PersonalRetry) {
+        $complete = Restore-TrackedPersonalFiles $archive $meta $PersonalRetry
+        $retryStatus = if ($complete) { 'Повтор завершён, личные файлы восстановлены' }
+            else { 'Повтор завершён частично, остались личные файлы' }
+        Update-TrackedState $retryStatus
+        return $complete
+    }
     $logBase = Join-Path $Script:WpmWorkRoot 'Logs'
     Initialize-WpmWorkDirectory $logBase
     $logRoot = Join-Path $logBase ($(if ($JustVerify) { 'Check_' } else { 'Import_' }) + (Get-Date -Format 'yyyyMMdd_HHmmss_fff') + '_' + [guid]::NewGuid().ToString('N').Substring(0,8))
@@ -390,6 +396,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
     if ($meta.PSObject.Properties['PersonalFiles'] -and @($approvedExtras.Keys -like 'UserFiles\*').Count) {
         Update-TrackedState '' @{
             PersonalFilesPending = $true
+            PersonalSourceIncomplete = -not $sourcePersonalFilesComplete
             PersonalMetadataHash = Get-ExactFileSha256 (Join-Path $archive 'metadata.json')
             PersonalManifestHash = Get-ExactFileSha256 (Join-Path $archive 'Validation\extras.jsonl')
         }
@@ -504,7 +511,8 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         # При остановке LoadState профиль мог быть создан частично.
         # Сохраняем состояние для пункта 4, но не удаляем учётную запись.
         $partial = $Script:ActiveOpState.USMTStarted -and -not $Script:ActiveOpState.USMTFinished
-        $status = if ($partial) { 'Отменено во время LoadState - возможен частичный профиль' }
+        $status = if ($PersonalRetry) { 'Повтор личных файлов отменён' }
+                  elseif ($partial) { 'Отменено во время LoadState - возможен частичный профиль' }
                   elseif ($Script:ActiveOpState.USMTFinished) { 'Отменено после LoadState - требуется проверка профиля' }
                   else { 'Отменено до LoadState' }
         Update-TrackedState $status @{LastError=$_.Exception.Message}
@@ -513,9 +521,13 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
         }
         throw
     } catch {
-        Write-DiagnosticFailure $_ 'Импорт/проверка архива'
-        Update-TrackedState 'Сбой - импорт не завершён' @{LastError=$_.Exception.Message}
-        Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Импорт не завершён. Повторный запуск и управляемая очистка описаны в пункте 4 главного меню. Автоматического удаления профиля нет.'
+        if ($PersonalRetry) {
+            Update-TrackedState 'Сбой повтора личных файлов' @{LastError=$_.Exception.Message}
+        } else {
+            Write-DiagnosticFailure $_ 'Импорт/проверка архива'
+            Update-TrackedState 'Сбой - импорт не завершён' @{LastError=$_.Exception.Message}
+            Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' 'Импорт не завершён. Повторный запуск и управляемая очистка описаны в пункте 4 главного меню. Автоматического удаления профиля нет.'
+        }
         throw
     } finally {
         try {
@@ -527,7 +539,7 @@ function Do-Import([string]$Usmt,[bool]$JustVerify = $false,[string]$ArchiveOver
                 } catch { Write-OperationReport 'ПРЕДУПРЕЖДЕНИЕ' ('Очистка кеша импорта не завершена: ' + $_.Exception.Message) }
             }
             if ($Script:ActiveOpState) {
-                $status = if ([string]$Script:ActiveOpState.Status -in @('Начато','Подготовка локального кеша','Архив подготовлен','Назначение проверено')) {
+                $status = if (-not $PersonalRetry -and [string]$Script:ActiveOpState.Status -in @('Начато','Подготовка локального кеша','Архив подготовлен','Назначение проверено')) {
                     'Отменено до запуска LoadState'
                 } else { '' }
                 try { Update-TrackedState $status @{ProcessId=0;ProcessStartTicks=0} }
