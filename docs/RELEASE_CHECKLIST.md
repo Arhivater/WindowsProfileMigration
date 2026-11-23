@@ -70,5 +70,5 @@
 - [x] Показывать общий процент по шагам и измерять внутренний объём по байтам, файлам или группам.
 - [x] Указывать стадию ожидания, когда Windows, USMT и WinRM не сообщают объём.
 - [x] Проверить актуальный код [55bd31e](https://github.com/Arhivater/WindowsProfileMigration/commit/55bd31e). На Linux прошло 99 из 99, на Windows 11 ARM64 и Windows Server 2022 по 105 из 105. На Windows 11 открыт и закрыт стартовый экран. [Регрессия Windows](https://github.com/Arhivater/WindowsProfileMigration/actions/runs/45097284037)
-- [ ] Проверить отчёт и проценты в реальном экспорте Windows. [Лаборатория USMT](https://github.com/Arhivater/WindowsProfileMigration/actions/runs/45097287472)
+- [x] Проверить отчёт и проценты в реальном экспорте Windows. ScanState и UsmtUtils отработали успешно. В TXT проверены отметки начала этапов и 100% по шагам. [Лаборатория USMT](https://github.com/Arhivater/WindowsProfileMigration/actions/runs/45097287472)
 - [x] Сверить содержимое дистрибутива с файлами программы и разместить SHA-256 рядом со ссылкой на GitHub Releases.
