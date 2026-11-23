@@ -5,24 +5,50 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+function Initialize-LabUserProfile([string]$Name, [string]$Sid, [Security.SecureString]$Password) {
+    $buffer = [Text.StringBuilder]::new(1024)
+    $result = [WpmLabUserEnv]::CreateProfile($Sid, $Name, $buffer, $buffer.Capacity)
+    if ($result -eq 0) { return $buffer.ToString() }
+    Write-Host ('CREATE_PROFILE HRESULT 0x{0:X8}' -f $result)
+    if ($result.ToString('X8') -ne '800706F7') {
+        [Runtime.InteropServices.Marshal]::ThrowExceptionForHR($result)
+        throw 'PROFILE'
+    }
+
+    # On this Windows ARM runner the profile API can fail in RPC.
+    # Let Windows initialize the fresh test account during a short local logon.
+    $credential = [Management.Automation.PSCredential]::new("$env:COMPUTERNAME\$Name", $Password)
+    $shell = Join-Path $env:SystemRoot 'System32\cmd.exe'
+    $process = Start-Process -FilePath $shell -Credential $credential -LoadUserProfile -WorkingDirectory $env:SystemRoot -ArgumentList '/d /c exit 0' -WindowStyle Hidden -PassThru
+    try {
+        if (-not $process.WaitForExit(15000) -or $process.ExitCode -ne 0) { throw 'PROFILE' }
+    } finally {
+        if (-not $process.HasExited) { $process.Kill() }
+        $process.Dispose()
+    }
+    for ($attempt = 0; $attempt -lt 15; $attempt++) {
+        $profile = Get-CimInstance Win32_UserProfile -Filter "SID='$Sid'"
+        if ($profile -and $profile.LocalPath -and -not $profile.Loaded) {
+            Write-Host 'PROFILE INITIALIZED BY TEST LOGON'
+            return [string]$profile.LocalPath
+        }
+        Start-Sleep -Seconds 1
+    }
+    throw 'PROFILE'
+}
+
 function New-LabProfile([string]$Prefix) {
     $name = $Prefix + [guid]::NewGuid().ToString('N').Substring(0,16)
     $random = [Security.Cryptography.RandomNumberGenerator]::Create()
     $bytes = New-Object byte[] 32
     try { $random.GetBytes($bytes) } finally { $random.Dispose() }
     $password = ConvertTo-SecureString ('aA1!' + [Convert]::ToBase64String($bytes)) -AsPlainText -Force
-    try { $user = New-LocalUser -Name $name -Password $password } finally { $password.Dispose() }
-    # CreateProfile creates the standard user hive without logging in or running anything as this user.
-    $buffer = [Text.StringBuilder]::new(1024)
-    $sid = $user.SID.Value
-    $result = [WpmLabUserEnv]::CreateProfile($sid, $name, $buffer, $buffer.Capacity)
-    if ($result -ne 0) {
-        Write-Host ('CREATE_PROFILE HRESULT 0x{0:X8}' -f $result)
-        [Runtime.InteropServices.Marshal]::ThrowExceptionForHR($result)
-        throw 'PROFILE'
-    }
+    try {
+        $user = New-LocalUser -Name $name -Password $password
+        $sid = $user.SID.Value
+        $path = Initialize-LabUserProfile $name $sid $password
+    } finally { $password.Dispose() }
     $profile = @(Get-CimInstance Win32_UserProfile -Filter "SID='$sid'")
-    $path = $buffer.ToString()
     if ($profile.Count -ne 1 -or $profile[0].LocalPath -ine $path -or $profile[0].Special -or
         $profile[0].Loaded -ne $false -or -not (Test-Path -LiteralPath (Join-Path $path 'NTUSER.DAT') -PathType Leaf)) {
         throw 'PROFILE'
