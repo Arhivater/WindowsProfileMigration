@@ -1,5 +1,7 @@
 # Чек-лист WindowsProfileMigration v1.10.1
 
+Релиз v1.11 и результаты его проверки опубликованы отдельно. [Релиз](https://github.com/Arhivater/WindowsProfileMigration/releases/tag/v1.11) · [Чек-лист](https://github.com/Arhivater/WindowsProfileMigration/blob/v1.11/docs/RELEASE_CHECKLIST.md)
+
 **PASS** - проверка выполнена и прошла. **FAIL** - проверка выявила дефект. **BLOCKED** - для прогона отсутствует нужная среда или доступ. **NOT_TESTED** - отдельный сценарий ещё не выполнялся.
 
 ## Синтетические проверки

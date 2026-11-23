@@ -1,5 +1,7 @@
 # История изменений WindowsProfileMigration
 
+Релиз v1.11 и результаты его проверки опубликованы отдельно. [Релиз](https://github.com/Arhivater/WindowsProfileMigration/releases/tag/v1.11) · [Чек-лист](https://github.com/Arhivater/WindowsProfileMigration/blob/v1.11/docs/RELEASE_CHECKLIST.md)
+
 Автор проекта: Arhivater.
 
 ## v1.10.1

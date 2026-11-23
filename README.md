@@ -4,7 +4,7 @@
 
 ![Исходный ПК сохраняет профиль в архив, новый ПК проверяет и восстанавливает его](.github/media/profile-transfer.svg)
 
-**[⬇ Скачать v1.10.1 для Windows (.zip)](https://github.com/Arhivater/WindowsProfileMigration/releases/download/v1.10.1/WindowsProfileMigration_v1.10.1_Arhivater.zip)**　·　[Инструкция](README.txt)　·　[Что нового в v1.11.0](#что-нового-в-v1110)
+**[⬇ Скачать v1.11 для Windows (.zip)](https://github.com/Arhivater/WindowsProfileMigration/releases/download/v1.11/WindowsProfileMigration_v1.11_Arhivater.zip)**　·　[Инструкция](https://github.com/Arhivater/WindowsProfileMigration/blob/v1.11/README.txt)　·　[Версия v1.10.1](https://github.com/Arhivater/WindowsProfileMigration/releases/tag/v1.10.1)
 
 ## Первый перенос
 
@@ -21,11 +21,11 @@
 - **Оборвалась связь во время отправки ZIP?** Пункт **7** позволяет продолжить передачу. Перед импортом программа сверяет SHA-256 архива на получателе.
 - **Компьютер перезагрузился во время импорта?** Откройте пункт **4** на целевом ПК. Журнал покажет, успел ли запуститься LoadState, чтобы вы могли проверить состояние профиля перед повторной попыткой.
 
-## Что нового в v1.11.0
+## Версия v1.11
 
-В релизной ветке можно защитить архив паролем, добавить отдельную копию локальных «Документов» и «Загрузок» и восстановить ярлыки рабочего стола. Ярлык на сетевой файл, сайт или RDP-подключение сохраняется вместе с адресом, даже когда ресурс недоступен.
+В v1.11 можно защитить архив паролем, добавить отдельную копию локальных «Документов» и «Загрузок» и восстановить ярлыки рабочего стола. Ярлык на сетевой файл, сайт или RDP-подключение сохраняется вместе с адресом, даже когда ресурс недоступен.
 
-**v1.11.0 собрана и ожидает испытаний на Windows.** [Скачать сборку v1.11.0](https://raw.githubusercontent.com/Arhivater/WindowsProfileMigration/release/v1.11.0/dist/WindowsProfileMigration_v1.11.0_Arhivater.zip) · [Схема программы](https://github.com/Arhivater/WindowsProfileMigration/blob/release/v1.11.0/TECHNICAL.md) · [Чек-лист ветки](https://github.com/Arhivater/WindowsProfileMigration/blob/release/v1.11.0/docs/RELEASE_CHECKLIST.md)
+Индикатор показывает долю завершённых шагов или уже обработанные байты и файлы. Итоговый TXT фиксирует этапы, длительность и код сбоя. [Релиз v1.11](https://github.com/Arhivater/WindowsProfileMigration/releases/tag/v1.11) · [Схема программы](https://github.com/Arhivater/WindowsProfileMigration/blob/v1.11/TECHNICAL.md) · [Чек-лист и результаты испытаний](https://github.com/Arhivater/WindowsProfileMigration/blob/v1.11/docs/RELEASE_CHECKLIST.md)
 
 <details>
 <summary><strong>Что проверено в опубликованной v1.10.1?</strong></summary>

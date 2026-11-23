@@ -1,5 +1,7 @@
 # Технический аудит WindowsProfileMigration v1.10.1
 
+Релиз v1.11 и результаты его проверки опубликованы отдельно. [Релиз](https://github.com/Arhivater/WindowsProfileMigration/releases/tag/v1.11) · [Чек-лист](https://github.com/Arhivater/WindowsProfileMigration/blob/v1.11/docs/RELEASE_CHECKLIST.md)
+
 Автор проекта: Arhivater. Базовый коммит v1.10.0: `0e6f900e0e7f77d5b67bc95d45b53ddf2441e14c`.
 
 ## Архитектура и границы проверки

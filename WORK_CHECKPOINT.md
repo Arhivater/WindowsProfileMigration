@@ -1,5 +1,7 @@
 # Точка продолжения WindowsProfileMigration v1.10.1
 
+Релиз v1.11 и результаты его проверки опубликованы отдельно. [Релиз](https://github.com/Arhivater/WindowsProfileMigration/releases/tag/v1.11) · [Чек-лист](https://github.com/Arhivater/WindowsProfileMigration/blob/v1.11/docs/RELEASE_CHECKLIST.md)
+
 Код v1.10.1 включён в `main`. Тег `v1.10.1` указывает на сборку `ab6feb5`. Исходная версия v1.10.0 сохранена в коммите `0e6f900`.
 
 ## Состояние сборки
