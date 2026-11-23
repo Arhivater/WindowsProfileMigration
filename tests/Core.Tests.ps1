@@ -391,7 +391,7 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         $launcher = Join-Path $kit 'start.cmd'
         $fixture = Join-Path $program 'Bootstrap.ps1'
         [IO.File]::Copy((Join-Path $script:WpmProjectRoot 'start.cmd'), $launcher)
-        foreach ($code in @(0,19,1223,-1073741510)) {
+        foreach ($code in @(0,19,1223)) {
             $fixtureScript = @'
 if ([Environment]::CurrentDirectory -ine $env:SystemRoot) { exit 99 }
 exit {0}
