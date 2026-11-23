@@ -104,4 +104,4 @@
 - [x] Проверить синтаксис семи диаграмм Mermaid и ссылки на точки входа.
 - [x] Проверить выход через 0 и крестик при запуске из папки SMB на Windows 11. После каждого выхода стартовые файлы открылись на запись в эксклюзивном режиме. [Проверка на Windows](https://github.com/Arhivater/WindowsProfileMigration/actions/runs/45157205465)
 
-[Скачать сборку v1.11.1](https://raw.githubusercontent.com/Arhivater/WindowsProfileMigration/release/v1.11.1/dist/WindowsProfileMigration_v1.11.1.zip). SHA-256 ZIP `b1e1d1d4f6b8ba3ec7bd46767427262e79b6542df1d54008b821cd563ad78aca`.
+[Скачать сборку v1.11.1](https://raw.githubusercontent.com/Arhivater/WindowsProfileMigration/release/v1.11.1/dist/WindowsProfileMigration_v1.11.1.zip). SHA-256 ZIP `ed7d2dcf3987da45e9432d32f9eaac3828b1267edfd1c12558b1fd999313ed61`.
