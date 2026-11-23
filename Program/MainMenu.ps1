@@ -49,7 +49,7 @@ try {
         }
     }
     Invoke-InteractiveMenu
-    # Код выхода передаётся через Bootstrap.ps1 в Start.cmd.
+    # При запуске из повышенной консоли этот код возвращает start.cmd.
     # Отмена пользователем не ошибка; хотя бы один реальный сбой даёт код 1.
     if ($Script:HadFailures) { exit 1 }
     exit 0

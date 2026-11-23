@@ -56,3 +56,8 @@ jobs:
         run: |
           echo 0|call start.cmd
           exit /b %ERRORLEVEL%
+      - name: Check menu exit and console close from an SMB share
+        if: matrix.os == 'windows-11-arm'
+        timeout-minutes: 3
+        shell: powershell
+        run: .\tests\Test-NetworkLauncherExit.ps1

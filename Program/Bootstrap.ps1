@@ -75,35 +75,34 @@ function Quote-LaunchPath([string]$Path) {
     return ('"' + ($Path -replace '(\\+)$','$1$1') + '"')
 }
 
-# Главный процесс получает путь к комплекту. UAC спрашиваем только если консоль ещё не повышена.
-function Start-MigrationProcess([string]$Root) {
-    $main = Join-Path $Root 'Program\ProfileMigration.ps1'
-    if (-not (Test-Path -LiteralPath $main -PathType Leaf)) { throw ('Не найден основной скрипт: ' + $main) }
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+# Администратор получает отдельное окно. Исходный загрузчик завершится сразу после запуска.
+function Start-MigrationProcess([string]$Main, [string]$Root) {
     $launch = @{
         FilePath = Join-Path $PSHOME 'powershell.exe'
         WorkingDirectory = $PSHOME
-        ArgumentList = '-NoProfile -ExecutionPolicy Bypass -File {0} -ToolRoot {1}' -f (Quote-LaunchPath $main),(Quote-LaunchPath $Root)
-        PassThru = $true
+        ArgumentList = '-NoProfile -ExecutionPolicy Bypass -File {0} -ToolRoot {1}' -f (Quote-LaunchPath $Main),(Quote-LaunchPath $Root)
+        Verb = 'RunAs'
     }
-    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { $launch.NoNewWindow = $true }
-    else { $launch.Verb = 'RunAs' }
-    return (Start-Process @launch)
+    Start-Process @launch
 }
 
 $exitCode = 1
-$process = $null
 try {
     $root = Resolve-OriginalFolder $Script:KitRoot
     Write-Host ('Папка комплекта: ' + $root)
-    $process = Start-MigrationProcess $root
-    if ($null -eq $process) { throw 'Не удалось запустить основную программу.' }
-    [void]$process.Handle
-    $process.WaitForExit()
-    $code = $process.ExitCode
-    if ($null -eq $code) { throw 'Не удалось получить код завершения основной программы.' }
-    $exitCode = [int]$code
+    $main = Join-Path $root 'Program\ProfileMigration.ps1'
+    if (-not (Test-Path -LiteralPath $main -PathType Leaf)) { throw ('Не найден основной скрипт: ' + $main) }
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        # В повышенной консоли запускаем меню в том же PowerShell.
+        # При закрытии окна отдельного загрузчика уже нет.
+        & $main -ToolRoot $root
+        $exitCode = $LASTEXITCODE
+    } else {
+        Start-MigrationProcess $main $root
+        $exitCode = 0
+    }
 } catch {
     Write-BootstrapFailure $_
     $cause = $_.Exception
@@ -115,7 +114,5 @@ try {
         Write-Host ('ОШИБКА ЗАПУСКА: ' + $_.Exception.Message) -ForegroundColor Red
         $exitCode = 1
     }
-} finally {
-    if ($process) { $process.Dispose() }
 }
 exit $exitCode

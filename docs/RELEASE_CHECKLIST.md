@@ -103,4 +103,4 @@
 - [x] Собрать ZIP v1.11.1, сверить все файлы и контрольную сумму скачанного с GitHub архива.
 - [x] Проверить синтаксис семи диаграмм Mermaid и ссылки на точки входа.
 
-[Скачать сборку v1.11.1](https://raw.githubusercontent.com/Arhivater/WindowsProfileMigration/release/v1.11.1/dist/WindowsProfileMigration_v1.11.1.zip). SHA-256 ZIP `bf7ea9fdf8eb71925a710f9c068257a5a7e0d0cb1420f6bd2b020c20f42713d0`.
+[Скачать сборку v1.11.1](https://raw.githubusercontent.com/Arhivater/WindowsProfileMigration/release/v1.11.1/dist/WindowsProfileMigration_v1.11.1.zip). SHA-256 ZIP `b1e1d1d4f6b8ba3ec7bd46767427262e79b6542df1d54008b821cd563ad78aca`.

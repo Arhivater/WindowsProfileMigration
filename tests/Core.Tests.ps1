@@ -384,25 +384,29 @@ if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         Assert-WpmEqual (Resolve-OriginalFolder '\\fixtures\Общая папка\каталог\') '\\fixtures\Общая папка\каталог'
     }
 
-    Invoke-WpmTest 'CMD launcher forwards success and errors from a harmless fixture' {
+    Invoke-WpmTest 'CMD launcher exits without input and uses a local working directory' {
         $kit = Join-Path $WpmTestRoot 'комплект с пробелами!'
         $program = Join-Path $kit 'Program'
         [void][IO.Directory]::CreateDirectory($program)
         $launcher = Join-Path $kit 'start.cmd'
         $fixture = Join-Path $program 'Bootstrap.ps1'
         [IO.File]::Copy((Join-Path $script:WpmProjectRoot 'start.cmd'), $launcher)
-        foreach ($code in @(0,19,1223)) {
-            [IO.File]::WriteAllText($fixture, "exit $code")
-            # Pass the precise CMD command line and close stdin to release its pause.
+        foreach ($code in @(0,19,1223,-1073741510)) {
+            $fixtureScript = @'
+if ([Environment]::CurrentDirectory -ine $env:SystemRoot) { exit 99 }
+exit {0}
+'@.Replace('{0}', [string]$code)
+            [IO.File]::WriteAllText($fixture, $fixtureScript)
+            # Keep stdin open to catch an accidental pause after PowerShell exits.
             $start = [Diagnostics.ProcessStartInfo]::new()
             $start.FileName = $env:ComSpec
             $start.Arguments = '/d /v:off /s /c ""{0}""' -f $launcher
+            $start.WorkingDirectory = $kit
             $start.UseShellExecute = $false
             $start.RedirectStandardInput = $true
             $start.CreateNoWindow = $true
             $process = [Diagnostics.Process]::Start($start)
             try {
-                $process.StandardInput.Close()
                 if (-not $process.WaitForExit(20000)) {
                     $process.Kill()
                     throw 'The fixture launcher did not exit.'
